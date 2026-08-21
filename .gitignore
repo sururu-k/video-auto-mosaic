@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 素材・データセットは絶対にコミットしない
+data/
+datasets/
+samples/
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.wmv
+*.png
+*.jpg
+*.jpeg
+
+# モデル重み
+*.pt
+*.onnx
+*.pth
+weights/
+
+# 中間生成物
+out/
+tmp/
+*.json.gz
