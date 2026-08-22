@@ -67,20 +67,40 @@ class Region:
     box: Box
     cls: str
     score: float
-    source: str  # "detected" | "interpolated" | "memory"
+    source: str  # "detected" | "interpolated" | "memory" | "bridged" | "manual"
+    speed: float = 0.0  # このフレーム付近での移動量 px/frame
+    hold: int = 0       # 直近の実観測から何フレーム離れた推定か
 
 
 @dataclass
 class TemporalConfig:
     iou_threshold: float = 0.20
     max_gap: int = 12          # トラック継続を許す欠損フレーム数
-    memory: int = 6            # トラック端を前後に保持するフレーム数
+    memory: int = 6            # トラック端を後ろへ保持するフレーム数
+    memory_before: int = 0     # トラック開始前へ遡って保持するフレーム数（0でmemoryと同じ）
+    stitch_max_gap: int = 90   # 途切れたトラック同士を繋ぐ最大フレーム間隔（0で無効）
+    stitch_iou: float = 0.10   # 繋ぐ条件その1: 端の矩形の IoU
+    stitch_dist_ratio: float = 0.12  # 繋ぐ条件その2: 中心間距離が対角のこの比以内
+    stitch_size_ratio: float = 3.0   # 大きさがこの倍率を超えて違うものは繋がない
     min_track_len: int = 2     # これ未満のトラックはデスパイク対象
     despike_conf: float = 0.35 # 最大スコアがこれ未満の短いトラックだけ落とす
+    track_min_peak: float = 0.0  # トラック内の最大スコアがこれ未満なら丸ごと捨てる（0で無効）
     min_area_ratio: float = 0.0000  # フレーム面積比の下限（0で無効）
     max_area_ratio: float = 0.35    # これを超える検出は誤検出とみなす
-    margin_scale: float = 1.0  # 膨張マージン全体の倍率
-    jpeg_margin: int = 8
+    margin_scale: float = 1.0    # 膨張マージン全体の倍率
+    jpeg_margin: int = 4         # 圧縮アーティファクトの染み出し対策
+    base_ratio: float = 0.15     # 基礎マージン = sqrt(面積) * この比
+    base_min: float = 6.0
+    base_max: float = 40.0
+    score_reference: float = 0.5 # このスコアに達したら「十分に確からしい」とみなす
+    confidence_weight: float = 0.5   # 低信頼のときに基礎マージンへ上乗せする割合
+    estimated_factor: float = 1.3    # 補間/memory/橋渡し由来の領域に掛ける倍率
+    margin_cap_ratio: float = 0.5    # マージンは sqrt(面積) のこの比までで頭打ち
+    margin_cap_px: float = 0.0       # 絶対上限 px（0で無効）
+    motion_weight: float = 2.0       # 局所速度に掛ける係数。動く対象の追従遅れを吸収する
+    motion_cap: float = 60.0         # 動き由来のマージンの上限 px
+    hold_growth: float = 0.25        # 実観測から1フレーム離れるごとに広げる割合（速度比）
+    hold_cap: float = 48.0           # 不確かさ由来のマージンの上限 px
     bridge_max: int = 150      # 前後が覆われている未処理区間を埋める最大長（0で無効）
     frame_step: int = 1        # 検出を何フレームおきに行ったか（マージンとgapに反映）
 
@@ -185,14 +205,96 @@ def despike(tracks: list[Track], cfg: TemporalConfig) -> tuple[list[Track], int]
     """短命かつ低スコアのトラックを落とす。補間より前に行うこと。
 
     Recall 優先なので、スコアが高いものは1フレームだけでも残す。
+
+    track_min_peak を指定すると2閾値のヒステリシスになる。
+    「トラック内で一度でも track_min_peak を超えたものだけを有効とし、
+    そのトラック内は検出しきい値まで拾う」という Canny と同じ発想。
+    検出しきい値を極端に下げたときの誤検出を、フレーム単位でなく
+    トラック単位で落とせる。ただし弱い検出しか出ない本物も落ちるので、
+    実素材で効果を測ってから使うこと。既定は無効。
     """
     kept, dropped = [], 0
     for t in tracks:
+        if cfg.track_min_peak > 0 and t.max_score < cfg.track_min_peak:
+            dropped += 1
+            continue
         if len(t) < cfg.min_track_len and t.max_score < cfg.despike_conf:
             dropped += 1
             continue
         kept.append(t)
     return kept, dropped
+
+
+def stitch_tracks(
+    tracks: list[Track], frame_w: int, frame_h: int, cfg: TemporalConfig
+) -> tuple[list[Track], int]:
+    """途切れ途切れのトラックを、位置と大きさが近ければ1本に繋ぐ。
+
+    検出が数秒のスパンで飛び飛びになると、max_gap を超えてトラックが分断され、
+    「モザイク有り・なし・有り」になる。同じ対象なら座標も大きさも似ているはずなので、
+    それを手がかりに繋ぎ直す。繋がった区間は既存の線形補間が埋めるので、
+    結果としてモザイクが持続する。
+
+    繋ぐ条件は3つすべてを満たすこと:
+      - 時間の隔たりが stitch_max_gap 以内
+      - 端の矩形が重なっている（IoU）か、中心が近い
+      - 大きさが極端に違わない
+    """
+    if cfg.stitch_max_gap <= 0 or len(tracks) < 2:
+        return tracks, 0
+
+    diag = math.hypot(frame_w, frame_h)
+    max_dist = diag * cfg.stitch_dist_ratio
+
+    # 開始フレーム順に見て、後ろのトラックを貪欲に吸収する
+    order = sorted(range(len(tracks)), key=lambda i: tracks[i].first)
+    alive = {i: tracks[i] for i in order}
+    merged = 0
+
+    for i in order:
+        a = alive.get(i)
+        if a is None:
+            continue
+        changed = True
+        while changed:
+            changed = False
+            best = None
+            for j in order:
+                if j == i or j not in alive:
+                    continue
+                b = alive[j]
+                if b.cls != a.cls:
+                    continue
+                gap = b.first - a.last
+                if gap <= 0 or gap > cfg.stitch_max_gap:
+                    continue
+
+                box_a = a.obs[a.last][0]
+                box_b = b.obs[b.first][0]
+
+                area_a = max(1.0, box_a[2] * box_a[3])
+                area_b = max(1.0, box_b[2] * box_b[3])
+                ratio = max(area_a, area_b) / min(area_a, area_b)
+                if ratio > cfg.stitch_size_ratio:
+                    continue
+
+                ca, cb = _center(box_a), _center(box_b)
+                dist = math.hypot(cb[0] - ca[0], cb[1] - ca[1])
+                if _iou(box_a, box_b) < cfg.stitch_iou and dist > max_dist:
+                    continue
+
+                # 隔たりが小さいものから繋ぐ
+                if best is None or gap < best[0]:
+                    best = (gap, j)
+
+            if best is not None:
+                _, j = best
+                b = alive.pop(j)
+                a.obs.update(b.obs)
+                merged += 1
+                changed = True
+
+    return list(alive.values()), merged
 
 
 def _lerp_box(a: Box, b: Box, w: float) -> Box:
@@ -207,11 +309,12 @@ def densify(
 
     for t in tracks:
         frames = sorted(t.obs)
+        local = _local_speeds(t, frames)
 
         # 観測フレームをそのまま置く
         for f in frames:
             box, score = t.obs[f]
-            per_frame[f].append(Region(box, t.cls, score, "detected"))
+            per_frame[f].append(Region(box, t.cls, score, "detected", local[f]))
 
         # 観測と観測のあいだを線形補間で埋める。バッチなので未来を使える。
         for a, b in zip(frames, frames[1:]):
@@ -228,21 +331,98 @@ def densify(
                         t.cls,
                         min(score_a, score_b),
                         "interpolated",
+                        max(local[a], local[b]),
+                        min(f - a, b - f),
                     )
                 )
 
         # トラック端を前後に保持する（frame memory）。
         # 計算コストほぼゼロで検出漏れを潰せるので最初に入れるべき機構。
-        mem = cfg.memory * max(1, cfg.frame_step)
-        if mem > 0:
+        step = max(1, cfg.frame_step)
+        mem_after = cfg.memory * step
+        mem_before = (cfg.memory_before or cfg.memory) * step
+        # memory 区間は矩形を固定してはいけない。対象が動いていると置いていかれる。
+        # 端点の速度で外挿し、観測から離れた分は hold として持たせて、
+        # expand 側で不確かさぶんを広げる。
+        if mem_before > 0:
             head_box, head_score = t.obs[frames[0]]
-            for f in range(max(0, frames[0] - mem), frames[0]):
-                per_frame[f].append(Region(head_box, t.cls, head_score, "memory"))
+            vx, vy = _endpoint_velocity(t, frames, at_start=True)
+            for f in range(max(0, frames[0] - mem_before), frames[0]):
+                d = frames[0] - f
+                per_frame[f].append(
+                    Region(
+                        _shift_box(head_box, -vx * d, -vy * d),
+                        t.cls,
+                        head_score,
+                        "memory",
+                        local[frames[0]],
+                        d,
+                    )
+                )
+        if mem_after > 0:
             tail_box, tail_score = t.obs[frames[-1]]
-            for f in range(frames[-1] + 1, min(n_frames, frames[-1] + mem + 1)):
-                per_frame[f].append(Region(tail_box, t.cls, tail_score, "memory"))
+            vx, vy = _endpoint_velocity(t, frames, at_start=False)
+            for f in range(frames[-1] + 1, min(n_frames, frames[-1] + mem_after + 1)):
+                d = f - frames[-1]
+                per_frame[f].append(
+                    Region(
+                        _shift_box(tail_box, vx * d, vy * d),
+                        t.cls,
+                        tail_score,
+                        "memory",
+                        local[frames[-1]],
+                        d,
+                    )
+                )
 
     return per_frame
+
+
+def _local_speeds(track: Track, frames: list[int]) -> dict[int, float]:
+    """観測フレームごとの局所的な移動量 px/frame。
+
+    全トラック共通の中央値を使うと、ピストン運動のように速く動く対象に
+    マージンが全く足りなくなる。逆に静止している対象は無駄に膨らむ。
+    前後の観測との変位から、そのフレーム付近での実際の速さを出す。
+    """
+    if len(frames) < 2:
+        return {f: 0.0 for f in frames}
+
+    out: dict[int, float] = {}
+    for i, f in enumerate(frames):
+        vals = []
+        if i > 0:
+            a, b = frames[i - 1], f
+            ca, cb = _center(track.obs[a][0]), _center(track.obs[b][0])
+            vals.append(math.hypot(cb[0] - ca[0], cb[1] - ca[1]) / max(1, b - a))
+        if i < len(frames) - 1:
+            a, b = f, frames[i + 1]
+            ca, cb = _center(track.obs[a][0]), _center(track.obs[b][0])
+            vals.append(math.hypot(cb[0] - ca[0], cb[1] - ca[1]) / max(1, b - a))
+        out[f] = max(vals) if vals else 0.0
+    return out
+
+
+def _endpoint_velocity(track: Track, frames: list[int], at_start: bool) -> tuple[float, float]:
+    """トラック端での速度ベクトル px/frame。memory 区間の外挿に使う。
+
+    端の数観測から求める。1点しかなければ 0（外挿せず固定）。
+    """
+    if len(frames) < 2:
+        return (0.0, 0.0)
+    if at_start:
+        a, b = frames[0], frames[min(2, len(frames) - 1)]
+    else:
+        a, b = frames[max(0, len(frames) - 3)], frames[-1]
+    dt = b - a
+    if dt <= 0:
+        return (0.0, 0.0)
+    ca, cb = _center(track.obs[a][0]), _center(track.obs[b][0])
+    return ((cb[0] - ca[0]) / dt, (cb[1] - ca[1]) / dt)
+
+
+def _shift_box(box: Box, dx: float, dy: float) -> Box:
+    return (box[0] + dx, box[1] + dy, box[2], box[3])
 
 
 def _union_box(boxes: list[Box]) -> Box:
@@ -297,14 +477,31 @@ def bridge_uncovered(
             left_open.append((start, end))
             continue
 
-        union = _union_box(boxes)
         score = min(
             min((r.score for r in before), default=0.0),
             min((r.score for r in after), default=0.0),
         )
         cls = before[0].cls if before else after[0].cls
+
+        # 前後それぞれの代表矩形を線形に繋ぐ。外接矩形で塞ぐと、対象が大きく
+        # 動いた区間で矩形が画面の大半を覆ってしまう。補間なら必要な範囲に収まる。
+        box_a = _union_box([r.box for r in before]) if before else None
+        box_b = _union_box([r.box for r in after]) if after else None
+        span = end - start + 1
+
         for i in range(start, end):
-            per_frame[i].append(Region(union, cls, score, "bridged"))
+            if box_a is not None and box_b is not None:
+                w = (i - start + 1) / span
+                box = _lerp_box(box_a, box_b, w)
+            else:
+                box = box_a or box_b
+            speed = max(
+                (r.speed for r in before), default=0.0
+            )
+            speed = max(speed, max((r.speed for r in after), default=0.0))
+            per_frame[i].append(
+                Region(box, cls, score, "bridged", speed, min(i - start + 1, end - i))
+            )
             filled += 1
 
     return filled, left_open
@@ -333,7 +530,6 @@ def expand(
     frame_w: int,
     frame_h: int,
     cfg: TemporalConfig,
-    speed: float = 0.0,
 ) -> Box:
     """膨張マージンを乗せる。
 
@@ -342,18 +538,46 @@ def expand(
       motion     速く動くほど厚く（検出漏れは動きの速い場面で起きる）
       confidence 低信頼ほど厚く
       jpeg       圧縮アーティファクトの染み出し対策
-    補間・memory 由来の領域はさらに厚くする。
+
+    信頼度の項は素の (1 - score) を使ってはいけない。このモデルはスコアが
+    全体的に低く、(1 - score) がほぼ常に1になって基礎マージンを何倍にも
+    膨らませてしまう。score_reference で正規化し、上限も設ける。
+
+    最終的なマージンは対象の大きさに対する比で頭打ちにする。小さい対象を
+    画面いっぱいに潰さないための歯止め。
     """
     x, y, w, h = region.box
     area = max(1.0, w * h)
-    base = max(0.20 * math.sqrt(area), 12.0)
-    # 間引き検出時は検出フレーム間で対象がより大きく動くので、その分厚く盛る
-    motion = 1.5 * speed * max(1, cfg.frame_step)
-    confidence = (1.0 - min(1.0, region.score)) * base * 2.0
-    margin = (base + motion + confidence + cfg.jpeg_margin) * cfg.margin_scale
+    scale = math.sqrt(area)
 
+    base = min(max(cfg.base_ratio * scale, cfg.base_min), cfg.base_max)
+    score_norm = min(1.0, max(0.0, region.score) / max(1e-6, cfg.score_reference))
+    confidence = (1.0 - score_norm) * base * cfg.confidence_weight
+
+    # 大きさに由来する分。ここは「潰しすぎ」に直結するので上限で抑える
+    static = (base + confidence + cfg.jpeg_margin) * cfg.margin_scale
     if region.source != "detected":
-        margin *= 2.0  # 推定で置いた領域は素直に厚く盛る
+        static *= cfg.estimated_factor
+    static = min(static, cfg.margin_cap_ratio * scale + cfg.base_min)
+    if cfg.margin_cap_px > 0:
+        static = min(static, cfg.margin_cap_px)
+
+    # 動きに由来する分は上限の外に出す。追従の遅れを吸収するためのもので、
+    # ここを削ると速く動く場面で対象の先端がモザイクから飛び出す。
+    # 静止している対象には乗らないので、全体が太る心配はない。
+    motion = min(
+        region.speed * cfg.motion_weight * max(1, cfg.frame_step),
+        cfg.motion_cap,
+    )
+
+    # 実観測から離れた推定ほど、対象がどこにいるか分からない。
+    # 外挿しても誤差は溜まるので、離れた分だけ覆う範囲を広げる。
+    uncertainty = min(
+        region.speed * cfg.hold_growth * region.hold,
+        cfg.hold_cap,
+    )
+
+    margin = static + motion + uncertainty
 
     nx = x - margin
     ny = y - margin
@@ -383,6 +607,7 @@ def process(
     tracks = build_tracks(filtered, n_frames, cfg)
     n_tracks_before = len(tracks)
     tracks, n_despiked = despike(tracks, cfg)
+    tracks, n_stitched = stitch_tracks(tracks, frame_w, frame_h, cfg)
 
     speeds = _track_speed(tracks)
     dense = densify(tracks, n_frames, cfg)
@@ -397,9 +622,7 @@ def process(
     out: dict[int, list[tuple[Box, Region]]] = {}
     for f in range(n_frames):
         regions = dense.get(f, [])
-        out[f] = [
-            (expand(r, frame_w, frame_h, cfg, median_speed), r) for r in regions
-        ]
+        out[f] = [(expand(r, frame_w, frame_h, cfg), r) for r in regions]
 
     covered = sum(1 for f in range(n_frames) if out[f])
     detected_frames = sum(1 for f in range(n_frames) if filtered.get(f))
@@ -418,6 +641,7 @@ def process(
         "geometric_dropped": n_geo_dropped,
         "tracks_before_despike": n_tracks_before,
         "tracks_despiked": n_despiked,
+        "tracks_stitched": n_stitched,
         "tracks_final": len(tracks),
         "frames_with_detection": detected_frames,
         "frames_with_mosaic": covered,
@@ -430,6 +654,36 @@ def process(
     }
     stats["_left_open"] = left_open
     return out, stats
+
+
+def estimated_only_ranges(
+    regions_per_frame: dict[int, list[tuple[Box, Region]]],
+    n_frames: int,
+    min_len: int = 5,
+) -> list[tuple[int, int, float]]:
+    """実観測が1つも無く、推定だけで覆っているフレームの連続区間。
+
+    ここは検出器が実際に効いていない区間で、モザイクの位置は当てずっぽうに近い。
+    自動処理の限界がそのまま出るので、人手レビューの最優先対象になる。
+    戻り値は (開始, 終了, 区間内の最大 hold)。
+    """
+    out: list[tuple[int, int, float]] = []
+    start = None
+    peak = 0
+    for f in range(n_frames):
+        regs = regions_per_frame.get(f, [])
+        has_real = any(r.source == "detected" or r.source == "manual" for _, r in regs)
+        if regs and not has_real:
+            if start is None:
+                start, peak = f, 0
+            peak = max(peak, max((r.hold for _, r in regs), default=0))
+        else:
+            if start is not None and f - start >= min_len:
+                out.append((start, f - 1, peak))
+            start = None
+    if start is not None and n_frames - start >= min_len:
+        out.append((start, n_frames - 1, peak))
+    return out
 
 
 def review_flags(

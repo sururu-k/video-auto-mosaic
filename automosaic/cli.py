@@ -25,8 +25,9 @@ from .detector import (
     Detector,
     available_providers,
 )
+from . import corrections as corr
 from .render import FrameBuffer, apply_regions, default_block_size
-from .temporal import TemporalConfig, process, review_flags
+from .temporal import TemporalConfig, estimated_only_ranges, process, review_flags
 from . import video as vid
 
 
@@ -88,17 +89,19 @@ def run_detection(
     src: str,
     info: vid.VideoInfo,
     det: Detector,
-    infer_size: int,
+    detect_scale: int,
     limit_frames: int | None,
     quiet: bool,
     frame_step: int = 1,
+    tta: bool = False,
+    tiles: int = 1,
 ) -> tuple[dict[int, list[Detection]], int]:
-    dec_w, dec_h = vid.detection_frame_size(info, infer_size)
+    dec_w, dec_h = vid.detection_frame_size(info, detect_scale)
     frame_bytes = dec_w * dec_h * 3
-    # 正方フレーム座標(infer_size) -> 元動画座標 の倍率
-    scale_back = info.width / dec_w * infer_size
+    # デコード後フレーム座標 -> 元動画座標 の倍率
+    scale_back = info.width / dec_w
 
-    proc = vid.open_detection_reader(src, infer_size, limit_frames)
+    proc = vid.open_detection_reader(src, detect_scale, limit_frames)
     err: list[str] = []
     _drain(proc.stderr, err)
 
@@ -107,7 +110,6 @@ def run_detection(
         total = min(total, limit_frames) if total else limit_frames
     prog = None if quiet else Progress(total, "パス1 検出")
 
-    square = np.zeros((infer_size, infer_size, 3), dtype=np.uint8)
     per_frame: dict[int, list[Detection]] = {}
     idx = 0
     try:
@@ -115,12 +117,22 @@ def run_detection(
             raw = proc.stdout.read(frame_bytes)
             if len(raw) < frame_bytes:
                 break
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape(dec_h, dec_w, 3)
             if frame_step <= 1 or idx % frame_step == 0:
-                # 右下パディングで正方に（nudenet の前処理と同じ規約）
-                square[:] = 0
-                square[:dec_h, :dec_w] = frame
-                per_frame[idx] = det.detect_square(square, scale_back)
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(dec_h, dec_w, 3)
+                dets = det.detect_frame(frame, tta=tta, tiles=tiles)
+                per_frame[idx] = [
+                    Detection(
+                        d.cls,
+                        d.score,
+                        (
+                            int(round(d.box[0] * scale_back)),
+                            int(round(d.box[1] * scale_back)),
+                            int(round(d.box[2] * scale_back)),
+                            int(round(d.box[3] * scale_back)),
+                        ),
+                    )
+                    for d in dets
+                ]
             else:
                 # 間引いたフレームは空にしておく。補間とmemoryが埋める。
                 per_frame[idx] = []
@@ -137,7 +149,7 @@ def run_detection(
     if prog:
         prog.done(idx)
     if proc.returncode not in (0, None) and idx == 0:
-        raise RuntimeError("デコードに失敗しました:\n" + "\n".join(err[-10:]))
+        raise RuntimeError('デコードに失敗しました:\n' + '\n'.join(err[-10:]))
     return per_frame, idx
 
 
@@ -222,14 +234,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.path.join(os.path.dirname(os.path.dirname(__file__)), "weights", "640m.onnx"),
         help="ONNX モデル",
     )
-    g.add_argument("--infer-size", type=int, default=640, help="推論解像度")
+    g.add_argument(
+        "--infer-size",
+        type=int,
+        default=960,
+        help="推論解像度。実素材で 640->960 にすると検出フレームが約4割増えた。"
+        "1280 まで上げても伸びはわずかで時間が1.7倍になる",
+    )
     g.add_argument(
         "--conf",
         type=float,
-        default=0.12,
-        help="信頼度しきい値。Recall 優先なので既定より下げてある",
+        default=0.06,
+        help="信頼度しきい値。このモデルは実写でスコアが低く出るため大きく下げてある。"
+        "既定の 0.2 相当だと実素材で半分近く取りこぼす",
     )
-    g.add_argument("--nms-iou", type=float, default=0.45, help="NMS の IoU しきい値")
+    g.add_argument("--nms-iou", type=float, default=0.45, help="重複判定の IoU しきい値")
+    g.add_argument(
+        "--merge",
+        default="union",
+        choices=["union", "nms"],
+        help="重複検出のまとめ方。union は外接矩形に統合（被覆を減らさない）、"
+        "nms は最高スコアの1個だけ残す",
+    )
     g.add_argument(
         "--classes",
         default="default",
@@ -244,6 +270,24 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--threads", type=int, default=0, help="CPU 推論のスレッド数（0で自動）")
     g.add_argument("--device-id", type=int, default=1, help="DirectML のアダプタ番号")
     g.add_argument(
+        "--tta",
+        action="store_true",
+        help="水平反転した推論結果もマージする。推論回数2倍。取りこぼしが減る",
+    )
+    g.add_argument(
+        "--tiles",
+        type=int,
+        default=1,
+        help="フレームを NxN のタイルに割って各タイルも推論する。"
+        "小さく写る対象に効く。推論回数は (1 + N*N) 倍",
+    )
+    g.add_argument(
+        "--detect-scale",
+        type=int,
+        default=0,
+        help="パス1のデコード長辺 px（0で自動: タイル数に応じて決める）",
+    )
+    g.add_argument(
         "--frame-step",
         type=int,
         default=1,
@@ -253,8 +297,65 @@ def build_parser() -> argparse.ArgumentParser:
 
     t = p.add_argument_group("時間方向")
     t.add_argument("--max-gap", type=int, default=12, help="トラック継続を許す欠損フレーム数")
-    t.add_argument("--memory", type=int, default=6, help="トラック端を前後に保持するフレーム数")
-    t.add_argument("--margin-scale", type=float, default=1.0, help="膨張マージンの倍率")
+    t.add_argument("--memory", type=int, default=6, help="トラック終了後へ保持するフレーム数")
+    t.add_argument(
+        "--memory-before",
+        type=int,
+        default=0,
+        help="トラック開始前へ遡って保持するフレーム数（0で --memory と同じ）。"
+        "検出が遅れて始まる分を先回りして塞ぐ",
+    )
+    t.add_argument(
+        "--stitch-gap",
+        type=int,
+        default=90,
+        help="途切れたトラック同士を繋ぐ最大フレーム間隔（0で無効）。"
+        "位置と大きさが近ければ1本に繋ぎ、あいだは補間で埋める",
+    )
+    t.add_argument(
+        "--stitch-dist",
+        type=float,
+        default=0.12,
+        help="繋ぐ条件: 中心間距離が画面対角のこの比以内",
+    )
+    t.add_argument(
+        "--margin-scale",
+        type=float,
+        default=0.35,
+        help="膨張マージンの倍率。大きいと潰しすぎ、小さいと輪郭が出る",
+    )
+    t.add_argument(
+        "--margin-cap",
+        type=float,
+        default=16.0,
+        help="膨張マージンの絶対上限 px（0で無効）。潰しすぎを直接抑える",
+    )
+    t.add_argument(
+        "--motion-weight",
+        type=float,
+        default=2.0,
+        help="局所速度に掛ける係数。速く動く対象への追従遅れを吸収する。"
+        "この分は --margin-cap の外なので、静止時の大きさは変わらない",
+    )
+    t.add_argument(
+        "--motion-cap",
+        type=float,
+        default=60.0,
+        help="動き由来のマージンの上限 px",
+    )
+    t.add_argument(
+        "--hold-growth",
+        type=float,
+        default=0.5,
+        help="実観測から1フレーム離れるごとに領域を広げる割合（局所速度に対する比）。"
+        "memory や補間で推定している区間の不確かさを覆う",
+    )
+    t.add_argument(
+        "--estimated-factor",
+        type=float,
+        default=1.3,
+        help="補間/memory/橋渡し由来の領域に掛けるマージン倍率",
+    )
     t.add_argument(
         "--max-area-ratio",
         type=float,
@@ -263,10 +364,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     t.add_argument("--no-despike", action="store_true", help="デスパイクを無効にする")
     t.add_argument(
+        "--track-min-peak",
+        type=float,
+        default=0.0,
+        help="トラック内の最大スコアがこれ未満なら丸ごと捨てる（2閾値ヒステリシス）。"
+        "0で無効。--conf を大きく下げたときの誤検出対策",
+    )
+    t.add_argument(
         "--bridge-max",
         type=int,
         default=150,
         help="前後が覆われている未処理区間を埋める最大フレーム数",
+    )
+    t.add_argument(
+        "--estimate-gaps",
+        action="store_true",
+        help="検出が途切れた区間を推定で埋める。memory・橋渡し・不確かさ膨張が有効になり、"
+        "取りこぼしは減るが位置が当てずっぽうの領域が増えて塗り過ぎになる。"
+        "既定は無効で、実際に検出できた箇所と、検出と検出のあいだの補間だけを塗る",
     )
     t.add_argument(
         "--no-bridge",
@@ -288,6 +403,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="--detections の JSON があればパス1を飛ばす",
     )
     m.add_argument("--report", help="統計とレビュー対象フレームの JSON 出力先")
+    m.add_argument(
+        "--corrections",
+        help="人手レビュー（python -m automosaic.review）で作った修正 JSON。"
+        "時間方向の処理を通したあとに反映してから焼く",
+    )
     m.add_argument("--limit-frames", type=int, help="先頭 N フレームだけ処理（動作確認用）")
     m.add_argument("--detect-only", action="store_true", help="パス1だけ実行して統計を出す")
     m.add_argument("--quiet", action="store_true")
@@ -365,12 +485,28 @@ def main(argv: list[str] | None = None) -> int:
             provider=args.provider,
             intra_threads=args.threads,
             device_id=args.device_id,
+            merge_mode=args.merge,
         )
+        # タイル分割するときは、タイル1枚が推論解像度を埋められるだけデコードする
+        detect_scale = args.detect_scale or args.infer_size * max(1, args.tiles)
         if not args.quiet:
             print(f"プロバイダ {det.active_provider}")
+            extra = []
+            if args.tta:
+                extra.append("TTA(水平反転)")
+            if args.tiles > 1:
+                extra.append(f"{args.tiles}x{args.tiles} タイル")
+            if args.frame_step > 1:
+                extra.append(f"{args.frame_step}フレームおき")
+            print(
+                f"検出設定   conf {args.conf}  デコード長辺 {detect_scale}px"
+                + (f"  {' + '.join(extra)}" if extra else "")
+            )
         per_frame, n_frames = run_detection(
-            src, info, det, args.infer_size, args.limit_frames, args.quiet,
+            src, info, det, detect_scale, args.limit_frames, args.quiet,
             frame_step=max(1, args.frame_step),
+            tta=args.tta,
+            tiles=max(1, args.tiles),
         )
         if args.detections:
             os.makedirs(os.path.dirname(os.path.abspath(args.detections)), exist_ok=True)
@@ -397,6 +533,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # ---- 時間方向の安定化 ----
+    if not args.estimate_gaps:
+        # 既定は「実際に検出できた箇所だけ」。推定で広げる要素を落とし、
+        # 検出と検出のあいだの補間だけ残す。塗り過ぎを避けるための方針。
+        args.memory = min(args.memory, 2)
+        args.memory_before = min(args.memory_before or 2, 2)
+        args.bridge_max = 0
+        args.hold_growth = 0.0
+        args.motion_weight = min(args.motion_weight, 1.0)
+
     cfg = TemporalConfig(
         max_gap=args.max_gap,
         memory=args.memory,
@@ -405,11 +550,32 @@ def main(argv: list[str] | None = None) -> int:
         min_track_len=0 if args.no_despike else 2,
         bridge_max=0 if args.no_bridge else args.bridge_max,
         frame_step=max(1, args.frame_step),
+        track_min_peak=args.track_min_peak,
+        memory_before=args.memory_before,
+        stitch_max_gap=args.stitch_gap,
+        stitch_dist_ratio=args.stitch_dist,
+        margin_cap_px=args.margin_cap,
+        motion_weight=args.motion_weight,
+        hold_growth=args.hold_growth,
+        motion_cap=args.motion_cap,
+        estimated_factor=args.estimated_factor,
     )
     regions, stats = process(
         per_frame, n_frames, info.width, info.height, classes, cfg
     )
     left_open = stats.pop("_left_open", [])
+
+    # 手修正は自動処理の後段に置く。検出をやり直しても修正が生き残るし、
+    # ここで反映しておけば以降のレポートも修正後の状態を映す
+    # （手で足した領域は実観測扱いなので「推定のみ区間」から外れる）。
+    if args.corrections:
+        cset = corr.CorrectionSet.load(args.corrections)
+        if cset.items:
+            regions = corr.apply(regions, cset)
+            if not args.quiet:
+                print(f"手修正を反映: {args.corrections}（{len(cset.items)} 件）")
+        elif not args.quiet:
+            print(f"手修正ファイルに項目がありません: {args.corrections}")
 
     if not args.quiet:
         print("\n[検出統計]")
@@ -430,6 +596,23 @@ def main(argv: list[str] | None = None) -> int:
         if len(left_open) > 20:
             print(f"  ... 他 {len(left_open) - 20} 件")
 
+    est_only = estimated_only_ranges(regions, n_frames)
+    if est_only and not args.quiet:
+        fps = info.fps
+        total_est = sum(e - s + 1 for s, e, _ in est_only)
+        print()
+        print(
+            f"[推定のみで覆っている区間 {len(est_only)} 件 / 計 {total_est} フレーム]"
+        )
+        print("  検出器が効いておらず位置が当てずっぽうに近い。人手レビューの最優先対象")
+        for s_, e_, peak in sorted(est_only, key=lambda t: -(t[1] - t[0]))[:15]:
+            print(
+                f"  frame {s_:>7}-{e_:<7} ({s_ / fps:7.2f}s - {e_ / fps:7.2f}s)  "
+                f"{e_ - s_ + 1:>5} フレーム  最大 hold {peak}"
+            )
+        if len(est_only) > 15:
+            print(f"  ... 他 {len(est_only) - 15} 件")
+
     flags = review_flags(regions, n_frames)
     if args.report:
         with open(args.report, "w", encoding="utf-8") as f:
@@ -445,6 +628,17 @@ def main(argv: list[str] | None = None) -> int:
                             "frames": e - s,
                         }
                         for s, e in left_open
+                    ],
+                    "estimated_only_ranges": [
+                        {
+                            "start_frame": s_,
+                            "end_frame": e_,
+                            "start_sec": round(s_ / info.fps, 3),
+                            "end_sec": round(e_ / info.fps, 3),
+                            "frames": e_ - s_ + 1,
+                            "max_hold": peak,
+                        }
+                        for s_, e_, peak in est_only
                     ],
                     "review_frames": flags,
                 },

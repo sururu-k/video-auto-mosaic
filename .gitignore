@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-export/
 venv/
 
 # 素材・データセットは絶対にコミットしない
@@ -16,7 +17,7 @@ samples/
 *.jpg
 *.jpeg
 
-# モデル重み
+# モデル重み（gh release download で取得する。100MB超）
 *.pt
 *.onnx
 *.pth
@@ -26,6 +27,3 @@ weights/
 out/
 tmp/
 *.json.gz
-
-# 重み（gh release download で取得する。100MB超）
-weights/

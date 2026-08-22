@@ -136,12 +136,86 @@ def test_bridge_fills_gap_beyond_max_gap():
         f"素通しフレームが残っている: {stats['frames_with_mosaic']}/120"
     )
     assert stats["uncovered_gaps"] == 0
-    assert stats["frames_bridged"] > 0
-    print(f"  ギャップ橋渡し OK ({stats['frames_bridged']} フレームを補填)")
+    # 位置が近いのでトラックレット結合が先に繋ぐ。繋がらない場合は橋渡しが埋める
+    assert stats["tracks_stitched"] > 0 or stats["frames_bridged"] > 0
+    print(
+        f"  ギャップ補填 OK (結合 {stats['tracks_stitched']} / "
+        f"橋渡し {stats['frames_bridged']} フレーム)"
+    )
 
 
-def test_bridge_covers_both_endpoints():
-    """橋渡しの矩形が、区間の前後どちらの位置も含んでいること。"""
+def test_stitch_joins_intermittent_tracks():
+    """モザイクが「有り・なし・有り」と途切れる場面を1本に繋ぐこと。
+
+    位置と大きさが近い検出が数秒スパンで飛び飛びに出ると、max_gap を超えて
+    トラックが分断され、そのたびにモザイクが切れる。実素材で実際に起きた症状。
+    """
+    dets = {f: [] for f in range(200)}
+    # 30フレーム(1秒)おきに5フレームだけ検出される、という飛び飛びの出方
+    for start in range(0, 200, 30):
+        for f in range(start, min(200, start + 5)):
+            dets[f] = [
+                Detection("MALE_GENITALIA_EXPOSED", 0.2, (300 + start // 6, 200, 60, 60))
+            ]
+
+    off = TemporalConfig(max_gap=12, memory=6, stitch_max_gap=0, bridge_max=0)
+    on = TemporalConfig(max_gap=12, memory=6, stitch_max_gap=90, bridge_max=0)
+
+    _, s_off = process(dets, 200, 640, 480, {"MALE_GENITALIA_EXPOSED"}, off)
+    _, s_on = process(dets, 200, 640, 480, {"MALE_GENITALIA_EXPOSED"}, on)
+
+    assert s_on["tracks_stitched"] > 0, "トラックが繋がっていない"
+    assert s_on["frames_with_mosaic"] > s_off["frames_with_mosaic"], (
+        f"結合しても被覆が増えていない: {s_off['frames_with_mosaic']} -> "
+        f"{s_on['frames_with_mosaic']}"
+    )
+    # 最後の検出以降は memory の分しか伸びないので、そこは覆われなくてよい。
+    # 見たいのは「検出区間のあいだの途切れ」が消えていること。
+    r_on, _ = process(dets, 200, 640, 480, {"MALE_GENITALIA_EXPOSED"}, on)
+    last_detected = max(f for f, ds in dets.items() if ds)
+    for f in range(0, last_detected + 1):
+        assert r_on[f], f"検出区間のあいだのフレーム{f}が途切れている"
+    print(
+        f"  途切れトラックの結合 OK "
+        f"({s_off['frames_with_mosaic']} -> {s_on['frames_with_mosaic']}/200, "
+        f"検出区間内は連続)"
+    )
+
+
+def test_stitch_does_not_join_distant_objects():
+    """離れた位置の別対象までは繋がないこと。過剰に潰さないための歯止め。"""
+    dets = {f: [] for f in range(100)}
+    for f in range(0, 10):
+        dets[f] = [Detection("MALE_GENITALIA_EXPOSED", 0.5, (20, 20, 40, 40))]
+    for f in range(60, 70):
+        dets[f] = [Detection("MALE_GENITALIA_EXPOSED", 0.5, (560, 400, 40, 40))]
+
+    cfg = TemporalConfig(max_gap=12, memory=2, stitch_max_gap=90, bridge_max=0)
+    _, stats = process(dets, 100, 640, 480, {"MALE_GENITALIA_EXPOSED"}, cfg)
+    assert stats["tracks_stitched"] == 0, "離れた対象を繋いでしまっている"
+    print("  離れた対象は繋がない OK")
+
+
+def test_memory_before_extends_backwards():
+    """検出が遅れて始まる分を、開始前へ遡って塞げること。"""
+    dets = {f: [] for f in range(60)}
+    for f in range(30, 40):
+        dets[f] = [Detection("MALE_GENITALIA_EXPOSED", 0.5, (100, 100, 50, 50))]
+
+    cfg = TemporalConfig(memory=6, memory_before=20, stitch_max_gap=0, bridge_max=0)
+    regions, _ = process(dets, 60, 640, 480, {"MALE_GENITALIA_EXPOSED"}, cfg)
+
+    assert regions[10], "開始20フレーム前が塞がれていない"
+    assert not regions[9]
+    print("  開始前への遡り OK")
+
+
+def test_bridge_interpolates_between_endpoints():
+    """橋渡しは前後の外接矩形でなく線形補間になっていること。
+
+    外接矩形で塞ぐと、対象が大きく動いた区間で矩形が画面の大半を覆う。
+    「潰しすぎ」の主要因だったので補間に変更した。
+    """
     dets = {f: [] for f in range(60)}
     for f in range(0, 20):
         dets[f] = [Detection("FEMALE_GENITALIA_EXPOSED", 0.9, (100, 100, 50, 50))]
@@ -149,12 +223,32 @@ def test_bridge_covers_both_endpoints():
         dets[f] = [Detection("FEMALE_GENITALIA_EXPOSED", 0.9, (400, 300, 50, 50))]
 
     cfg = TemporalConfig(max_gap=5, memory=2, bridge_max=150, margin_scale=0.0)
-    regions, _ = process(dets, 60, 640, 480, {"FEMALE_GENITALIA_EXPOSED"}, cfg)
+    regions, stats = process(dets, 60, 640, 480, {"FEMALE_GENITALIA_EXPOSED"}, cfg)
+
+    assert stats["frames_with_mosaic"] == 60, "素通しフレームが残っている"
 
     box = regions[30][0][0]
-    assert box[0] <= 100 and box[1] <= 100
-    assert box[0] + box[2] >= 450 and box[1] + box[3] >= 350
-    print("  橋渡し矩形が両端を包含 OK")
+    # 両端を包含する外接矩形（幅350以上）にはならず、元の大きさ程度に収まる
+    assert box[2] < 150, f"橋渡し矩形が大きすぎる: 幅 {box[2]}"
+    # 位置は前後のあいだにある
+    assert 100 < box[0] < 400
+    assert 100 < box[1] < 300
+    print(f"  橋渡しの線形補間 OK (幅 {box[2]:.0f}, x {box[0]:.0f})")
+
+
+def test_margin_does_not_explode_on_low_scores():
+    """低スコアでもマージンが暴走しないこと。
+
+    以前は confidence 項が (1 - score) * base * 2 で、このモデルのように
+    スコアが常に低いと基礎マージンの何倍にも膨らんでいた。
+    """
+    dets = {0: [Detection("FEMALE_GENITALIA_EXPOSED", 0.15, (200, 200, 60, 60))]}
+    cfg = TemporalConfig(memory=0, min_track_len=0)
+    regions, _ = process(dets, 1, 640, 480, {"FEMALE_GENITALIA_EXPOSED"}, cfg)
+    box = regions[0][0][0]
+    ratio = (box[2] * box[3]) / (60 * 60)
+    assert ratio < 6.0, f"面積が {ratio:.1f} 倍に膨らんでいる"
+    print(f"  低スコア時のマージン抑制 OK (面積 {ratio:.2f}倍)")
 
 
 def test_long_gap_is_reported_not_silently_filled():
@@ -163,7 +257,8 @@ def test_long_gap_is_reported_not_silently_filled():
     for f in list(range(0, 20)) + list(range(380, 400)):
         dets[f] = [Detection("FEMALE_GENITALIA_EXPOSED", 0.9, (100, 100, 50, 50))]
 
-    cfg = TemporalConfig(max_gap=12, memory=6, bridge_max=150)
+    # 結合も無効にして、橋渡しの判断だけを見る
+    cfg = TemporalConfig(max_gap=12, memory=6, bridge_max=150, stitch_max_gap=0)
     _, stats = process(dets, 400, 640, 480, {"FEMALE_GENITALIA_EXPOSED"}, cfg)
 
     assert stats["uncovered_gaps"] == 1
