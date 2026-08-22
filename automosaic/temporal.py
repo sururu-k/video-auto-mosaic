@@ -17,6 +17,11 @@ from dataclasses import dataclass, field
 
 from .detector import Detection
 
+try:  # scipy があれば最適割当を使う。無くても動くようにしておく
+    from scipy.optimize import linear_sum_assignment as _lsa
+except Exception:  # noqa: BLE001
+    _lsa = None
+
 Box = tuple[float, float, float, float]  # x, y, w, h
 
 
@@ -81,7 +86,7 @@ class TemporalConfig:
     stitch_max_gap: int = 90   # 途切れたトラック同士を繋ぐ最大フレーム間隔（0で無効）
     stitch_iou: float = 0.10   # 繋ぐ条件その1: 端の矩形の IoU
     stitch_dist_ratio: float = 0.12  # 繋ぐ条件その2: 中心間距離が対角のこの比以内
-    stitch_size_ratio: float = 3.0   # 大きさがこの倍率を超えて違うものは繋がない
+    stitch_size_ratio: float = 5.0   # 大きさがこの倍率を超えて違うものは繋がない
     min_track_len: int = 2     # これ未満のトラックはデスパイク対象
     despike_conf: float = 0.35 # 最大スコアがこれ未満の短いトラックだけ落とす
     track_min_peak: float = 0.0  # トラック内の最大スコアがこれ未満なら丸ごと捨てる（0で無効）
@@ -148,13 +153,54 @@ def geometric_filter(
     return out, dropped
 
 
+def _assign(cost: list[list[float]], max_cost: float) -> list[tuple[int, int]]:
+    """トラックと検出の対応付けを解く。
+
+    scipy があればハンガリアン法で全体最適に解く。IoU の大きい順に貪欲で
+    取っていくと、対象が複数あるときに片方が取り違えられて軌跡が入れ替わる。
+    scipy が無い環境では従来どおり貪欲で近似する。
+    """
+    if not cost or not cost[0]:
+        return []
+
+    pairs: list[tuple[int, int]] = []
+    if _lsa is not None:
+        import numpy as _np
+
+        m = _np.asarray(cost, dtype=float)
+        rows, cols = _lsa(m)
+        for r, c in zip(rows, cols):
+            if m[r, c] <= max_cost:
+                pairs.append((int(r), int(c)))
+        return pairs
+
+    flat = sorted(
+        (
+            (cost[i][j], i, j)
+            for i in range(len(cost))
+            for j in range(len(cost[0]))
+            if cost[i][j] <= max_cost
+        )
+    )
+    used_r: set[int] = set()
+    used_c: set[int] = set()
+    for _, i, j in flat:
+        if i in used_r or j in used_c:
+            continue
+        used_r.add(i)
+        used_c.add(j)
+        pairs.append((i, j))
+    return pairs
+
+
 def build_tracks(
     per_frame: dict[int, list[Detection]], n_frames: int, cfg: TemporalConfig
 ) -> list[Track]:
-    """クラスごとに IoU 貪欲マッチングでトラックを作る。
+    """クラスごとにトラックを作る。
 
     max_gap フレームまでは検出が無くてもトラックを生かしておく。ByteTrack の
     「低スコア検出を捨てずに軌跡で救済する」考え方の簡易版。
+    対応付けはクラスごとに線形割当で解く（_assign 参照）。
     """
     tracks: list[Track] = []
     active: list[tuple[Track, int, Box]] = []  # (track, last_seen_frame, last_box)
@@ -165,33 +211,34 @@ def build_tracks(
         # 期限切れのトラックを active から外す
         active = [(t, lf, lb) for (t, lf, lb) in active if f - lf <= cfg.effective_max_gap]
 
-        used_det: set[int] = set()
-        used_track: set[int] = set()
+        matched_det: set[int] = set()
 
-        # 全ペアの IoU を出して、大きい順に貪欲マッチ
-        pairs = []
-        for ti, (t, lf, lb) in enumerate(active):
-            for di, d in enumerate(dets):
-                if d.cls != t.cls:
-                    continue
-                iou = _iou(lb, tuple(float(v) for v in d.box))
-                if iou >= cfg.iou_threshold:
-                    pairs.append((iou, ti, di))
-        pairs.sort(reverse=True)
-
-        for iou, ti, di in pairs:
-            if ti in used_track or di in used_det:
+        # クラスごとに割当を解く。クラスをまたいだ対応付けはしない
+        classes = {d.cls for d in dets}
+        for cls in classes:
+            t_idx = [i for i, (t, _, _) in enumerate(active) if t.cls == cls]
+            d_idx = [i for i, d in enumerate(dets) if d.cls == cls]
+            if not t_idx or not d_idx:
                 continue
-            used_track.add(ti)
-            used_det.add(di)
-            t, _, _ = active[ti]
-            box = tuple(float(v) for v in dets[di].box)
-            t.obs[f] = (box, dets[di].score)
-            active[ti] = (t, f, box)
+
+            cost = [
+                [
+                    1.0 - _iou(active[ti][2], tuple(float(v) for v in dets[di].box))
+                    for di in d_idx
+                ]
+                for ti in t_idx
+            ]
+            for r, c in _assign(cost, 1.0 - cfg.iou_threshold):
+                ti, di = t_idx[r], d_idx[c]
+                t, _, _ = active[ti]
+                box = tuple(float(v) for v in dets[di].box)
+                t.obs[f] = (box, dets[di].score)
+                active[ti] = (t, f, box)
+                matched_det.add(di)
 
         # マッチしなかった検出は新規トラック
         for di, d in enumerate(dets):
-            if di in used_det:
+            if di in matched_det:
                 continue
             box = tuple(float(v) for v in d.box)
             t = Track(cls=d.cls, obs={f: (box, d.score)})
@@ -606,8 +653,12 @@ def process(
     filtered, n_geo_dropped = geometric_filter(filtered, frame_w, frame_h, cfg)
     tracks = build_tracks(filtered, n_frames, cfg)
     n_tracks_before = len(tracks)
-    tracks, n_despiked = despike(tracks, cfg)
+    # 結合を先に、デスパイクを後に行う。順序が逆だと、単発の低スコア検出が
+    # 「短命かつ低スコア」として先に捨てられ、結合処理がそれを見る前に消える。
+    # 実際、位置が15pxしか離れていない検出が繋がらずに1.8秒の穴になっていた。
+    # 先に繋いでおけば、まとまったトラックとして評価されるので生き残る。
     tracks, n_stitched = stitch_tracks(tracks, frame_w, frame_h, cfg)
+    tracks, n_despiked = despike(tracks, cfg)
 
     speeds = _track_speed(tracks)
     dense = densify(tracks, n_frames, cfg)

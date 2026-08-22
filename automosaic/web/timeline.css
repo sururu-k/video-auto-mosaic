@@ -1,0 +1,150 @@
+/* 暗めの配色。長時間見るのでコントラストは強くしすぎない。 */
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: #16181c;
+  color: #d8dce2;
+  font: 13px/1.6 "Yu Gothic UI", "Meiryo", system-ui, sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  background: #1e2127;
+  border-bottom: 1px solid #2c313a;
+}
+
+header .titles { color: #aeb6c2; }
+header .sep { color: #4a515c; margin: 0 6px; }
+
+#save-status { padding: 3px 10px; border-radius: 3px; font-weight: bold; }
+#save-status.saved { background: #1f3b25; color: #7fd68f; }
+#save-status.dirty { background: #3b3418; color: #e0c76a; }
+#save-status.error { background: #45201f; color: #f08b86; }
+
+main { padding: 12px 14px 40px; }
+
+.stage { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+
+#player {
+  position: relative;
+  line-height: 0;
+  background: #000;
+  border: 1px solid #2c313a;
+}
+
+#player video, #player img {
+  display: block;
+  max-width: 100%;
+}
+
+/* 停止中だけ厳密フレーム画像を前に出す */
+#player img {
+  position: absolute;
+  left: 0; top: 0;
+  width: 100%; height: 100%;
+  display: none;
+}
+#player img.show { display: block; }
+
+#player canvas {
+  position: absolute;
+  left: 0; top: 0;
+  width: 100%; height: 100%;
+  cursor: crosshair;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.controls .field { color: #98a1ad; display: inline-flex; align-items: center; gap: 5px; }
+
+button {
+  background: #262b33;
+  color: #d8dce2;
+  border: 1px solid #39404b;
+  border-radius: 3px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font: inherit;
+}
+button:hover { background: #303742; }
+button:active { background: #3a4250; }
+
+select {
+  background: #14161a;
+  color: #d8dce2;
+  border: 1px solid #39404b;
+  border-radius: 3px;
+  padding: 3px 5px;
+  font: inherit;
+}
+
+input[type="number"] {
+  width: 76px;
+  background: #14161a;
+  color: #d8dce2;
+  border: 1px solid #39404b;
+  border-radius: 3px;
+  padding: 3px 5px;
+  font: inherit;
+}
+
+.hint {
+  color: #7d8794;
+  padding: 4px 8px;
+  border-left: 3px solid #39404b;
+}
+.hint.active { color: #ffd479; border-left-color: #ffd479; }
+
+.timeline-wrap { margin-top: 14px; }
+#timeline { width: 100%; display: block; cursor: pointer; background: #101216; }
+
+.legend { display: flex; gap: 16px; margin-top: 5px; color: #98a1ad; }
+.legend .sw { display: inline-block; width: 11px; height: 11px; margin-right: 5px; }
+.sw-real { background: #3ba55d; }
+.sw-est { background: #d9b73c; }
+.sw-none { background: #d0453e; }
+.sw-manual { background: #e05a5a; }
+
+.lists { display: flex; gap: 18px; margin-top: 16px; align-items: flex-start; }
+.list-col { flex: 1 1 0; min-width: 0; }
+.list-col h2 { font-size: 13px; margin: 0 0 2px; color: #c5cbd4; }
+.list-col .note { margin: 0 0 6px; color: #7d8794; font-size: 12px; }
+
+.list-col ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid #2c313a;
+  background: #1a1d22;
+}
+.list-col li {
+  padding: 4px 8px;
+  border-bottom: 1px solid #24282f;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.list-col li:hover { background: #262b33; }
+.list-col li.current { background: #2f3946; }
+.list-col li .len { color: #7d8794; }
+.list-col li.done { color: #6f7a86; }
+
+.keys { margin-top: 18px; color: #7d8794; }
+.keys b { color: #aeb6c2; margin-right: 8px; }
+
+/* 検査キューへ戻る導線。PC でこの画面だけを開いてしまったときに迷わせない */
+header .titles a { color: #7fb0ff; }

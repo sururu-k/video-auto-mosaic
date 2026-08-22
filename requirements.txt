@@ -2,3 +2,4 @@
 onnxruntime-directml>=1.20
 opencv-python-headless>=4.9
 numpy>=1.26
+scipy>=1.11          # トラックと検出の対応付けを線形割当で解く（無くても貪欲で動く）

@@ -182,6 +182,30 @@ def test_stitch_joins_intermittent_tracks():
     )
 
 
+def test_assignment_does_not_swap_nearby_objects():
+    """近接した2つの対象の軌跡が入れ替わらないこと。
+
+    IoU の大きい順に貪欲で取ると、片方が先に別のトラックへ吸われて
+    軌跡が交差する。線形割当なら全体最適で解くので入れ替わりにくい。
+    """
+    dets = {}
+    for f in range(20):
+        # 2つの対象が近接しながら並んで動く
+        dets[f] = [
+            Detection("MALE_GENITALIA_EXPOSED", 0.5, (100 + f * 4, 200, 60, 60)),
+            Detection("MALE_GENITALIA_EXPOSED", 0.5, (170 + f * 4, 200, 60, 60)),
+        ]
+
+    cfg = TemporalConfig(memory=0, min_track_len=0, stitch_max_gap=0, bridge_max=0)
+    regions, stats = process(dets, 20, 640, 480, {"MALE_GENITALIA_EXPOSED"}, cfg)
+
+    # 2本のトラックが最後まで維持されること（入れ替わると分断されて増える）
+    assert stats["tracks_final"] == 2, f"トラックが {stats['tracks_final']} 本になっている"
+    for f in range(20):
+        assert len(regions[f]) == 2, f"フレーム{f}の領域が {len(regions[f])} 個"
+    print("  近接対象の割当 OK")
+
+
 def test_stitch_does_not_join_distant_objects():
     """離れた位置の別対象までは繋がないこと。過剰に潰さないための歯止め。"""
     dets = {f: [] for f in range(100)}
@@ -278,18 +302,44 @@ def test_edge_gap_not_bridged():
     print("  端の区間は橋渡ししない OK")
 
 
-def test_despike_before_interpolation():
-    """孤立した低スコア検出が長い区間に引き伸ばされないこと。"""
+def test_despike_drops_scattered_noise():
+    """ばらけた低スコアの誤検出が長い区間に引き伸ばされないこと。
+
+    同じ位置に出る弱い検出は結合されて生き残る（実在する対象を弱く拾っている
+    可能性が高い）。位置が離れているものはノイズとみなして落とす。
+    """
     dets = {f: [] for f in range(60)}
     dets[0] = [Detection("FEMALE_GENITALIA_EXPOSED", 0.15, (10, 10, 20, 20))]
-    dets[50] = [Detection("FEMALE_GENITALIA_EXPOSED", 0.15, (10, 10, 20, 20))]
+    dets[50] = [Detection("FEMALE_GENITALIA_EXPOSED", 0.15, (560, 440, 20, 20))]
 
     cfg = TemporalConfig(max_gap=12, memory=0, min_track_len=2, despike_conf=0.35)
     regions, stats = process(dets, 60, 640, 480, {"FEMALE_GENITALIA_EXPOSED"}, cfg)
 
+    assert stats["tracks_stitched"] == 0, "離れたノイズを繋いでしまっている"
     assert stats["tracks_despiked"] == 2
     assert stats["frames_with_mosaic"] == 0
-    print("  デスパイク OK")
+    print("  ばらけたノイズのデスパイク OK")
+
+
+def test_stitch_runs_before_despike():
+    """結合がデスパイクより先に走ること。
+
+    順序が逆だと、単発の低スコア検出が先に捨てられ、結合処理がそれを見る前に
+    消える。実素材で、15pxしか離れていない検出が繋がらず1.8秒の穴になっていた。
+    """
+    dets = {f: [] for f in range(60)}
+    # 同じ位置に、単発の弱い検出が離れて2回出る
+    dets[0] = [Detection("FEMALE_GENITALIA_EXPOSED", 0.15, (100, 100, 40, 40))]
+    dets[30] = [Detection("FEMALE_GENITALIA_EXPOSED", 0.15, (103, 102, 40, 40))]
+
+    cfg = TemporalConfig(max_gap=12, memory=2, min_track_len=2, despike_conf=0.35)
+    regions, stats = process(dets, 60, 640, 480, {"FEMALE_GENITALIA_EXPOSED"}, cfg)
+
+    assert stats["tracks_stitched"] == 1, "結合されていない（デスパイクが先に消している）"
+    assert stats["tracks_despiked"] == 0
+    for f in range(0, 31):
+        assert regions[f], f"フレーム{f}が埋まっていない"
+    print("  結合がデスパイクより先 OK")
 
 
 def test_high_score_single_frame_survives():

@@ -1,450 +1,415 @@
 "use strict";
 
-// automosaic レビュー UI。
-// 見るべき区間だけを提示して、そこだけ直すための画面。全フレームを送るのは
-// 被覆状況の文字列と矩形リストだけで、絵は必要なフレームだけ取りに行く。
+// 検査キュー画面。
+//
+// 「どのフレームを見るか」はサーバが決める。画面はそれを1枚ずつ出して、
+// 押された判定を返すだけにしてある。判定の記録もサーバ持ちなので、
+// 端末を閉じても、別の端末で開き直しても続きから再開できる。
+//
+// 操作は指だけで完結させる。キーボードの割り当ては残してあるが、
+// それが無いと出来ないことは1つも作らない。
 
 const $ = (id) => document.getElementById(id);
 
+// トークンは URL から拾う。サーバが Cookie にも移すので画像は素の URL でも
+// 通るが、Cookie が消えている端末でも動くように毎回付け直す。
+const TOKEN = new URLSearchParams(location.search).get("t") || "";
+
+function url(path, params) {
+  const p = new URLSearchParams(params || {});
+  if (TOKEN) p.set("t", TOKEN);
+  const q = p.toString();
+  return q ? path + "?" + q : path;
+}
+
 const el = {
-  videoName: $("video-name"),
-  videoMeta: $("video-meta"),
-  save: $("save-status"),
-  video: $("video"),
-  still: $("still"),
-  overlay: $("overlay"),
-  player: $("player"),
-  frameInput: $("frame-input"),
-  frameTotal: $("frame-total"),
-  timeLabel: $("time-label"),
+  pos: $("pos"),
+  reason: $("reason"),
+  save: $("save"),
+  fill: $("progress-fill"),
+  shot: $("shot"),
+  ov: $("ov"),
+  banner: $("banner"),
+  judge: $("judge"),
+  mark: $("mark"),
+  size: $("size"),
   sizeLabel: $("size-label"),
-  spanInput: $("span-input"),
-  classSelect: $("class-select"),
-  confSlider: $("conf-slider"),
-  confLabel: $("conf-label"),
-  rawToggle: $("raw-toggle"),
-  corrCount: $("corr-count"),
-  hint: $("mode-hint"),
-  timeline: $("timeline"),
-  estList: $("est-list"),
-  uncList: $("unc-list"),
-  manList: $("man-list"),
-  estCount: $("est-count"),
-  uncCount: $("unc-count"),
-  manCount: $("man-count"),
+  spanRow: $("span-row"),
+  confirm: $("btn-confirm"),
+  sheet: $("sheet"),
+  sheetInfo: $("sheet-info"),
+  optClass: $("opt-class"),
+  optStep: $("opt-step"),
 };
 
 const S = {
-  state: null,          // /api/state の中身
-  corrections: [],      // 手修正の全リスト。これをそのまま POST する
-  cur: 0,               // 現在フレーム
-  addMode: false,       // M で入る追加モード
-  pending: null,        // 置いたがまだ適用していない矩形 [x,y,w,h]
-  size: [64, 64],       // 追加する矩形のサイズ
-  mouse: null,          // 動画座標系のカーソル位置。D の対象判定に使う
-  stillToken: 0,        // 古いフレーム画像の到着で上書きされるのを防ぐ
-  playing: false,
-  confMin: 0,
+  state: null,
+  items: [],
+  idx: 0,
+  version: 0,
+  sizePct: 100,
+  span: 0,
+  pending: null,   // 置いた矩形 [x, y, w, h]（動画座標）
+  tap: null,       // 正規化タップ座標。サーバへはこちらを送る
+  marking: false,
+  busy: false,
+  imgWidth: 720,
 };
 
-// 由来ごとの色。青=自動検出、黄=補間/memory/橋渡し、赤=手修正。
-const SRC_COLOR = {
-  d: "#4a9eff",
-  i: "#ffd479",
-  m: "#ffd479",
-  b: "#ffb347",
-  x: "#ff5a5a",
-};
-const SRC_NAME = {
-  d: "検出",
-  i: "補間",
-  m: "memory",
-  b: "橋渡し",
-  x: "手修正",
-};
+const SRC_COLOR = { d: "#4a9eff", i: "#ffd479", m: "#ffd479", b: "#ffb347", x: "#ff5a5a" };
 
 // --------------------------------------------------------------------
-// 読み込み
+// 起動
 // --------------------------------------------------------------------
+
+async function get(path, params) {
+  const res = await fetch(url(path, params));
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  return res.json();
+}
+
+async function post(path, body) {
+  const res = await fetch(url(path), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  return res.json();
+}
 
 async function boot() {
-  S.state = await (await fetch("/api/state")).json();
-  const c = await (await fetch("/api/corrections")).json();
-  S.corrections = c.corrections || [];
+  // light=1 で全フレームぶんの矩形と被覆文字列を落としてもらう。
+  // この画面が使うのは解像度・クラス・既定サイズだけで、あれは1時間の
+  // 動画だと 10MB を超える。端末の回線では起動しなくなる
+  S.state = await get("/api/state", { light: 1 });
+  const q = await get("/api/queue");
+  S.version = q.version;
+  S.items = q.items;
 
-  const st = S.state;
-  S.size = st.default_size.slice();
+  el.ov.width = S.state.width;
+  el.ov.height = S.state.height;
 
-  el.videoName.textContent = st.video;
-  el.videoMeta.textContent =
-    `${st.width}x${st.height}  ${st.fps.toFixed(3)} fps  ${st.n_frames} フレーム` +
-    `  /  再生: ${st.rendered || "なし"}`;
-  el.frameTotal.textContent = `/ ${st.n_frames - 1}`;
-  el.frameInput.max = st.n_frames - 1;
+  // 送ってもらう画像の幅。原寸を投げさせると1枚に数 MB かかり、
+  // 判定の手応えが消える。画面に映る以上の解像度は要らない
+  const dpr = window.devicePixelRatio || 1;
+  S.imgWidth = Math.min(
+    S.state.width,
+    Math.max(480, Math.round(Math.min(window.screen.width, 1280) * dpr))
+  );
 
-  el.overlay.width = st.width;
-  el.overlay.height = st.height;
-  el.player.style.width = st.width + "px";
-  el.still.style.aspectRatio = `${st.width} / ${st.height}`;
-
-  for (const name of st.classes) {
+  for (const name of S.state.classes) {
     const o = document.createElement("option");
     o.value = name;
     o.textContent = name;
-    if (name === st.default_class) o.selected = true;
-    el.classSelect.appendChild(o);
+    if (name === S.state.default_class) o.selected = true;
+    el.optClass.appendChild(o);
   }
+  el.optStep.value = q.step;
+  $("opt-all").checked = q.all_frames;
+  $("link-timeline").href = url("/timeline");
 
-  if (st.has_video) {
-    el.video.src = "/video";
+  buildSpanButtons(q.step);
+  updateSize();
+  updateProgress(q.progress);
+  S.idx = firstUnjudged(0);
+  show();
+}
+
+// --------------------------------------------------------------------
+// 表示
+// --------------------------------------------------------------------
+
+function cur() {
+  return S.items[S.idx] || null;
+}
+
+function frameUrl(frame, width) {
+  const p = { n: frame, fmt: "jpg", w: width, v: S.version };
+  if ($("opt-raw").checked) p.raw = 1;
+  return url("/frame", p);
+}
+
+function show() {
+  const it = cur();
+  if (!it) {
+    el.shot.removeAttribute("src");
+    el.reason.textContent = "";
+    el.pos.textContent = S.items.length ? "全部見終わりました" : "対象がありません";
+    banner(S.items.length ? "すべて判定済みです。設定から間隔や対象を変えられます" : "");
+    clearOverlay();
+    return;
+  }
+  el.shot.src = frameUrl(it.frame, S.imgWidth);
+  el.reason.textContent = `${it.label}  frame ${it.frame}`;
+  el.reason.className = "tag p" + it.priority;
+  el.pos.textContent = `${S.idx + 1} / ${S.items.length}`;
+  el.pos.title = `frame ${it.frame}`;
+  drawBoxes();
+  prefetch();
+  if (it.verdict) {
+    banner({ ok: "判定済み: 問題なし", fixed: "判定済み: 塞いだ", unsure: "判定済み: 保留" }[it.verdict]);
   } else {
-    // 再生用の動画が無いときはコマ送りだけで運用する
-    el.video.style.display = "none";
-    el.player.style.height = st.height + "px";
+    banner("");
   }
-
-  updateSizeLabel();
-  renderLists();
-  setFrame(0, true);
-  drawTimeline();
-  tick();
 }
 
-// --------------------------------------------------------------------
-// フレーム移動
-// --------------------------------------------------------------------
-
-function setFrame(n, force) {
-  const st = S.state;
-  n = Math.max(0, Math.min(st.n_frames - 1, Math.round(n)));
-  if (n === S.cur && !force) return;
-  S.cur = n;
-  el.frameInput.value = n;
-  el.timeLabel.textContent = (n / st.fps).toFixed(2) + "s";
-
-  if (!S.playing) {
-    // フレーム中央の時刻を狙う。境界ちょうどだと前後どちらが出るか不定
-    if (st.has_video) el.video.currentTime = (n + 0.5) / st.fps;
-    loadStill(n);
+function prefetch() {
+  // 次の2枚を先読みする。/frame は世代番号付きの URL だけキャッシュ可なので、
+  // 修正が入れば URL ごと変わり、古い絵が残ることはない
+  for (let k = 1; k <= 2; k++) {
+    const it = S.items[S.idx + k];
+    if (it) new Image().src = frameUrl(it.frame, S.imgWidth);
   }
-  draw();
-  drawTimeline();
-  markCurrentInLists();
 }
 
-function loadStill(n) {
-  const token = ++S.stillToken;
-  const raw = el.rawToggle.checked ? "&raw=1" : "";
-  const img = new Image();
-  img.onload = () => {
-    if (token !== S.stillToken) return; // 古い要求。捨てる
-    el.still.src = img.src;
-    el.still.classList.add("show");
-  };
-  img.src = `/frame?n=${n}${raw}`;
+function clearOverlay() {
+  const ctx = el.ov.getContext("2d");
+  ctx.clearRect(0, 0, el.ov.width, el.ov.height);
 }
 
-function hideStill() {
-  S.stillToken++;
-  el.still.classList.remove("show");
-}
+function drawBoxes() {
+  clearOverlay();
+  if (!$("opt-boxes").checked && !S.pending) return;
+  const ctx = el.ov.getContext("2d");
+  // 端末では画面に対して縮んで表示されるので、線幅は解像度に比例させる
+  const lw = Math.max(2, Math.round(S.state.width / 400));
 
-function tick() {
-  if (S.playing && S.state.has_video) {
-    const n = Math.round(el.video.currentTime * S.state.fps);
-    if (n !== S.cur) {
-      S.cur = n;
-      el.frameInput.value = n;
-      el.timeLabel.textContent = (n / S.state.fps).toFixed(2) + "s";
-      draw();
-      drawTimeline();
+  if ($("opt-boxes").checked) {
+    const it = cur();
+    ctx.lineWidth = lw;
+    for (const r of (it && it.boxes) || []) {
+      ctx.strokeStyle = SRC_COLOR[r[4]] || "#ffffff";
+      ctx.strokeRect(r[0], r[1], r[2], r[3]);
     }
   }
-  requestAnimationFrame(tick);
-}
-
-function play() {
-  if (!S.state.has_video) return;
-  S.playing = true;
-  hideStill();
-  el.video.play();
-}
-
-function pause() {
-  S.playing = false;
-  el.video.pause();
-  setFrame(Math.round(el.video.currentTime * S.state.fps), true);
-}
-
-function togglePlay() {
-  if (S.playing) pause(); else play();
-}
-
-// --------------------------------------------------------------------
-// 重ね描き
-// --------------------------------------------------------------------
-
-function regionsAt(n) {
-  return (S.state.regions[String(n)] || []);
-}
-
-function draw() {
-  const ctx = el.overlay.getContext("2d");
-  ctx.clearRect(0, 0, el.overlay.width, el.overlay.height);
-  ctx.lineWidth = 2;
-  ctx.font = "12px sans-serif";
-
-  for (const r of regionsAt(S.cur)) {
-    const [x, y, w, h, src, score] = r;
-    if (src === "d" && score < S.confMin) continue; // 信頼度スライダで一時的に隠す
-    ctx.strokeStyle = SRC_COLOR[src] || "#ffffff";
-    ctx.strokeRect(x, y, w, h);
-    ctx.fillStyle = ctx.strokeStyle;
-    ctx.fillText(`${SRC_NAME[src] || src} ${score.toFixed(2)}`, x + 2, Math.max(12, y - 3));
-  }
-
   if (S.pending) {
-    ctx.setLineDash([6, 4]);
+    ctx.lineWidth = lw * 1.5;
+    ctx.setLineDash([lw * 4, lw * 3]);
     ctx.strokeStyle = "#ffffff";
     ctx.strokeRect(S.pending[0], S.pending[1], S.pending[2], S.pending[3]);
     ctx.setLineDash([]);
   }
 }
 
-// --------------------------------------------------------------------
-// タイムライン
-// --------------------------------------------------------------------
-
-function drawTimeline() {
-  const cv = el.timeline;
-  const w = cv.clientWidth;
-  if (cv.width !== w) cv.width = w;
-  const h = cv.height;
-  const ctx = cv.getContext("2d");
-  const st = S.state;
-  const cov = st.coverage;
-  const n = st.n_frames;
-
-  ctx.fillStyle = "#101216";
-  ctx.fillRect(0, 0, w, h);
-
-  const bandH = h - 10;
-  for (let px = 0; px < w; px++) {
-    const a = Math.floor((px * n) / w);
-    const b = Math.max(a + 1, Math.floor(((px + 1) * n) / w));
-    // 1px に何十フレームも入るので、その中でいちばん悪い状態を出す。
-    // 平均を取ると単発の素通しが消えて見えなくなる。
-    let worst = 1;
-    for (let f = a; f < b && f < n; f++) {
-      const c = cov.charCodeAt(f) - 48;
-      if (c === 0) { worst = 0; break; }
-      if (c === 2) worst = 2;
-    }
-    ctx.fillStyle = worst === 0 ? "#d0453e" : worst === 2 ? "#d9b73c" : "#3ba55d";
-    ctx.fillRect(px, 0, 1, bandH);
-  }
-
-  // 手修正のあるフレームを下段に赤で立てる
-  ctx.fillStyle = "#e05a5a";
-  for (const c of S.corrections) {
-    const px = Math.floor((c.frame * w) / n);
-    ctx.fillRect(px, bandH + 1, 2, 9);
-  }
-
-  // 現在位置
-  const cx = Math.floor((S.cur * w) / n);
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(cx, 0, 1, h);
+function banner(text) {
+  el.banner.textContent = text || "";
+  el.banner.classList.toggle("hidden", !text);
 }
 
-// --------------------------------------------------------------------
-// リスト
-// --------------------------------------------------------------------
-
-function rangeItem(r, ul) {
-  const li = document.createElement("li");
-  const t0 = (r.start / S.state.fps).toFixed(2);
-  const t1 = (r.end / S.state.fps).toFixed(2);
-  const a = document.createElement("span");
-  a.textContent = `${r.start} - ${r.end}  (${t0}s - ${t1}s)`;
-  const b = document.createElement("span");
-  b.className = "len";
-  b.textContent = `${r.frames}f`;
-  li.appendChild(a);
-  li.appendChild(b);
-  li.dataset.start = r.start;
-  li.dataset.end = r.end;
-  li.onclick = () => setFrame(r.start, true);
-  ul.appendChild(li);
-}
-
-function renderLists() {
-  const st = S.state;
-  el.estList.innerHTML = "";
-  el.uncList.innerHTML = "";
-  el.manList.innerHTML = "";
-
-  for (const r of st.estimated_only_ranges) rangeItem(r, el.estList);
-  for (const r of st.uncovered_ranges) rangeItem(r, el.uncList);
-
-  const estFrames = st.estimated_only_ranges.reduce((a, r) => a + r.frames, 0);
-  const uncFrames = st.uncovered_ranges.reduce((a, r) => a + r.frames, 0);
-  el.estCount.textContent =
-    `${st.estimated_only_ranges.length} 件 / ${estFrames} フレーム ` +
-    `(${(100 * estFrames / st.n_frames).toFixed(1)}%)`;
-  el.uncCount.textContent = `${st.uncovered_ranges.length} 件 / ${uncFrames} フレーム`;
-
-  // 手修正はフレームごとにまとめる。連番で置くと1件ずつでは読めない
-  const byFrame = new Map();
-  for (const c of S.corrections) {
-    byFrame.set(c.frame, (byFrame.get(c.frame) || 0) + 1);
-  }
-  const frames = [...byFrame.keys()].sort((a, b) => a - b);
-  for (const f of frames) {
-    const li = document.createElement("li");
-    const a = document.createElement("span");
-    a.textContent = `frame ${f}  (${(f / st.fps).toFixed(2)}s)`;
-    const b = document.createElement("span");
-    b.className = "len";
-    b.textContent = `${byFrame.get(f)}`;
-    li.appendChild(a);
-    li.appendChild(b);
-    li.dataset.start = f;
-    li.dataset.end = f;
-    li.onclick = () => setFrame(f, true);
-    el.manList.appendChild(li);
-  }
-  el.manCount.textContent = `${S.corrections.length} 件 / ${frames.length} フレーム`;
-  el.corrCount.textContent = S.corrections.length;
-  markCurrentInLists();
-}
-
-function markCurrentInLists() {
-  for (const ul of [el.estList, el.uncList, el.manList]) {
-    for (const li of ul.children) {
-      const inside = S.cur >= +li.dataset.start && S.cur <= +li.dataset.end;
-      li.classList.toggle("current", inside);
-      if (inside) li.scrollIntoView({ block: "nearest" });
-    }
-  }
-}
-
-// --------------------------------------------------------------------
-// 修正
-// --------------------------------------------------------------------
-
-function setSaveStatus(kind, text) {
-  el.save.className = kind;
+function setSave(kind, text) {
+  el.save.className = "save " + kind;
   el.save.textContent = text;
 }
 
-async function pushCorrections() {
-  setSaveStatus("dirty", "保存中");
+function updateProgress(p) {
+  if (!p) return;
+  const pct = p.total ? (100 * p.done) / p.total : 0;
+  el.fill.style.width = pct.toFixed(1) + "%";
+  el.sheetInfo.textContent =
+    `${p.total} 枚中 ${p.done} 枚判定済み（残り ${p.remaining}）` +
+    `  問題なし ${p.counts.ok} / 塞いだ ${p.counts.fixed} / 保留 ${p.counts.unsure}`;
+  $("btn-undo").disabled = !p.can_undo;
+  $("btn-undo2").disabled = !p.can_undo;
+}
+
+// --------------------------------------------------------------------
+// 移動
+// --------------------------------------------------------------------
+
+function firstUnjudged(from) {
+  for (let i = from; i < S.items.length; i++) if (!S.items[i].verdict) return i;
+  for (let i = 0; i < from; i++) if (!S.items[i].verdict) return i;
+  return S.items.length ? S.items.length : 0;
+}
+
+function goto(i) {
+  cancelMark();
+  S.idx = Math.max(0, Math.min(S.items.length, i));
+  show();
+}
+
+function advance() {
+  goto(firstUnjudged(S.idx + 1));
+}
+
+// --------------------------------------------------------------------
+// 判定
+// --------------------------------------------------------------------
+
+async function judge(verdict, extra) {
+  const it = cur();
+  if (!it || S.busy) return;
+  S.busy = true;
+  setSave("busy", "保存中");
   try {
-    const res = await fetch("/api/corrections", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ corrections: S.corrections }),
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const d = await res.json();
-    // 手修正は実観測扱いなので、帯の色も推定のみ区間も変わる。丸ごと差し替える
-    S.state.coverage = d.coverage;
-    S.state.regions = d.regions;
-    S.state.estimated_only_ranges = d.estimated_only_ranges;
-    S.state.uncovered_ranges = d.uncovered_ranges;
-    setSaveStatus("saved", `保存済み (${d.n_corrections} 件)`);
-    renderLists();
-    drawTimeline();
-    draw();
-    if (!S.playing) loadStill(S.cur); // モザイクが乗った絵に差し替える
+    const d = await post("/api/mark", Object.assign({ frame: it.frame, verdict }, extra || {}));
+    it.verdict = verdict;
+    // 修正で領域が変わったら、その枚の矩形と画像の世代番号を入れ替える
+    it.boxes = d.regions;
+    S.version = d.version;
+    updateProgress(d.progress);
+    setSave("ok", `保存済 ${d.n_corrections}`);
+    advance();
   } catch (e) {
-    setSaveStatus("error", "保存失敗: " + e.message);
+    setSave("err", "保存できません");
+    banner("保存できませんでした: " + e.message);
+  } finally {
+    S.busy = false;
   }
 }
 
-function placePending(cx, cy) {
-  const [w, h] = S.size;
+async function undo() {
+  if (S.busy) return;
+  S.busy = true;
+  setSave("busy", "戻しています");
+  try {
+    const d = await post("/api/undo");
+    if (!d.ok) {
+      setSave("ok", "保存済");
+      banner(d.error || "戻せません");
+      return;
+    }
+    S.version = d.version;
+    const i = S.items.findIndex((x) => x.frame === d.frame);
+    if (i >= 0) {
+      S.items[i].verdict = null;
+      S.items[i].boxes = d.regions;
+      S.idx = i;
+    }
+    updateProgress(d.progress);
+    setSave("ok", `保存済 ${d.n_corrections}`);
+    cancelMark();
+    show();
+    banner(`frame ${d.frame} の判定を取り消しました`);
+  } catch (e) {
+    setSave("err", "戻せません");
+    banner("取り消せませんでした: " + e.message);
+  } finally {
+    S.busy = false;
+  }
+}
+
+// --------------------------------------------------------------------
+// 位置の指定
+// --------------------------------------------------------------------
+
+function startMark() {
+  if (!cur()) return;
+  S.marking = true;
+  S.pending = null;
+  S.tap = null;
+  document.body.classList.add("marking");
+  el.judge.classList.add("hidden");
+  el.mark.classList.remove("hidden");
+  el.confirm.disabled = true;
+  el.confirm.textContent = "画像をタップしてください";
+  banner("漏れている場所を、画像の上で直接タップしてください");
+  drawBoxes();
+}
+
+function cancelMark() {
+  if (!S.marking) return;
+  S.marking = false;
+  S.pending = null;
+  S.tap = null;
+  document.body.classList.remove("marking");
+  el.judge.classList.remove("hidden");
+  el.mark.classList.add("hidden");
+  banner("");
+  drawBoxes();
+}
+
+function boxSize() {
+  const [w, h] = S.state.default_size;
+  return [
+    Math.max(8, Math.round((w * S.sizePct) / 100)),
+    Math.max(8, Math.round((h * S.sizePct) / 100)),
+  ];
+}
+
+function placeFromTap(nx, ny) {
+  // サーバ側の tap_to_box と同じ規則で置く。ここで違う計算をすると
+  // 「見えている枠」と「実際に塞がれる場所」がずれる
+  const [bw, bh] = boxSize();
+  const W = S.state.width, H = S.state.height;
+  const w = Math.max(4, Math.min(W, bw));
+  const h = Math.max(4, Math.min(H, bh));
+  const cx = Math.min(Math.max(nx, 0), 1) * W;
+  const cy = Math.min(Math.max(ny, 0), 1) * H;
+  S.tap = [nx, ny];
   S.pending = [
-    Math.round(cx - w / 2),
-    Math.round(cy - h / 2),
+    Math.min(Math.max(cx - w / 2, 0), W - w),
+    Math.min(Math.max(cy - h / 2, 0), H - h),
     w,
     h,
   ];
-  el.hint.classList.remove("active");
-  el.hint.textContent = "矩形を置きました。1 でこのフレームだけ / 2 でここから N フレームに適用";
-  S.addMode = false;
-  draw();
+  el.confirm.disabled = false;
+  el.confirm.textContent = "この位置で確定";
+  banner("大きさは下のスライダで調整できます");
+  drawBoxes();
 }
 
-function applyPending(nFrames) {
-  if (!S.pending) {
-    el.hint.textContent = "先に M を押して動画上をクリックし、矩形を置いてください";
-    el.hint.classList.add("active");
-    return;
-  }
-  const cls = el.classSelect.value;
-  const last = Math.min(S.state.n_frames - 1, S.cur + nFrames - 1);
-  for (let f = S.cur; f <= last; f++) {
-    S.corrections.push({
-      frame: f,
-      box: S.pending.slice(),
-      class: cls,
-      kind: "add",
-    });
-  }
-  S.pending = null;
-  el.hint.textContent =
-    `frame ${S.cur}-${last} に ${cls} を追加しました`;
-  pushCorrections();
+function updateSize() {
+  const [w, h] = boxSize();
+  el.sizeLabel.textContent = `${w}x${h}px`;
+  if (S.tap) placeFromTap(S.tap[0], S.tap[1]);
 }
 
-function deleteUnderCursor() {
-  if (!S.mouse) return;
-  const [mx, my] = S.mouse;
-  // 後ろから見て最初に当たった1件だけ消す（corrections.remove_at と同じ規則）
-  for (let i = S.corrections.length - 1; i >= 0; i--) {
-    const c = S.corrections[i];
-    if (c.frame !== S.cur) continue;
-    const [x, y, w, h] = c.box;
-    if (mx >= x && mx <= x + w && my >= y && my <= y + h) {
-      S.corrections.splice(i, 1);
-      el.hint.textContent = `frame ${S.cur} の手修正を1件消しました`;
-      pushCorrections();
-      return;
-    }
-  }
-  el.hint.textContent = "カーソルの下に手修正がありません";
-}
-
-function undoLast() {
-  if (!S.corrections.length) return;
-  S.corrections.pop();
-  pushCorrections();
-}
-
-function nextEstimatedRange() {
-  const ranges = S.state.estimated_only_ranges;
-  for (const r of ranges) {
-    if (r.start > S.cur) { setFrame(r.start, true); return; }
-  }
-  if (ranges.length) setFrame(ranges[0].start, true); // 末尾まで来たら先頭へ戻る
-}
-
-function updateSizeLabel() {
-  el.sizeLabel.textContent = `${S.size[0]} x ${S.size[1]} px`;
-}
-
-function scaleSize(k) {
-  S.size = [
-    Math.max(8, Math.round(S.size[0] * k)),
-    Math.max(8, Math.round(S.size[1] * k)),
+function buildSpanButtons(step) {
+  const opts = [
+    { v: 0, label: "このコマだけ" },
+    { v: step, label: `前後 ${step}` },
+    { v: step * 3, label: `前後 ${step * 3}` },
   ];
-  updateSizeLabel();
-  if (S.pending) {
-    const cx = S.pending[0] + S.pending[2] / 2;
-    const cy = S.pending[1] + S.pending[3] / 2;
-    placePending(cx, cy);
+  S.span = opts[1].v;
+  el.spanRow.innerHTML = "";
+  for (const o of opts) {
+    const b = document.createElement("button");
+    b.className = "mid span-btn" + (o.v === S.span ? " on" : "");
+    b.textContent = o.label;
+    b.onclick = () => {
+      S.span = o.v;
+      for (const c of el.spanRow.children) c.classList.remove("on");
+      b.classList.add("on");
+    };
+    el.spanRow.appendChild(b);
+  }
+}
+
+function tapAt(ev) {
+  const t = ev.changedTouches ? ev.changedTouches[0] : ev;
+  const r = el.ov.getBoundingClientRect();
+  // 画面ピクセルではなく比率で持つ。端末の拡大率や回転で意味が変わらない
+  return [(t.clientX - r.left) / r.width, (t.clientY - r.top) / r.height];
+}
+
+el.ov.addEventListener("pointerdown", (ev) => {
+  if (!S.marking) return;
+  ev.preventDefault();
+  const [nx, ny] = tapAt(ev);
+  placeFromTap(nx, ny);
+});
+
+// --------------------------------------------------------------------
+// キューの組み直し
+// --------------------------------------------------------------------
+
+async function reloadQueue(params) {
+  setSave("busy", "作り直し中");
+  try {
+    const q = await get("/api/queue", Object.assign({ rebuild: 1 }, params || {}));
+    S.items = q.items;
+    S.version = q.version;
+    el.optStep.value = q.step;
+    buildSpanButtons(q.step);
+    updateProgress(q.progress);
+    setSave("ok", "保存済");
+    S.idx = firstUnjudged(0);
+    show();
+  } catch (e) {
+    setSave("err", "作り直せません");
+    banner(e.message);
   }
 }
 
@@ -452,77 +417,67 @@ function scaleSize(k) {
 // 入力
 // --------------------------------------------------------------------
 
-function canvasPos(ev) {
-  const r = el.overlay.getBoundingClientRect();
-  return [
-    ((ev.clientX - r.left) / r.width) * S.state.width,
-    ((ev.clientY - r.top) / r.height) * S.state.height,
-  ];
-}
+$("btn-ok").onclick = () => judge("ok");
+$("btn-unsure").onclick = () => judge("unsure");
+$("btn-ng").onclick = startMark;
+$("btn-undo").onclick = undo;
+$("btn-undo2").onclick = undo;
+$("btn-cancel").onclick = cancelMark;
 
-el.overlay.addEventListener("mousemove", (ev) => {
-  S.mouse = canvasPos(ev);
-});
+el.confirm.onclick = () => {
+  if (!S.tap) return;
+  const [w, h] = boxSize();
+  const payload = {
+    x: S.tap[0], y: S.tap[1], w, h,
+    span: S.span,
+    class: el.optClass.value || S.state.default_class,
+  };
+  cancelMark();
+  judge("fixed", payload);
+};
 
-el.overlay.addEventListener("click", (ev) => {
-  const [x, y] = canvasPos(ev);
-  S.mouse = [x, y];
-  if (S.addMode) placePending(x, y);
-});
+el.size.oninput = () => {
+  S.sizePct = +el.size.value;
+  updateSize();
+};
+$("btn-minus").onclick = () => {
+  el.size.value = Math.max(+el.size.min, S.sizePct - 15);
+  el.size.oninput();
+};
+$("btn-plus").onclick = () => {
+  el.size.value = Math.min(+el.size.max, S.sizePct + 15);
+  el.size.oninput();
+};
 
-el.timeline.addEventListener("click", (ev) => {
-  const r = el.timeline.getBoundingClientRect();
-  const f = Math.floor(((ev.clientX - r.left) / r.width) * S.state.n_frames);
-  if (S.playing) pause();
-  setFrame(f, true);
-});
+$("btn-menu").onclick = () => el.sheet.classList.remove("hidden");
+$("btn-close-sheet").onclick = () => el.sheet.classList.add("hidden");
+el.sheet.onclick = (ev) => { if (ev.target === el.sheet) el.sheet.classList.add("hidden"); };
+
+$("opt-raw").onchange = show;
+$("opt-boxes").onchange = () => drawBoxes();
+$("opt-all").onchange = () => reloadQueue({ all: $("opt-all").checked ? 1 : 0 });
+$("btn-rebuild").onclick = () =>
+  reloadQueue({ step: Math.max(1, +el.optStep.value || 5), all: $("opt-all").checked ? 1 : 0 });
+$("btn-unjudged").onclick = () => { el.sheet.classList.add("hidden"); goto(firstUnjudged(0)); };
+$("btn-prev-item").onclick = () => goto(S.idx - 1);
+$("btn-next-item").onclick = () => goto(S.idx + 1);
 
 document.addEventListener("keydown", (ev) => {
   if (ev.target.tagName === "INPUT" || ev.target.tagName === "SELECT") return;
-  const k = ev.key;
-  if (k === " ") { ev.preventDefault(); togglePlay(); return; }
-  if (k === ",") { if (S.playing) pause(); setFrame(S.cur - 1, true); return; }
-  if (k === ".") { if (S.playing) pause(); setFrame(S.cur + 1, true); return; }
-  if (k === "[") { scaleSize(1 / 1.15); return; }
-  if (k === "]") { scaleSize(1.15); return; }
-  if (k === "m" || k === "M") {
-    if (S.playing) pause();
-    S.addMode = true;
-    el.hint.classList.add("active");
-    el.hint.textContent = "追加モード: 動画上をクリックして矩形を置いてください";
-    return;
+  switch (ev.key) {
+    case "1": judge("ok"); break;
+    case "2": startMark(); break;
+    case "3": judge("unsure"); break;
+    case "u": case "U": undo(); break;
+    case "ArrowLeft": goto(S.idx - 1); break;
+    case "ArrowRight": goto(S.idx + 1); break;
+    case "Escape": cancelMark(); break;
+    default: return;
   }
-  if (k === "1") { if (S.playing) pause(); applyPending(1); return; }
-  if (k === "2") {
-    if (S.playing) pause();
-    applyPending(Math.max(1, parseInt(el.spanInput.value, 10) || 30));
-    return;
-  }
-  if (k === "d" || k === "D") { deleteUnderCursor(); return; }
-  if (k === "g" || k === "G") { if (S.playing) pause(); nextEstimatedRange(); return; }
+  ev.preventDefault();
 });
 
-$("btn-play").onclick = togglePlay;
-$("btn-prev").onclick = () => { if (S.playing) pause(); setFrame(S.cur - 1, true); };
-$("btn-next").onclick = () => { if (S.playing) pause(); setFrame(S.cur + 1, true); };
-$("btn-smaller").onclick = () => scaleSize(1 / 1.15);
-$("btn-bigger").onclick = () => scaleSize(1.15);
-$("btn-next-est").onclick = () => { if (S.playing) pause(); nextEstimatedRange(); };
-$("btn-undo").onclick = undoLast;
-
-el.frameInput.onchange = () => { if (S.playing) pause(); setFrame(+el.frameInput.value, true); };
-el.rawToggle.onchange = () => { if (!S.playing) loadStill(S.cur); };
-el.confSlider.oninput = () => {
-  S.confMin = parseFloat(el.confSlider.value);
-  el.confLabel.textContent = S.confMin.toFixed(2);
-  draw();
-};
-
-el.video.addEventListener("pause", () => { if (S.playing) pause(); });
-el.video.addEventListener("play", () => { S.playing = true; hideStill(); });
-el.video.addEventListener("ended", () => { S.playing = false; setFrame(S.cur, true); });
-// メタデータが載る前の currentTime 代入は黙って無視されるので、載ってから入れ直す
-el.video.addEventListener("loadedmetadata", () => { if (!S.playing) setFrame(S.cur, true); });
-window.addEventListener("resize", drawTimeline);
-
-boot().catch((e) => setSaveStatus("error", "起動に失敗: " + e.message));
+boot().catch((e) => {
+  setSave("err", "起動に失敗");
+  banner("起動に失敗しました: " + e.message);
+});

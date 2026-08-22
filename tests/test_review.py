@@ -1,8 +1,12 @@
-"""レビュー UI の検証。サーバを立てずに回る部分だけ。
+"""レビュー UI の検証。
 
-HTTP そのものの確認（200/206 が返るか）は実際にサーバを起動して行う。
-ここで見るのは、その手前にある「間違えると静かに壊れる」ところ:
-Range のパース、/api/state の構造、修正の往復、YOLO 座標変換。
+大半はサーバを立てずに回る。「間違えると静かに壊れる」ところ:
+Range のパース、検査キューの組み立て、タップ座標の変換、修正の往復、
+YOLO 座標変換。
+
+トークン検証と API の往復だけは、実際に ThreadingHTTPServer を立てて
+urllib から叩いて確かめる。403 を返すつもりで 200 を返していた、が
+いちばん困る種類の壊れ方で、関数を直接呼んでいると気づけない。
 """
 
 import json
@@ -10,7 +14,12 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 
+import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,17 +28,25 @@ from automosaic.corrections import Correction, CorrectionSet  # noqa: E402
 from automosaic.corrections import apply as apply_corrections  # noqa: E402
 from automosaic.detector import Detection  # noqa: E402
 from automosaic.review import (  # noqa: E402
+    COOKIE_NAME,
     COV_ESTIMATED,
     COV_NONE,
     COV_REAL,
+    ReviewHandler,
     ReviewSession,
+    build_queue,
+    cookie_token,
     dominant_class,
     export_dataset,
+    lan_addresses,
     median_box_size,
     mosaic_bgr,
     parse_range,
+    qr_matrix,
     runs_of,
+    tap_to_box,
     to_yolo,
+    token_matches,
 )
 from automosaic.temporal import TemporalConfig  # noqa: E402
 
@@ -110,6 +127,42 @@ def test_state_payload_shape():
         r = d["regions"]["0"][0]
         assert len(r) == 6 and r[4] == "d"
         print(f"  /api/state の構造 OK（推定のみ {d['coverage'].count(COV_ESTIMATED)} フレーム）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_state_payload_light_drops_heavy_arrays():
+    """light=1 で全フレームぶんの配列を落とすこと。
+
+    検査キュー画面が要るのは解像度とクラスだけ。1時間の動画で 10MB を超える
+    regions を端末に落とさせると、起動そのものが終わらない。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        light = s.state_payload(light=True)
+        for key in ("width", "height", "n_frames", "classes", "default_size", "default_class"):
+            assert key in light, key
+        for key in ("regions", "coverage", "estimated_only_ranges"):
+            assert key not in light, f"{key} が light に残っている"
+        full = json.dumps(s.state_payload(), ensure_ascii=False)
+        assert len(json.dumps(light, ensure_ascii=False)) < len(full) / 2
+        print("  /api/state?light=1 の軽量化 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_queue_items_carry_their_boxes():
+    """キューの各枚に、その場で重ねる矩形が同梱されること。"""
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        q = s.queue_payload()
+        assert q["items"], "キューが空"
+        for it in q["items"]:
+            assert "boxes" in it
+            assert it["boxes"] == s.frame_regions(it["frame"])
+        print("  キュー項目の矩形同梱 OK")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -336,6 +389,441 @@ def test_mosaic_bgr_covers_box_only():
     # 領域外は YUV 往復の丸め誤差ぶんしか動かない
     assert np.abs(out[:8, :8].astype(int) - frame[:8, :8].astype(int)).max() <= 3
     print("  プレビューのモザイク OK")
+
+
+# -- 検査キューの組み立て ------------------------------------------------
+
+
+def _regs(box, score=0.9, source="detected"):
+    from automosaic.temporal import Region
+
+    return [(box, Region(box, CLS, score, source))]
+
+
+def test_build_queue_priority_order():
+    """推定のみ -> 未処理 の順に並び、区間は間引いて出ること。
+
+    ここが崩れると、いちばん怪しい区間が数百枚の後ろに沈む。
+    「順に叩けば重要なところから片付く」がキュー方式の唯一の取り柄なので、
+    並び順は仕様そのもの。
+    """
+    cov = COV_REAL * 20 + COV_ESTIMATED * 20 + COV_NONE * 5 + COV_REAL * 15
+    q = build_queue(cov, {}, 60, step=5)
+    prios = [it["priority"] for it in q]
+    assert prios == sorted(prios), "優先度の順に並んでいない"
+    est = [it["frame"] for it in q if it["reason"] == "estimated"]
+    unc = [it["frame"] for it in q if it["reason"] == "uncovered"]
+    assert est == [20, 25, 30, 35], est
+    # step 以下の短い区間は中央の1枚だけ。端を取ると隣の区間が写る
+    assert unc == [42], unc
+    print("  キューの並びと間引き OK")
+
+
+def test_build_queue_dedupes_by_priority():
+    """同じフレームが複数の理由に当たっても、重い理由で1回だけ出すこと。"""
+    cov = COV_ESTIMATED * 30
+    regions = {f: _regs((0, 0, 10, 10), 0.1, "interpolated") for f in range(30)}
+    q = build_queue(cov, regions, 30, step=5)
+    frames = [it["frame"] for it in q]
+    assert len(frames) == len(set(frames)), "同じフレームが二重に出ている"
+    assert all(it["reason"] == "estimated" for it in q), [it["reason"] for it in q]
+    print("  キューの重複排除 OK")
+
+
+def test_build_queue_flags_area_jump():
+    cov = COV_REAL * 40
+    regions = {}
+    for f in range(40):
+        w = 100 if f < 20 else 300  # frame 20 で面積が 9 倍になる
+        regions[f] = _regs((0.0, 0.0, float(w), float(w)))
+    q = build_queue(cov, regions, 40, step=5)
+    assert [it["frame"] for it in q] == [20], q
+    assert q[0]["reason"] == "area_jump"
+    print("  面積の急変の検出 OK")
+
+
+def test_build_queue_all_frames():
+    """問題が無くても全部見たい場合の経路。"""
+    cov = COV_REAL * 100
+    assert build_queue(cov, {}, 100, step=10) == [], "問題が無いのにキューが出来ている"
+    q = build_queue(cov, {}, 100, step=10, all_frames=True)
+    assert [it["frame"] for it in q] == list(range(0, 100, 10))
+    assert all(it["reason"] == "sampled" for it in q)
+    print("  全フレーム対象の指定 OK")
+
+
+def test_session_queue_targets_estimated_ranges():
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        assert s.queue, "キューが空"
+        # 先頭は推定のみ。実際に検出のあるフレームは出てこない
+        assert s.queue[0]["reason"] == "estimated"
+        for it in s.queue:
+            if it["reason"] == "estimated":
+                assert s.coverage[it["frame"]] == COV_ESTIMATED
+        print(f"  セッションのキュー OK（{len(s.queue)} 枚）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# -- タップ座標の変換 ----------------------------------------------------
+
+
+def test_tap_to_box_centers_on_tap():
+    assert tap_to_box(0.5, 0.5, (100, 80), 640, 480) == (270.0, 200.0, 100.0, 80.0)
+    assert tap_to_box(0.25, 0.5, (100, 80), 640, 480) == (110.0, 200.0, 100.0, 80.0)
+    print("  タップ位置が矩形の中心になる OK")
+
+
+def test_tap_to_box_pushes_back_at_edges():
+    """端を突いても矩形を痩せさせないこと。
+
+    切り詰めると、画面端に寄った対象を覆いきれない。「押したのに漏れたまま」は
+    このツールで唯一やってはいけない失敗。
+    """
+    assert tap_to_box(0.0, 0.0, (100, 80), 640, 480) == (0.0, 0.0, 100.0, 80.0)
+    assert tap_to_box(1.0, 1.0, (100, 80), 640, 480) == (540.0, 400.0, 100.0, 80.0)
+    # 範囲外の入力もフレーム内に収める
+    assert tap_to_box(-3.0, 9.0, (100, 80), 640, 480) == (0.0, 400.0, 100.0, 80.0)
+    # フレームより大きい指定はフレーム全体まで
+    assert tap_to_box(0.5, 0.5, (9999, 9999), 640, 480) == (0.0, 0.0, 640.0, 480.0)
+    print("  画面端でのタップ OK")
+
+
+# -- 判定の記録と取り消し ------------------------------------------------
+
+
+def test_mark_fixed_covers_span():
+    """「漏れている」で置いた矩形が、前後のフレームにも入ること。
+
+    キューは間引いて出しているので、1コマだけ塞いでも隣は漏れたまま。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        assert s.coverage[25] == COV_ESTIMATED
+        n = s.mark(25, "fixed", tap=(0.5, 0.5), size=(64, 64), span=2, cls=CLS)
+        assert n == 5, n
+        for f in range(23, 28):
+            assert s.coverage[f] == COV_REAL, f
+        assert s.verdicts[25] == "fixed"
+        assert len(s.corrections.items) == 5
+        box = s.corrections.items[0].box
+        assert box == (288.0, 208.0, 64.0, 64.0), box
+        print("  漏れている判定の反映 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_undo_restores_corrections_and_verdict():
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        s.mark(25, "fixed", tap=(0.5, 0.5), size=(64, 64), span=2)
+        s.mark(30, "ok")
+        assert s.progress_payload()["done"] >= 1
+
+        h = s.undo()
+        assert h["frame"] == 30 and 30 not in s.verdicts
+        h = s.undo()
+        assert h["frame"] == 25
+        assert not s.corrections.items, "戻したのに修正が残っている"
+        assert s.coverage[25] == COV_ESTIMATED, "戻したのに被覆が実観測のまま"
+        assert s.undo() is None, "戻すものが無いのに戻っている"
+        print("  ひとつ戻す OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_progress_survives_restart():
+    """判定の記録がファイルに残り、開き直しても続きから戻れること。
+
+    端末を閉じただけで最初からやり直しになると、長い動画は絶対に終わらない。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        target = s.queue[0]["frame"]
+        s.mark(target, "ok")
+        s.mark(s.queue[1]["frame"], "unsure")
+        assert os.path.exists(s.progress_path)
+
+        again = make_session(tmp)
+        assert again.verdicts.get(target) == "ok"
+        p = again.progress_payload()
+        assert p["done"] == 2 and p["counts"]["unsure"] == 1, p
+        assert p["can_undo"], "履歴が読み戻せていない"
+        print("  進捗の保存と読み戻し OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_mark_rejects_unknown_verdict():
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        for bad in ("yes", "", "OK"):
+            try:
+                s.mark(0, bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"{bad!r} が通ってしまった")
+        try:
+            s.mark(0, "fixed")  # 位置なし
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("位置なしの fixed が通ってしまった")
+        print("  不正な判定の拒否 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# -- トークン ------------------------------------------------------------
+
+
+def test_token_matches():
+    assert token_matches("abc123", "abc123")
+    assert not token_matches("abc123", "abc124")
+    assert not token_matches("abc123", "abc1234")  # 前方一致で通さない
+    assert not token_matches("abc123", "")
+    assert not token_matches("abc123", None)
+    # --no-token のときだけ素通し
+    assert token_matches("", None) and token_matches("", "なんでも")
+    print("  トークンの照合 OK")
+
+
+def test_cookie_token():
+    assert cookie_token("automosaic_t=xyz") == "xyz"
+    assert cookie_token("a=1; automosaic_t=xyz; b=2") == "xyz"
+    assert cookie_token("automosaic_token=xyz") is None  # 前方一致で拾わない
+    assert cookie_token("other=1") is None
+    assert cookie_token(None) is None
+    print("  Cookie からのトークン取り出し OK")
+
+
+def test_lan_addresses_are_plausible():
+    for a in lan_addresses():
+        assert a.count(".") == 3 and not a.startswith("127."), a
+    print(f"  LAN アドレスの取得 OK（{lan_addresses() or 'なし'}）")
+
+
+# -- QR --------------------------------------------------------------------
+
+
+def test_qr_decodes_with_opencv():
+    """自前で組んだ QR が、実際の読み取り器で復号できること。
+
+    外部ライブラリを使えないので符号化は手書きになる。目で見て確かめられない
+    種類のコードなので、cv2 の読み取り器に通して往復を確認する。
+    """
+    det = cv2.QRCodeDetector()
+    for text in (
+        "http://127.0.0.1:8765/?t=abcdefghijkm",
+        "http://192.168.100.23:8765/?t=qwertyuiop23",
+        "x" * 100,   # 型番が上がってブロック分割に入る長さ
+    ):
+        m = qr_matrix(text)
+        size = len(m)
+        quiet = 4
+        img = np.full((size + quiet * 2, size + quiet * 2), 255, np.uint8)
+        for r in range(size):
+            for c in range(size):
+                if m[r][c]:
+                    img[r + quiet, c + quiet] = 0
+        big = cv2.resize(img, None, fx=8, fy=8, interpolation=cv2.INTER_NEAREST)
+        data, _, _ = det.detectAndDecode(big)
+        assert data == text, f"復号できない: {data!r}"
+    print("  QR の生成と復号 OK")
+
+
+# -- HTTP ------------------------------------------------------------------
+
+
+def _serve(session, token):
+    ReviewHandler.session = session
+    ReviewHandler.token = token
+    ReviewHandler.verbose = False
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), ReviewHandler)
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, f"http://127.0.0.1:{httpd.server_address[1]}"
+
+
+def _get(url, headers=None):
+    req = urllib.request.Request(url, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, r.read(), r
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), e
+
+
+def _post(url, obj):
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(obj).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode("utf-8"))
+
+
+def test_http_requires_token():
+    """トークンが無い・違う要求は全部 403 で落ちること。
+
+    LAN に出す前提なので、ここが抜けると同じネットワークの誰でも素材を見られる。
+    画面も API も画像も、例外なく閉じていることを確かめる。
+    """
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    try:
+        s = make_session(tmp)
+        httpd, base = _serve(s, "testtoken1234")
+        for path in ("/", "/timeline", "/static/app.js", "/api/state", "/api/queue", "/frame?n=0"):
+            code, _, _ = _get(base + path)
+            assert code == 403, f"{path} がトークン無しで {code}"
+            code, _, _ = _get(base + path + ("&" if "?" in path else "?") + "t=chigau")
+            assert code == 403, f"{path} が誤ったトークンで {code}"
+        code, _ = _post(base + "/api/mark", {"frame": 0, "verdict": "ok"})
+        assert code == 403, code
+        code, _ = _post(base + "/api/undo", {})
+        assert code == 403, code
+        assert not s.verdicts, "403 なのに判定が記録されている"
+        print("  トークン無しの遮断 OK")
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_http_accepts_token_in_query_cookie_and_header():
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    try:
+        s = make_session(tmp)
+        tok = "testtoken1234"
+        httpd, base = _serve(s, tok)
+
+        code, body, res = _get(f"{base}/api/state?t={tok}")
+        assert code == 200, code
+        assert json.loads(body)["n_frames"] == s.n_frames
+        # 通ったら Cookie に移す。以降の画像取得に毎回付けさせないため
+        assert f"{COOKIE_NAME}={tok}" in (res.headers.get("Set-Cookie") or "")
+
+        code, _, _ = _get(f"{base}/api/state", {"Cookie": f"automosaic_t={tok}"})
+        assert code == 200, code
+        code, _, _ = _get(f"{base}/api/state", {"X-Review-Token": tok})
+        assert code == 200, code
+        code, _, _ = _get(f"{base}/", {"X-Review-Token": tok})
+        assert code == 200, "画面本体が開けない"
+        print("  URL / Cookie / ヘッダのトークン受け入れ OK")
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_http_queue_and_mark_roundtrip():
+    """キューを取り、判定を投げ、進捗が進み、戻せること。"""
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    try:
+        s = make_session(tmp)
+        tok = "testtoken1234"
+        httpd, base = _serve(s, tok)
+
+        code, body, _ = _get(f"{base}/api/queue?t={tok}")
+        assert code == 200
+        q = json.loads(body)
+        assert q["items"], "キューが空"
+        prios = [it["priority"] for it in q["items"]]
+        assert prios == sorted(prios)
+        assert q["progress"]["done"] == 0
+        assert all(it["verdict"] is None for it in q["items"])
+
+        first = q["items"][0]["frame"]
+        code, d = _post(f"{base}/api/mark?t={tok}", {"frame": first, "verdict": "ok"})
+        assert code == 200 and d["progress"]["done"] == 1, d
+        second = q["items"][1]["frame"]
+        code, d = _post(
+            f"{base}/api/mark?t={tok}",
+            {"frame": second, "verdict": "fixed", "x": 0.5, "y": 0.5,
+             "w": 64, "h": 64, "span": 1, "class": CLS},
+        )
+        assert code == 200 and d["added"] == 3, d
+        assert d["n_corrections"] == 3
+        assert any(r[4] == "x" for r in d["regions"]), "手修正が領域に入っていない"
+
+        # 判定済みの印がキューにも載ること（続きから再開できる根拠）
+        code, body, _ = _get(f"{base}/api/queue?t={tok}")
+        items = {it["frame"]: it["verdict"] for it in json.loads(body)["items"]}
+        assert items[first] == "ok" and items[second] == "fixed"
+
+        code, d = _post(f"{base}/api/undo?t={tok}", {})
+        assert code == 200 and d["ok"] and d["frame"] == second, d
+        assert d["n_corrections"] == 0 and d["progress"]["done"] == 1
+        print("  キュー取得 -> 判定 -> 取り消し OK")
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_http_frame_image_is_scaled_and_mosaicked():
+    """/frame が縮小と JPEG 化に対応していること。
+
+    端末に原寸 PNG を投げるとタップの手応えが消えるので、幅を指定できることは
+    体感速度そのもの。実ファイルが要るので小さい動画をその場で作る。
+    """
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    try:
+        path = os.path.join(tmp, "src.avi")
+        vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 30.0, (640, 480))
+        if not vw.isOpened():
+            print("  /frame の確認は飛ばします（VideoWriter を開けない）")
+            return
+        rng = np.random.default_rng(0)
+        for _ in range(60):
+            vw.write(rng.integers(0, 256, (480, 640, 3), dtype=np.uint8))
+        vw.release()
+
+        s = make_session(tmp)
+        s.video = path
+        from automosaic.review import FrameReader
+
+        s.reader = FrameReader(path)
+        tok = "testtoken1234"
+        httpd, base = _serve(s, tok)
+
+        code, body, res = _get(f"{base}/frame?n=5&t={tok}")
+        assert code == 200 and res.headers["Content-Type"] == "image/png", code
+        full = cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR)
+        assert full.shape[1] == 640
+
+        code, body, res = _get(f"{base}/frame?n=5&fmt=jpg&w=320&v=1&t={tok}")
+        assert code == 200 and res.headers["Content-Type"] == "image/jpeg"
+        assert "max-age" in (res.headers.get("Cache-Control") or ""), "先読みが効かない"
+        small = cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR)
+        assert small.shape[1] == 320, small.shape
+        assert len(body) < 200_000, len(body)
+        print(f"  /frame の縮小と JPEG 化 OK（640px PNG {len(full.tobytes())//1024}KB 相当 "
+              f"-> 320px JPEG {len(body)//1024}KB）")
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
