@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>automosaic 手描き</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="top">
+  <a id="back" class="btn" href="/">戻る</a>
+  <span id="pos">読み込み中</span>
+  <span class="spacer"></span>
+  <span id="save" class="save ok">-</span>
+</header>
+
+<div id="stage">
+  <div id="imgwrap">
+    <img id="shot" alt="対象のフレーム">
+    <canvas id="ov"></canvas>
+  </div>
+</div>
+<div id="banner">好きなフレームで画像をタップすると、そこに矩形を置きます</div>
+
+<div class="pad">
+  <div class="row">
+    <button id="b-first">≪</button>
+    <button id="b-back10">-10</button>
+    <button id="b-back">-1</button>
+    <input id="seek" type="range" min="0" max="0" value="0" style="flex:1" aria-label="フレーム位置">
+    <button id="b-fwd">+1</button>
+    <button id="b-fwd10">+10</button>
+    <button id="b-last">≫</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <label>移動幅 <input id="stride" type="number" min="1" max="300" value="10" style="width:70px"></label>
+    <button id="b-prev-pt">前の打点</button>
+    <button id="b-next-pt">次の打点</button>
+    <label><input id="opt-raw" type="checkbox" checked> 原画で見る</label>
+  </div>
+
+  <div class="row" style="margin-top:10px">
+    <button id="b-minus">−</button>
+    <input id="size" type="range" min="20" max="400" step="5" value="100" style="flex:1" aria-label="矩形の大きさ">
+    <button id="b-plus">＋</button>
+    <span id="size-label" class="dim mono">-</span>
+  </div>
+
+  <div class="row" style="margin-top:8px">
+    <button id="b-put" class="big ok half" disabled>ここに置く</button>
+    <button id="b-absent" class="half">ここには無い</button>
+    <button id="b-del" class="half">この打点を消す</button>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h2>補間して反映する</h2>
+    <div class="row">
+      <label>補間する最大間隔 <input id="max_interp" type="number" min="1" max="300" value="20" style="width:80px"></label>
+      <label>点の後ろに持たせる <input id="hold" type="number" min="0" max="60" value="4" style="width:70px"> フレーム</label>
+      <label>クラス <select id="opt-class"></select></label>
+      <label><input id="merge" type="checkbox"> 既存の手修正に足す</label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="b-expand" class="primary">補間して corrections に展開</button>
+      <a id="go-job" class="btn" href="#">ジョブ画面へ（焼き直し）</a>
+    </div>
+    <p id="expand-msg" class="dim"></p>
+  </div>
+
+  <div class="card">
+    <h2>打点</h2>
+    <div id="points" class="mono dim"></div>
+  </div>
+</div>
+
+<script src="/static/common.js"></script>
+<script src="/static/draw.js"></script>
+</body>
+</html>

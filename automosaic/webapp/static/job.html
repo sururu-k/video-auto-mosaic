@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>automosaic ジョブ</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="top">
+  <a id="back" class="btn" href="/">一覧</a>
+  <h1 id="title">ジョブ</h1>
+  <span class="spacer"></span>
+  <span id="status"></span>
+</header>
+
+<main>
+  <div class="card">
+    <h2>素材</h2>
+    <p id="info" class="dim mono"></p>
+  </div>
+
+  <div class="card">
+    <h2>設定</h2>
+    <div class="grid">
+      <label>推論解像度
+        <select id="infer_size">
+          <option value="640">640（速い）</option>
+          <option value="960" selected>960（既定・費用対効果のピーク）</option>
+          <option value="1280">1280（遅い）</option>
+        </select>
+      </label>
+      <label>信頼度しきい値 <input id="conf" type="number" step="0.01" min="0.01" max="0.9" value="0.06"></label>
+      <label>対象クラス
+        <select id="classes">
+          <option value="default" selected>default（露出のみ）</option>
+          <option value="conservative">conservative（COVERED も含む）</option>
+        </select>
+      </label>
+      <label>モザイク
+        <select id="mode">
+          <option value="pixelize" selected>pixelize</option>
+          <option value="black">black</option>
+        </select>
+      </label>
+      <label>ブロック px（0で自動） <input id="block" type="number" min="0" max="200" value="0"></label>
+      <label>CRF <input id="crf" type="number" min="10" max="30" value="16"></label>
+      <label>先頭 N フレームだけ（0で全部） <input id="limit_frames" type="number" min="0" value="0"></label>
+      <label>プロバイダ
+        <select id="provider">
+          <option value="auto" selected>auto</option>
+          <option value="dml">dml</option>
+          <option value="cpu">cpu</option>
+          <option value="cuda">cuda</option>
+        </select>
+      </label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label><input id="tta" type="checkbox"> TTA（推論2倍・検出+16%）</label>
+      <label><input id="estimate_gaps" type="checkbox"> 途切れた区間を推定で埋める</label>
+      <label><input id="detect_only" type="checkbox"> 検出だけ（描画しない）</label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btn-start" class="primary">処理を始める</button>
+      <button id="btn-rerender">検出を再利用して焼き直す</button>
+      <button id="btn-cancel" class="danger">中断</button>
+    </div>
+    <p id="hint" class="dim"></p>
+  </div>
+
+  <div class="card">
+    <h2>進捗</h2>
+    <div style="margin-bottom:8px">
+      <div class="dim" id="p1label">パス1 検出</div>
+      <div class="bar"><i id="p1"></i></div>
+      <div class="dim mono" id="p1text">-</div>
+    </div>
+    <div>
+      <div class="dim" id="p2label">パス2 描画</div>
+      <div class="bar"><i id="p2"></i></div>
+      <div class="dim mono" id="p2text">-</div>
+    </div>
+    <p id="conn" class="dim"></p>
+  </div>
+
+  <div class="card">
+    <h2>完成品</h2>
+    <div class="row">
+      <a id="dl" class="btn primary" href="#">完成品をダウンロード</a>
+      <a id="go-review" class="btn" href="#">検査キューを開く</a>
+      <a id="go-draw" class="btn" href="#">手描きモード</a>
+      <button id="btn-dataset">学習データを書き出す</button>
+      <button id="btn-delete" class="danger">ジョブを消す</button>
+    </div>
+    <p id="dsmsg" class="dim"></p>
+    <video id="preview" class="hidden" controls playsinline style="max-width:100%;margin-top:10px"></video>
+  </div>
+
+  <div class="card">
+    <h2>ログ</h2>
+    <div id="log"></div>
+  </div>
+</main>
+
+<script src="/static/common.js"></script>
+<script src="/static/job.js"></script>
+</body>
+</html>
