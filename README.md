@@ -114,7 +114,7 @@ python -m automosaic sample.mp4 --detections det.json --reuse-detections
 ## 前提（確定事項）
 
 - **ツールは公開・配布しない。** 自己使用のみ。成果物の動画だけが外に出る
-  ライセンスはkにしない
+  ライセンスは気にしない
 
 ## 設計上の絶対条件
 
