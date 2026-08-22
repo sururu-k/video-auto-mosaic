@@ -26,3 +26,6 @@ weights/
 out/
 tmp/
 *.json.gz
+
+# 重み（gh release download で取得する。100MB超）
+weights/
