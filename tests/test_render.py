@@ -386,6 +386,41 @@ def test_estimated_regions_get_thicker_margin():
     print(f"  推定領域の厚盛り OK ({detected_w:.0f} -> {interpolated_w:.0f})")
 
 
+def test_checkpoint_roundtrip():
+    """途中保存が読み戻せること。長尺の検出が落ちたときに全損しないための機構。"""
+    import tempfile
+    from automosaic.cli import load_partial, save_detections
+    from automosaic.video import VideoInfo
+
+    info = VideoInfo(
+        width=640, height=480, fps_num=30, fps_den=1, nb_frames=100,
+        duration=3.3, pix_fmt="yuv420p", color_primaries=None, color_trc=None,
+        colorspace=None, color_range=None, has_audio=False,
+    )
+    per_frame = {
+        0: [Detection("MALE_GENITALIA_EXPOSED", 0.5, (10, 20, 30, 40))],
+        5: [],
+        7: [Detection("ANUS_EXPOSED", 0.3, (50, 60, 20, 25))],
+    }
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "det.json")
+        save_detections(path, per_frame, 10, info, complete=False)
+        loaded, n = load_partial(path)
+
+        assert n == 10
+        # 空のフレームは保存されない（容量の無駄なので）。中身のあるものは一致する
+        assert set(loaded) == {0, 7}
+        assert loaded[0][0].cls == "MALE_GENITALIA_EXPOSED"
+        assert loaded[0][0].box == (10, 20, 30, 40)
+        assert abs(loaded[7][0].score - 0.3) < 1e-6
+
+        # 存在しないパスは空で返る（初回実行時に例外にしない）
+        empty, n0 = load_partial(os.path.join(d, "nope.json"))
+        assert empty == {} and n0 == 0
+    print("  途中保存のラウンドトリップ OK")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"{len(tests)} 件のテストを実行\n")

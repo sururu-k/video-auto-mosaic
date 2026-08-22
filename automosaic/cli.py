@@ -85,6 +85,45 @@ class Progress:
         sys.stderr.flush()
 
 
+def save_detections(
+    path: str,
+    per_frame: dict[int, list[Detection]],
+    n_frames: int,
+    info: vid.VideoInfo,
+    complete: bool = True,
+) -> None:
+    """検出結果を保存する。書き込み途中で落ちても壊れないよう一時ファイル経由で置換する。"""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "n_frames": n_frames,
+                "width": info.width,
+                "height": info.height,
+                "complete": complete,
+                "detections": {
+                    str(k): [d.as_dict() for d in v] for k, v in per_frame.items() if v
+                },
+            },
+            f,
+            ensure_ascii=False,
+        )
+    os.replace(tmp, path)
+
+
+def load_partial(path: str) -> tuple[dict[int, list[Detection]], int]:
+    """途中保存された検出結果を読む。戻り値は (検出, 済んだフレーム数)。"""
+    if not path or not os.path.exists(path):
+        return {}, 0
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
+    per_frame = {
+        int(k): [Detection.from_dict(x) for x in v] for k, v in d["detections"].items()
+    }
+    return per_frame, int(d.get("n_frames", 0))
+
+
 def run_detection(
     src: str,
     info: vid.VideoInfo,
@@ -95,6 +134,10 @@ def run_detection(
     frame_step: int = 1,
     tta: bool = False,
     tiles: int = 1,
+    checkpoint_path: str | None = None,
+    checkpoint_every: int = 2000,
+    resume_from: int = 0,
+    resume_dets: dict[int, list[Detection]] | None = None,
 ) -> tuple[dict[int, list[Detection]], int]:
     dec_w, dec_h = vid.detection_frame_size(info, detect_scale)
     frame_bytes = dec_w * dec_h * 3
@@ -110,13 +153,21 @@ def run_detection(
         total = min(total, limit_frames) if total else limit_frames
     prog = None if quiet else Progress(total, "パス1 検出")
 
-    per_frame: dict[int, list[Detection]] = {}
+    per_frame: dict[int, list[Detection]] = dict(resume_dets or {})
     idx = 0
     try:
         while True:
             raw = proc.stdout.read(frame_bytes)
             if len(raw) < frame_bytes:
                 break
+            # 再開時は、済んだフレームのデコードだけ流して推論を飛ばす。
+            # デコードは推論に比べて桁違いに安いので、正確なシークを作るより
+            # 読み飛ばすほうが簡単で確実。
+            if idx < resume_from:
+                idx += 1
+                if prog:
+                    prog.update(idx)
+                continue
             if frame_step <= 1 or idx % frame_step == 0:
                 frame = np.frombuffer(raw, dtype=np.uint8).reshape(dec_h, dec_w, 3)
                 dets = det.detect_frame(frame, tta=tta, tiles=tiles)
@@ -139,6 +190,9 @@ def run_detection(
             idx += 1
             if prog:
                 prog.update(idx)
+            # 途中保存。長尺は数時間かかるので、落ちたときに全損しないようにする
+            if checkpoint_path and checkpoint_every > 0 and idx % checkpoint_every == 0:
+                save_detections(checkpoint_path, per_frame, idx, info, complete=False)
     finally:
         try:
             proc.stdout.close()
@@ -398,6 +452,18 @@ def build_parser() -> argparse.ArgumentParser:
     m = p.add_argument_group("運用")
     m.add_argument("--detections", help="検出結果 JSON の保存先／再利用元")
     m.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=2000,
+        help="検出結果を何フレームごとに途中保存するか（0で無効）。"
+        "長尺は数時間かかるので、落ちたときに全損しないようにする",
+    )
+    m.add_argument(
+        "--resume",
+        action="store_true",
+        help="--detections に途中保存があれば、その続きから検出を再開する",
+    )
+    m.add_argument(
         "--reuse-detections",
         action="store_true",
         help="--detections の JSON があればパス1を飛ばす",
@@ -502,29 +568,25 @@ def main(argv: list[str] | None = None) -> int:
                 f"検出設定   conf {args.conf}  デコード長辺 {detect_scale}px"
                 + (f"  {' + '.join(extra)}" if extra else "")
             )
+        resume_dets: dict[int, list[Detection]] = {}
+        resume_from = 0
+        if args.resume and args.detections:
+            resume_dets, resume_from = load_partial(args.detections)
+            if resume_from and not args.quiet:
+                print(f"途中保存から再開: {resume_from} フレームまで済み")
+
         per_frame, n_frames = run_detection(
             src, info, det, detect_scale, args.limit_frames, args.quiet,
             frame_step=max(1, args.frame_step),
             tta=args.tta,
             tiles=max(1, args.tiles),
+            checkpoint_path=args.detections,
+            checkpoint_every=args.checkpoint_every,
+            resume_from=resume_from,
+            resume_dets=resume_dets,
         )
         if args.detections:
-            os.makedirs(os.path.dirname(os.path.abspath(args.detections)), exist_ok=True)
-            with open(args.detections, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "n_frames": n_frames,
-                        "width": info.width,
-                        "height": info.height,
-                        "detections": {
-                            str(k): [d.as_dict() for d in v]
-                            for k, v in per_frame.items()
-                            if v
-                        },
-                    },
-                    f,
-                    ensure_ascii=False,
-                )
+            save_detections(args.detections, per_frame, n_frames, info, complete=True)
             if not args.quiet:
                 print(f"検出結果を保存: {args.detections}")
 
