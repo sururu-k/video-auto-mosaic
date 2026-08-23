@@ -111,7 +111,8 @@
 
 ## 4. 環境の制約（実測済み）
 
-- **`git push` は固まる。** `gh` の API 経由（Git Data API でコミットを生成）なら通る。
+- **`git push` は固まることがある。** 2026-08-24 時点では通った（`89e9715..6ad436a`）。
+  固まったら `gh` の API 経由（Git Data API でコミットを生成）で回避できる。
 - **arxiv からの直接ダウンロードは固まる。** WebSearch と WebFetch は通る。
   abs ページか ar5iv、Semantic Scholar を使う。
 - Windows / PowerShell と Git Bash の両方が使える。それぞれ構文が違う。

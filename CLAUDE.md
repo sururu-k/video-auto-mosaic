@@ -68,5 +68,5 @@ cd frontend && node build.mjs && npx tsc --noEmit
 
 - Windows。PowerShell と Git Bash の両方が使える
 - GPU は AMD の DirectML。**CUDA 前提のものは動かない**
-- **`git push` は固まる。** `gh` の API 経由（Git Data API）なら通る
+- **`git push` は固まることがある。** 固まったら `gh` の API 経由（Git Data API）で回避する
 - `data/myvideo5` `data/bench3` は既存の作業データ。読むだけ
