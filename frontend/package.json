@@ -1,0 +1,18 @@
+{
+  "name": "automosaic-frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "automosaic のレビュー UI / Web アプリのフロントエンド。TypeScript を esbuild で束ねて automosaic/ 以下へ直に出す",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "konva": "10.3.1",
+    "preact": "^10.29.8",
+    "typescript": "^5.7.0"
+  }
+}

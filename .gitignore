@@ -27,3 +27,10 @@ weights/
 out/
 tmp/
 *.json.gz
+
+# フロントエンド（ビルド結果 automosaic/web/*.js と
+# automosaic/webapp/static/*.js は npm 無しでも動くようコミットする）
+frontend/node_modules/
+# sourcemap は本体より大きく、中身は frontend/src そのもの。
+# 現地で追いたいときだけ node build.mjs --sourcemap で出す
+*.js.map
