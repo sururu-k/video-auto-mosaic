@@ -728,6 +728,119 @@ def test_no_double_start_across_restart():
         srv.close()
 
 
+def test_broken_meta_blocks_start_not_allows_it():
+    """壊れた meta.json は「読めないから起動を許す」ではなく「読めないから止める」。
+
+    running_pid() は meta.json の pid で生死を見る。以前は meta が壊れて
+    読めないとき、pid の無い meta を合成していたので「走っていない」と
+    早合点し、生きたプロセスがいても二重起動を許した（issue #5 の経路1）。
+
+    生きたプロセスがいる状態で meta.json を壊し、レジストリを持たない
+    新しいサーバ（プロセス内キャッシュに頼れない状態）から見ても、
+    起動を拒否し続けることを確かめる。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = upload(srv.base, sample_video())
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        write_fake_detections(job, d["n_frames"], d["width"], d["height"])
+
+        code, r = post_json(f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}", {"reuse": True})
+        assert code == 200, r
+    finally:
+        srv.close()  # レジストリが消える。サブプロセスは detached のまま残る
+
+    meta_path = os.path.join(lib, jid, "meta.json")
+    with open(meta_path, encoding="utf-8") as f:
+        pid1 = json.load(f)["pid"]
+
+    # meta.json を壊す（pid が読めなくなる）。壊した瞬間もプロセスは生きている
+    with open(meta_path, "w", encoding="utf-8") as f:
+        f.write("{ここで壊れている、jsonとして読めない")
+
+    srv = Server(lib)  # レジストリを持たない新しいサーバから見る
+    try:
+        code, r = post_json(f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}", {"reuse": True})
+        assert code == 409, f"壊れた meta.json で二重起動を通した: {code} {r}"
+        assert "meta.json" in r["detail"], r
+        # cancel も同じ理由で拒否してよい。ただし delete は別（ここでは触らない）
+    finally:
+        srv.close()
+
+    # 後片付け: 最初に起動したプロセスの終了を待つ（2秒素材なのですぐ終わる）
+    end = time.time() + 60
+    while jobs_mod.pid_alive(pid1) and time.time() < end:
+        time.sleep(0.2)
+    print("  壊れた meta.json は起動を許さない（読めないから止める） OK")
+
+
+def test_two_registries_toctou_only_one_starts():
+    """2サーバ（レジストリが別）から同時に起動しても1本しか通らないこと。
+
+    RunnerRegistry.start() の threading.Lock はプロセス内でしか効かない。
+    `--port` を変えれば同じライブラリに複数の webapp サーバを起動できるので、
+    レジストリをまたいだ排他が無いと同じ output.mp4 に2本走る（issue #5 の
+    経路2）。素の Popen は速く、素朴な同時押しだけでは毎回は窓を踏まないので、
+    running_pid の直後にわずかな遅延を注入して窓を広げる。ロジックは変えず
+    チェックの後に待たせるだけ（これでロックが無ければ確実に二重に通る）。
+    """
+    lib = make_lib()
+    srv_setup = Server(lib)
+    try:
+        d = upload(srv_setup.base, sample_video())
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        write_fake_detections(job, d["n_frames"], d["width"], d["height"])
+    finally:
+        srv_setup.close()
+
+    srv0 = Server(lib)
+    srv1 = Server(lib)
+    real_running_pid = jobs_mod.running_pid
+
+    def slow_running_pid(job):
+        r = real_running_pid(job)
+        time.sleep(0.4)
+        return r
+
+    jobs_mod.running_pid = slow_running_pid
+    results = {}
+
+    def hit(tag, srv, barrier):
+        barrier.wait()
+        code, r = post_json(f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}", {"reuse": True})
+        results[tag] = (code, r)
+
+    try:
+        barrier = threading.Barrier(2)
+        t0 = threading.Thread(target=hit, args=("srv0", srv0, barrier))
+        t1 = threading.Thread(target=hit, args=("srv1", srv1, barrier))
+        t0.start()
+        t1.start()
+        t0.join()
+        t1.join()
+    finally:
+        jobs_mod.running_pid = real_running_pid
+        srv0.close()
+        srv1.close()
+
+    oks = [k for k, (c, _r) in results.items() if c == 200]
+    assert len(oks) == 1, f"2サーバとも起動を受理した（同じ output.mp4 に2本）: {results}"
+    other = "srv1" if oks[0] == "srv0" else "srv0"
+    assert results[other][0] == 409, results
+
+    # 後片付け: 起動したジョブの終了を待つ
+    L = jobs_mod.Library(lib)
+    end = time.time() + 60
+    while L.get(jid).status not in ("done", "failed", "canceled", "interrupted"):
+        if time.time() > end:
+            break
+        time.sleep(0.2)
+    print(f"  2サーバ同時押しでも1本しか通らない OK（{oks[0]} が起動・相手は 409）")
+
+
 # --------------------------------------------------------------------------
 # 3. 検査キュー
 # --------------------------------------------------------------------------

@@ -64,6 +64,28 @@ def new_job_id(library: str) -> str:
     raise RuntimeError("ジョブID を確保できません")
 
 
+def _load_meta(meta_path: str, job_id: str) -> dict:
+    """meta.json を読む。読めなければ「読めない」ことが分かる形の meta を返す。
+
+    以前はここで pid の無い meta を合成していた。running_pid() はその meta に
+    pid が無いことを「走っていない」と解釈するので、生きたプロセスが処理中でも
+    二重起動を許してしまっていた（issue #5）。壊れて読めないことは「走って
+    いないと確認できた」こととは違う。判断がつかないので、meta_unreadable を
+    立てて呼び出し側（RunnerRegistry.start）に「読めないから止める」判断を
+    委ねる。
+    """
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {
+            "id": job_id,
+            "status": STATUS_FAILED,
+            "error": "meta.json を読めません",
+            "meta_unreadable": True,
+        }
+
+
 def safe_ext(filename: str) -> str:
     """アップロード名から拡張子だけ取り出す。
 
@@ -86,6 +108,17 @@ class Job:
     # -- パス -----------------------------------------------------------
     def path(self, *parts: str) -> str:
         return os.path.join(self.dir, *parts)
+
+    def reload(self) -> None:
+        """ディスクの meta.json を読み直して self.meta を差し替える。
+
+        起動の可否は「今まさにディスクに書いてある pid」で判断する必要がある。
+        Library.get() で読んだ時点の meta は、その後の待ち時間ぶん古くなりうる
+        （RunnerRegistry.start がロックを取っている間に他プロセスが pid を
+        書いた場合など）。読めない場合の扱いは Library.get() と揃える
+        （_load_meta を参照）。
+        """
+        self.meta = _load_meta(self.path("meta.json"), self.id)
 
     @property
     def source(self) -> str:
@@ -201,12 +234,10 @@ class Library:
         meta_path = os.path.join(d, "meta.json")
         if not os.path.isfile(meta_path):
             raise KeyError(job_id)
-        try:
-            with open(meta_path, encoding="utf-8") as f:
-                meta = json.load(f)
-        except (OSError, ValueError):
-            # meta が壊れていても素材は残っている。読めないことを状態として出す
-            meta = {"id": job_id, "status": STATUS_FAILED, "error": "meta.json を読めません"}
+        # meta が壊れていても素材は残っている。読めないことを状態として出す
+        # （_load_meta 参照。pid の無い meta を合成して「走っていない」と
+        # 早合点しない）
+        meta = _load_meta(meta_path, job_id)
         return Job(id=job_id, dir=d, meta=meta)
 
     def list(self) -> list[Job]:

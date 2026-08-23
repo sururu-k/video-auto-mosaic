@@ -395,6 +395,79 @@ class JobRunner:
         }
 
 
+class _StartLock:
+    """ジョブ起動の排他を、プロセスをまたいで取るためのファイルロック。
+
+    `--port` を変えれば同じライブラリに複数の webapp サーバを起動できる
+    （issue #5）。RunnerRegistry.start() の中の threading.Lock はプロセス内
+    でしか効かないので、2サーバから同時に押されると「見てから書くまで」の
+    あいだに両方が「走っていない」を見て両方が Popen する（TOCTOU）。
+
+    check（running_pid）から Popen・meta 書き込みまでを1つの区間として
+    ロックするには、OS レベルで複数プロセスから排他できるものが要る。
+    `os.open(..., O_CREAT | O_EXCL)` によるロックファイルの作成はアトミックで、
+    Windows でも既にファイルがあれば FileExistsError になる（実測済み）。
+
+    保持者ごと死んだ場合に永久ロックにしないよう、ロックファイルには
+    保持者（このロックを取ろうとしたサーバプロセス）自身の pid を書く。
+    取得できなかったとき、その pid が生きていなければ残骸とみなして奪う。
+    保持している時間は「Popen してレジストリと meta.json を更新する」
+    だけの短い区間なので、待たされてもすぐ空く前提でタイムアウトを短く取る。
+    """
+
+    def __init__(self, job: jobs_mod.Job, timeout: float = 5.0) -> None:
+        self.path = job.path(".start.lock")
+        self.timeout = timeout
+        self._acquired = False
+
+    def acquire(self) -> None:
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                try:
+                    os.write(fd, str(os.getpid()).encode("ascii"))
+                finally:
+                    os.close(fd)
+                self._acquired = True
+                return
+            except FileExistsError:
+                pass
+            holder = 0
+            try:
+                with open(self.path, encoding="ascii") as f:
+                    holder = int((f.read() or "0").strip() or 0)
+            except (OSError, ValueError):
+                holder = 0
+            if not jobs_mod.pid_alive(holder):
+                # 保持者ごと落ちた残骸。奪ってやり直す
+                try:
+                    os.remove(self.path)
+                except OSError:
+                    pass
+                continue
+            if time.time() >= deadline:
+                raise RuntimeError(
+                    "起動処理が混み合っています。少し待ってから試してください"
+                )
+            time.sleep(0.05)
+
+    def release(self) -> None:
+        if self._acquired:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+            self._acquired = False
+
+    def __enter__(self) -> "_StartLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
 class RunnerRegistry:
     """走っているジョブの一覧。1ジョブ1本まで。"""
 
@@ -413,31 +486,51 @@ class RunnerRegistry:
         サーバを再起動するとサブプロセスだけが生き残った状態（detached）に
         なり、レジストリは空になる。そこを見ていないと、同じ output.mp4 へ
         2本が同時に書き込む。meta.json の pid でも必ず確かめる。
+
+        check から Popen・meta 書き込みまでを _StartLock で1区間にする
+        （プロセスをまたいだ TOCTOU 対策、issue #5）。ロックを取ったあとに
+        meta.json を読み直すのは、ロック待ちのあいだに他プロセスが起動して
+        pid を書いていることがあるため。
         """
-        with self._lock:
-            cur = self._runners.get(job.id)
-            # proc が None なのは「登録したが Popen する前」の一瞬。そこを
-            # 空きと見なすと、続けて2回押されたときに2本走る
-            if cur is not None and (cur.proc is None or cur.alive()):
-                raise RuntimeError("このジョブは既に実行中です")
-            pid = jobs_mod.running_pid(job)
-            if pid is not None:
-                raise RuntimeError(
-                    f"このジョブは別のプロセス (pid {pid}) が実行中です。"
-                    "終わるまで待つか、そのプロセスを終了させてください"
-                )
-            r = JobRunner(job, settings, reuse=reuse)
-            self._runners[job.id] = r
+        lock = _StartLock(job)
+        lock.acquire()
         try:
-            r.start()
-        except Exception:
-            # 起動に失敗したものを残すと、上の proc is None の判定に引っかかって
-            # そのジョブが二度と起動できなくなる
+            job.reload()
+            if job.meta.get("meta_unreadable"):
+                # 「読めないから起動を許す」ではなく「読めないから止める」に倒す。
+                # pid が読めないだけで実際には生きたプロセスが処理中かもしれない
+                # （issue #5 の経路1）。壊れたジョブを消して作り直すか、
+                # meta.json を手で直すまでは起動させない
+                raise RuntimeError(
+                    "meta.json が壊れていて実行中かどうか確認できません。"
+                    "安全のため起動を止めます。ジョブを削除するか meta.json を直してください"
+                )
             with self._lock:
-                if self._runners.get(job.id) is r:
-                    del self._runners[job.id]
-            raise
-        return r
+                cur = self._runners.get(job.id)
+                # proc が None なのは「登録したが Popen する前」の一瞬。そこを
+                # 空きと見なすと、続けて2回押されたときに2本走る
+                if cur is not None and (cur.proc is None or cur.alive()):
+                    raise RuntimeError("このジョブは既に実行中です")
+                pid = jobs_mod.running_pid(job)
+                if pid is not None:
+                    raise RuntimeError(
+                        f"このジョブは別のプロセス (pid {pid}) が実行中です。"
+                        "終わるまで待つか、そのプロセスを終了させてください"
+                    )
+                r = JobRunner(job, settings, reuse=reuse)
+                self._runners[job.id] = r
+            try:
+                r.start()
+            except Exception:
+                # 起動に失敗したものを残すと、上の proc is None の判定に引っかかって
+                # そのジョブが二度と起動できなくなる
+                with self._lock:
+                    if self._runners.get(job.id) is r:
+                        del self._runners[job.id]
+                raise
+            return r
+        finally:
+            lock.release()
 
     def cancel(self, job_id: str) -> bool:
         r = self.get(job_id)
