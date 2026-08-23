@@ -31,6 +31,7 @@ from .render import FrameBuffer, apply_regions, default_block_size
 from .temporal import (
     TemporalConfig,
     estimated_only_ranges,
+    frames_with_mosaic_count,
     process,
     review_flags,
     uncovered_ranges,
@@ -1046,6 +1047,22 @@ def main(argv: list[str] | None = None) -> int:
     # 到達する）。手修正が無い場合も regions は process() の出力そのものなので
     # 結果は変わらない。以降の表示・レポートは必ずこの left_open を使うこと。
     left_open = uncovered_ranges(regions, n_frames)
+
+    # issue #41: stats["frames_with_mosaic"] / stats["uncovered_gaps"] は
+    # process() が返した corr.apply() より前の値のままだった。left_open だけを
+    # 数え直しても、同じ画面に出る「モザイク適用率」と stats テーブルの
+    # uncovered_gaps は古い値のままなので、「適用率100.0%・uncovered_gaps 0」と
+    # 「素通し区間 N 件」が同時に表示される（実測。issue #41 の再現手順）。
+    # 上の left_open（数え直し済み）と整合するよう、この2キーだけをここで
+    # 上書きする。他のキーを post-correction で数え直すべきかは per-key で判断
+    # した（詳細は PR 本文）。手修正は process() が触らない生検出/トラック段階
+    # には作用しないので、そこ由来のキー（geometric_dropped、tracks_*、
+    # median_track_speed_px_per_frame など）や、自動処理の内訳を示す診断値
+    # （regions_interpolated / regions_from_memory / regions_bridged /
+    # frames_bridged。「自動処理が何をしたか」を表す値であり「最終出力に何が
+    # 残っているか」ではないため）は前のままにしている。
+    stats["frames_with_mosaic"] = frames_with_mosaic_count(regions, n_frames)
+    stats["uncovered_gaps"] = len(left_open)
 
     covered = stats["frames_with_mosaic"]
     coverage_pct = 100.0 * covered / n_frames
