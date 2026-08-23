@@ -35,3 +35,6 @@ frontend/node_modules/
 # sourcemap は本体より大きく、中身は frontend/src そのもの。
 # 現地で追いたいときだけ node build.mjs --sourcemap で出す
 *.js.map
+
+# エージェント用の worktree（.claude/worktrees/）
+.claude/
