@@ -13,6 +13,7 @@ read1() で来た分だけ取り、両方の文字で切る。
 
 from __future__ import annotations
 
+import codecs
 import os
 import re
 import shutil
@@ -200,14 +201,22 @@ class JobRunner:
 
         readline() だと `\\r` で終わる進捗行は次の `\\n` が来るまで返らず、
         パス1のあいだ進捗が一切出てこない（数時間、無反応に見える）。
+
+        4096 バイトのチャンク単位で `chunk.decode("utf-8", "replace")` を
+        独立に呼ぶと、日本語（3バイト）のようなマルチバイト文字がチャンク
+        境界をまたいだときに前半チャンクの末尾・後半チャンクの先頭がそれぞれ
+        不正なバイト列になり、両方が置換文字に化ける（issue #30）。
+        インクリメンタルデコーダを使い、チャンクをまたぐ文字の内部状態を
+        デコーダ自身に持たせることでこれを避ける。
         """
         buf = ""
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
         try:
             while True:
                 chunk = pipe.read1(4096) if hasattr(pipe, "read1") else pipe.read(1)
                 if not chunk:
                     break
-                buf += chunk.decode("utf-8", "replace")
+                buf += dec.decode(chunk)
                 parts = re.split(r"[\r\n]", buf)
                 buf = parts.pop()
                 for line in parts:
@@ -217,6 +226,9 @@ class JobRunner:
         except (ValueError, OSError):
             pass
         finally:
+            # ストリーム終端。デコーダ内部に保持されたままの端数バイトを
+            # 確定させる（そこで打ち切ると最後の文字が欠ける）。
+            buf += dec.decode(b"", final=True)
             if buf.strip():
                 self._on_line(buf.strip(), is_err)
             try:
