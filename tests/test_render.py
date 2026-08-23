@@ -495,6 +495,55 @@ def test_detect_window_non_square_scales_axes_independently():
     print("  非正方 _detect_window の縦横独立スケール OK")
 
 
+def test_detect_square_rejects_non_square_detector():
+    """issue #36: detect_square() を非正方 Detector で呼ぶと y が黙ってずれていた。
+
+    修正前は `ratio = scale_back / self.net_w` だけで x にも y にも同じ倍率を
+    使っており、net_w != net_h のとき y（と h）が誤った値になっていた
+    （実測: net=640x384, scale_back=1920 で y は 250 になるべきところ 150 を返す
+    = -100px のずれ）。呼び出し側の設定ミスとして確実に止めるようにした。
+    """
+    from automosaic.detector import Detector
+
+    det = Detector.__new__(Detector)  # __init__ を経由しない（モデル読み込み無し）
+    det.net_w, det.net_h = 640, 384  # 非正方
+    det.letterbox = False
+    det.conf = 0.0
+    det.nms_iou = 0.45
+    det.merge_mode = "union"
+    det._infer = lambda img: [(4, 0.9, (100.0, 50.0, 20.0, 10.0))]  # type: ignore[method-assign]
+
+    try:
+        det.detect_square(np.zeros((640, 640, 3), dtype=np.uint8), 1920.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("非正方 Detector で detect_square() が止まらなかった")
+    print("  非正方 Detector での detect_square() 拒否 OK")
+
+
+def test_detect_square_still_works_for_square_detector():
+    """正方 Detector（letterbox=True）では detect_square() が従来どおり動くこと。"""
+    from automosaic.detector import Detector
+
+    det = Detector.__new__(Detector)
+    det.net_w, det.net_h = 640, 640  # 正方
+    det.letterbox = True
+    det.conf = 0.0
+    det.nms_iou = 0.45
+    det.merge_mode = "union"
+    det._infer = lambda img: [(4, 0.9, (100.0, 50.0, 20.0, 10.0))]  # type: ignore[method-assign]
+
+    dets = det.detect_square(np.zeros((640, 640, 3), dtype=np.uint8), 1920.0)
+    assert len(dets) == 1
+    ratio = 1920.0 / 640
+    expected = (100.0 * ratio, 50.0 * ratio, 20.0 * ratio, 10.0 * ratio)
+    got = dets[0].box
+    for g, e in zip(got, expected):
+        assert abs(g - round(e)) <= 1, f"正方経路の座標が変わった: {got} vs {expected}"
+    print(f"  正方 Detector での detect_square() は従来どおり OK ({got})")
+
+
 def test_checkpoint_roundtrip():
     """途中保存が読み戻せること。長尺の検出が落ちたときに全損しないための機構。"""
     import tempfile

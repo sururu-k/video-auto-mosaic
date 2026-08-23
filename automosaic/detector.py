@@ -195,7 +195,22 @@ class Detector:
         """letterbox 済みの正方 BGR フレーム1枚を推論する（正方設定でのみ使うこと）。
 
         scale_back: 正方フレーム座標 -> 元動画座標 の倍率。
+
+        issue #36: 非正方 Detector（infer_size に (w, h) を渡した場合、
+        self.letterbox=False）でこれを呼ぶと、scale_back を net_w だけで
+        割った比を x にも y にも使ってしまい、y 座標が黙ってずれる。
+        net_h も使えば数値上は救えるが、それは「square_bgr が本当に
+        正方形である」という、コードのどこにも書かれず検査もされない
+        前提に依存する。前提が崩れたときに再び同じ種類の黙った誤りを
+        生むだけなので、ここでは救わずに呼び出し側の設定ミスとして
+        確実に止める（RULES.md 0: 判断がつかないときは塞ぐ・止める）。
         """
+        if not self.letterbox:
+            raise ValueError(
+                "detect_square() は letterbox=True（正方）の Detector 専用です。"
+                f" この Detector は非正方（net={self.net_w}x{self.net_h}）。"
+                " 非正方には detect_frame() を使ってください。"
+            )
         raw = self._infer(square_bgr)
         ratio = scale_back / self.net_w
         raw = [(c, sc, (x * ratio, y * ratio, w * ratio, h * ratio)) for c, sc, (x, y, w, h) in raw]
