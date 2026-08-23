@@ -24,6 +24,7 @@ from .detector import (
     Detection,
     Detector,
     available_providers,
+    budget_net_size,
 )
 from . import corrections as corr
 from .render import FrameBuffer, apply_regions, default_block_size
@@ -474,7 +475,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--infer-size",
         type=int,
         default=960,
-        help="推論解像度。実素材で 640->960 にすると検出フレームが約4割増えた。"
+        help="推論の画素予算（この値の2乗が目安）。素材の縦横比なりの非正方"
+        "ネット解像度に配分する（issue #8。正方の黒帯レターボックスは廃止）。"
+        "実素材で 640->960 にすると検出フレームが約4割増えた。"
         "1280 まで上げても伸びはわずかで時間が1.7倍になる",
     )
     g.add_argument(
@@ -880,9 +883,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
     if not loaded:
+        # issue #8: 正方レターボックスは入力の縦横比を捨て、黒帯に画素予算を食わせる
+        # （16:9 素材で44%）。同じ画素予算(infer_size**2)を入力の縦横比なりに
+        # 配分し直した非正方のネット解像度を使う。素材の縦横比は info（動画その
+        # ものの縦横比）から決める。タイルは NxN に割っても縦横比は変わらないので
+        # 同じ net_w/net_h をそのまま使い回せる。
+        net_w, net_h = budget_net_size(info.width, info.height, args.infer_size)
         det = Detector(
             model_path=args.model,
-            infer_size=args.infer_size,
+            infer_size=(net_w, net_h),
             conf=args.conf,
             nms_iou=args.nms_iou,
             provider=args.provider,
@@ -890,8 +899,11 @@ def main(argv: list[str] | None = None) -> int:
             device_id=args.device_id,
             merge_mode=args.merge,
         )
-        # タイル分割するときは、タイル1枚が推論解像度を埋められるだけデコードする
-        detect_scale = args.detect_scale or args.infer_size * max(1, args.tiles)
+        # タイル分割するときは、タイル1枚が推論解像度を埋められるだけデコードする。
+        # 旧: infer_size(正方の辺) * タイル数。新: net の長辺 * タイル数
+        # （decode 自体は正方 box への fit なので、box の長辺だけ渡せば足りる。
+        # box が正方でも中身は縦横比なりに縮む＝黒帯にはならない）。
+        detect_scale = args.detect_scale or max(net_w, net_h) * max(1, args.tiles)
         if not args.quiet:
             print(f"プロバイダ {det.active_provider}")
             extra = []
@@ -902,7 +914,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.frame_step > 1:
                 extra.append(f"{args.frame_step}フレームおき")
             print(
-                f"検出設定   conf {args.conf}  デコード長辺 {detect_scale}px"
+                f"検出設定   conf {args.conf}  ネット入力 {net_w}x{net_h}px"
+                f"  デコード長辺 {detect_scale}px"
                 + (f"  {' + '.join(extra)}" if extra else "")
             )
         resume_dets: dict[int, list[Detection]] = {}

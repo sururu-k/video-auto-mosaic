@@ -10,6 +10,7 @@ nudenet パッケージの NudeDetector を使わない理由:
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 
@@ -102,13 +103,45 @@ def resolve_providers(name: str | None) -> list[str]:
     return [name]
 
 
+def budget_net_size(width: int, height: int, infer_size: int, stride: int = 32) -> tuple[int, int]:
+    """縦横比を保ったまま、面積予算 infer_size**2 に収まるネット入力解像度を決める。
+
+    issue #8: 正方レターボックス（side=max(w,h) の黒帯埋め）は 16:9 素材で
+    テンソルの44%を黒で捨てる。同じ画素予算（infer_size**2）を、入力の
+    縦横比に合わせて配分し直せば、その無駄をほぼゼロにできる
+    （実測: 1920x1080 / infer_size=960 で 960x960[44%黒] -> 1280x736[黒帯ほぼ無し]）。
+
+    stride の倍数に丸めるのは YOLO 系モデルの構造上の制約（stride=32 で
+    ダウンサンプルするため、入力もその倍数でないと出力の形が崩れる）。
+    丸めの分だけ比がわずかにずれるが、正方に比べれば無視できる差になる。
+    丸めは四捨五入（0.5 は切り上げ）。Python の組み込み round() は
+    0.5 を偶数側に丸める（銀行丸め）ので、ちょうど stride の半分に
+    乗るケース（例: 1920x1080/960 の raw_h=720.0 は 32 の 22.5 倍）で
+    予算を切り捨てる方向にだけ丸まってしまう。それを避けるため自前で丸める。
+    """
+    if width <= 0 or height <= 0 or infer_size <= 0:
+        return infer_size, infer_size
+    aspect = width / height
+    budget = float(infer_size) * float(infer_size)
+    raw_h = math.sqrt(budget / aspect)
+    raw_w = raw_h * aspect
+    net_w = max(stride, math.floor(raw_w / stride + 0.5) * stride)
+    net_h = max(stride, math.floor(raw_h / stride + 0.5) * stride)
+    return int(net_w), int(net_h)
+
+
 class Detector:
-    """ONNX の物体検出器。入力は letterbox 済み正方フレーム前提。"""
+    """ONNX の物体検出器。入力はネット解像度に合わせてリサイズしたフレーム。
+
+    infer_size に int を渡すと正方（黒帯レターボックス、旧経路）、
+    (w, h) のタプルを渡すと非正方（黒帯なし、直接リサイズ）になる。
+    後者は segmenter.py の非正方経路と同じ考え方（issue #8）。
+    """
 
     def __init__(
         self,
         model_path: str,
-        infer_size: int = 640,
+        infer_size: int | tuple[int, int] = 640,
         conf: float = 0.12,
         nms_iou: float = 0.45,
         provider: str | None = "auto",
@@ -138,6 +171,15 @@ class Detector:
             provider_options=provider_options,
         )
         self.input_name = self.session.get_inputs()[0].name
+        # infer_size が int なら正方（黒帯レターボックス、右下ゼロ埋め）。
+        # (w, h) のタプルなら非正方（黒帯なし、そのままネット解像度へリサイズ）。
+        # segmenter.py の letterbox フラグと同じ規約。
+        if isinstance(infer_size, (tuple, list)):
+            self.net_w, self.net_h = int(infer_size[0]), int(infer_size[1])
+            self.letterbox = False
+        else:
+            self.net_w = self.net_h = int(infer_size)
+            self.letterbox = True
         self.infer_size = infer_size
         self.conf = conf
         self.nms_iou = nms_iou
@@ -150,12 +192,12 @@ class Detector:
     def detect_square(
         self, square_bgr: np.ndarray, scale_back: float
     ) -> list[Detection]:
-        """letterbox 済みの正方 BGR フレーム1枚を推論する。
+        """letterbox 済みの正方 BGR フレーム1枚を推論する（正方設定でのみ使うこと）。
 
         scale_back: 正方フレーム座標 -> 元動画座標 の倍率。
         """
         raw = self._infer(square_bgr)
-        ratio = scale_back / self.infer_size
+        ratio = scale_back / self.net_w
         raw = [(c, sc, (x * ratio, y * ratio, w * ratio, h * ratio)) for c, sc, (x, y, w, h) in raw]
         return self._nms(raw)
 
@@ -203,43 +245,61 @@ class Detector:
     def _detect_window(
         self, window_bgr: np.ndarray, off_x: int, off_y: int, tta: bool
     ) -> list[tuple[int, float, tuple[float, float, float, float]]]:
-        """1つの窓（全体またはタイル）を推論し、フレーム座標に戻す。"""
+        """1つの窓（全体またはタイル）を推論し、フレーム座標に戻す。
+
+        letterbox=True（int infer_size）: 旧来どおり正方に黒帯パディングしてから
+        推論解像度へリサイズする。16:9 の窓だと下 43.75% が黒帯になる（issue #8）。
+        letterbox=False（(w,h) infer_size）: パディングせず窓をそのままネット解像度
+        (net_w, net_h) へ直接リサイズする。segmenter.py の非正方経路と同じ規約。
+        窓の縦横比がネットの縦横比とずれているぶんだけ引き伸ばしが入るが、
+        黒帯で画素を丸ごと捨てるより実効解像度を落とさずに済む。
+        """
         wh, ww = window_bgr.shape[:2]
-        side = max(wh, ww)
-        square = np.zeros((side, side, 3), dtype=window_bgr.dtype)
-        square[:wh, :ww] = window_bgr
-        # 正方(side) -> 推論解像度 の逆変換倍率
-        ratio = side / self.infer_size
+        if self.letterbox:
+            side = max(wh, ww)
+            canvas = np.zeros((side, side, 3), dtype=window_bgr.dtype)
+            canvas[:wh, :ww] = window_bgr
+            # 正方(side) -> 推論解像度 の逆変換倍率
+            ratio_x = ratio_y = side / self.net_w
+        else:
+            canvas = window_bgr
+            # 窓(ww,wh) -> 推論解像度(net_w,net_h) の逆変換倍率。縦横で別々
+            ratio_x = ww / self.net_w
+            ratio_y = wh / self.net_h
 
         out: list[tuple[int, float, tuple[float, float, float, float]]] = []
-        for det in self._infer(square):
+        for det in self._infer(canvas):
             cls_id, score, (x, y, bw, bh) = det
             out.append(
-                (cls_id, score, (x * ratio + off_x, y * ratio + off_y, bw * ratio, bh * ratio))
+                (
+                    cls_id,
+                    score,
+                    (x * ratio_x + off_x, y * ratio_y + off_y, bw * ratio_x, bh * ratio_y),
+                )
             )
 
         if tta:
-            flipped = square[:, ::-1].copy()
+            flipped = canvas[:, ::-1].copy()
             for cls_id, score, (x, y, bw, bh) in self._infer(flipped):
-                # 反転を戻す。正方の辺は infer_size 換算なので x' = infer_size - x - w
-                fx = self.infer_size - x - bw
+                # 反転を戻す。水平(幅)方向の反転なので net_w 基準
+                fx = self.net_w - x - bw
                 out.append(
                     (
                         cls_id,
                         score,
-                        (fx * ratio + off_x, y * ratio + off_y, bw * ratio, bh * ratio),
+                        (fx * ratio_x + off_x, y * ratio_y + off_y, bw * ratio_x, bh * ratio_y),
                     )
                 )
         return out
 
     def _infer(
-        self, square_bgr: np.ndarray
+        self, img_bgr: np.ndarray
     ) -> list[tuple[int, float, tuple[float, float, float, float]]]:
-        """正方フレームを1回推論し、推論解像度の座標系で (クラスID, score, xywh) を返す。"""
+        """フレームを1回推論し、推論解像度の座標系で (クラスID, score, xywh) を返す。"""
         blob = cv2.dnn.blobFromImage(
-            square_bgr,
+            img_bgr,
             1 / 255.0,
-            (self.infer_size, self.infer_size),
+            (self.net_w, self.net_h),
             (0, 0, 0),
             swapRB=True,
             crop=False,
