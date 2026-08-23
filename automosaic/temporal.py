@@ -318,10 +318,19 @@ def build_tracks(
     return tracks
 
 
-def despike(tracks: list[Track], cfg: TemporalConfig) -> tuple[list[Track], int]:
+def despike(
+    tracks: list[Track], cfg: TemporalConfig
+) -> tuple[list[Track], int, list[tuple[int, int, str, float]]]:
     """短命かつ低スコアのトラックを落とす。補間より前に行うこと。
 
-    Recall 優先なので、スコアが高いものは1フレームだけでも残す。
+    Recall 優先なので、スコアが高いものは1フレームだけでも残す。既定は無効
+    （min_track_len=0）。塗り過ぎのコストは許容できるが漏れは許容できないので、
+    捨てる理由がない（docs/09-mosaic-quality.md S4 の実測: 確実に映っている区間内の
+    実観測125件を捨て、うち40件はそのフレームが素通しになっていた）。
+
+    それでも --despike で明示的に有効化された場合、「判断できない区間を黙って
+    素通しにしない」という設計原則を守るため、捨てた場所（開始/終了フレーム・
+    クラス・最大スコア）も返す。呼び出し側はこれを必ず報告すること。
 
     track_min_peak を指定すると2閾値のヒステリシスになる。
     「トラック内で一度でも track_min_peak を超えたものだけを有効とし、
@@ -331,15 +340,18 @@ def despike(tracks: list[Track], cfg: TemporalConfig) -> tuple[list[Track], int]
     実素材で効果を測ってから使うこと。既定は無効。
     """
     kept, dropped = [], 0
+    dropped_ranges: list[tuple[int, int, str, float]] = []
     for t in tracks:
         if cfg.track_min_peak > 0 and t.max_score < cfg.track_min_peak:
             dropped += 1
+            dropped_ranges.append((t.first, t.last, t.cls, t.max_score))
             continue
         if len(t) < cfg.min_track_len and t.max_score < cfg.despike_conf:
             dropped += 1
+            dropped_ranges.append((t.first, t.last, t.cls, t.max_score))
             continue
         kept.append(t)
-    return kept, dropped
+    return kept, dropped, dropped_ranges
 
 
 def stitch_tracks(
@@ -730,7 +742,7 @@ def process(
     # 実際、位置が15pxしか離れていない検出が繋がらずに1.8秒の穴になっていた。
     # 先に繋いでおけば、まとまったトラックとして評価されるので生き残る。
     tracks, n_stitched = stitch_tracks(tracks, frame_w, frame_h, cfg)
-    tracks, n_despiked = despike(tracks, cfg)
+    tracks, n_despiked, despiked_ranges = despike(tracks, cfg)
 
     speeds = _track_speed(tracks)
     dense = densify(tracks, n_frames, cfg)
@@ -777,6 +789,9 @@ def process(
         "median_track_speed_px_per_frame": round(median_speed, 2),
     }
     stats["_left_open"] = left_open
+    # despike が有効（min_track_len > 0 か track_min_peak > 0）で何か捨てていたら、
+    # 場所を必ず出せるように渡しておく。既定では despike 無効なので通常は空。
+    stats["_despiked_ranges"] = despiked_ranges
     return out, stats
 
 
