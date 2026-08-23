@@ -723,6 +723,13 @@ def main(argv: list[str] | None = None) -> int:
     info = vid.probe(src)
     block = args.block or default_block_size(info.long_edge)
 
+    if info.rotation and not args.quiet:
+        print(
+            f"入力に回転メタデータがあります（{info.rotation}度）。"
+            f"表示向きの {info.width}x{info.height} として扱います。",
+            file=sys.stderr,
+        )
+
     if not args.quiet:
         print(f"入力      {src}")
         print(f"          {info.width}x{info.height}  {info.fps:.3f} fps  {info.pix_fmt}")

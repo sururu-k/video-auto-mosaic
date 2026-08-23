@@ -48,6 +48,10 @@ class VideoInfo:
     # 映像ストリーム自身の値ではないときに True。末尾に追加した新フィールドなので、
     # 既存の位置引数呼び出し（テストなど）は既定値 False のまま動く。
     duration_from_format_only: bool = False
+    # side_data_list から読んだ表示回転（0/90/180/270）。90/270 のときは
+    # width/height は probe() の時点ですでに入れ替え済み（＝実際にデコード
+    # される表示向きのサイズ）。ここには「入れ替えた」という事実だけを残す。
+    rotation: int = 0
 
     @property
     def fps(self) -> float:
@@ -96,6 +100,33 @@ class VideoInfo:
         return bool(self.duration) and not self.duration_from_format_only
 
 
+def _display_rotation(video: dict) -> int:
+    """side_data_list から表示回転を読み、0/90/180/270 に正規化する。
+
+    ffmpeg は再生時にこの回転を自動で適用して（既定で -autorotate 有効）、
+    デコード後のフレームは回転済み・転置済みのものが出てくる。90/270 度では
+    幅と高さが入れ替わって出るのに probe() がここを見ていないと、申告される
+    width/height と実際にデコードされるフレームの縦横が食い違う。バイト数が
+    たまたま一致すると（正方形に近い解像度など）長さ検査を素通りし、
+    reshape だけが転置されて全フレームが斜めに裂けたスクランブルになる
+    （このリポジトリでの実測: 640x360 に 90度回転を付けた素材で再現）。
+
+    side_data_list を持たない（回転メタデータ無し）動画は 0 を返す。
+    45度刻みでない・カメラ機器が書く古い形式の rotate タグのみで
+    side_data_list が無い場合は、ここでは検出できない（未確認・別途要対応）。
+    """
+    for sd in video.get("side_data_list") or []:
+        if sd.get("side_data_type") == "Display Matrix" and "rotation" in sd:
+            try:
+                deg = round(float(sd["rotation"]))
+            except (TypeError, ValueError):
+                continue
+            norm = deg % 360
+            if norm in (0, 90, 180, 270):
+                return norm
+    return 0
+
+
 def probe(path: str) -> VideoInfo:
     ffprobe = _require("ffprobe")
     out = subprocess.run(
@@ -135,9 +166,20 @@ def probe(path: str) -> VideoInfo:
     format_duration = data.get("format", {}).get("duration")
     duration = stream_duration or format_duration
 
+    width = int(video["width"])
+    height = int(video["height"])
+    rotation = _display_rotation(video)
+    if rotation in (90, 270):
+        # ffmpeg はデコード時にこの回転を自動で適用し、90/270度では
+        # 幅と高さを入れ替えたフレームを流す。width/height はここで
+        # 実際にデコードされる向きに合わせておく。以降のコード（パス1の
+        # scale_back、パス2の FrameBuffer など）は全部この値を前提に
+        # 動くので、ここで揃えないと検出座標もフレーム内容もずれる。
+        width, height = height, width
+
     return VideoInfo(
-        width=int(video["width"]),
-        height=int(video["height"]),
+        width=width,
+        height=height,
         fps_num=num,
         fps_den=den,
         nb_frames=int(nb) if nb and str(nb).isdigit() else None,
@@ -149,6 +191,7 @@ def probe(path: str) -> VideoInfo:
         color_range=video.get("color_range"),
         has_audio=any(s.get("codec_type") == "audio" for s in streams),
         duration_from_format_only=not stream_duration and bool(format_duration),
+        rotation=rotation,
     )
 
 
