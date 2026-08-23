@@ -1952,6 +1952,23 @@ def parse_size(text: str | None, fallback: tuple[int, int]) -> tuple[int, int]:
     return v, v
 
 
+def _cli_defaults() -> dict[str, object]:
+    """cli.py の argparse 既定値を、フラグ名をキーにして返す。
+
+    値をここに書き写すと、cli.py 側の既定が変わったときに追随できず、レビュー画面が
+    焼き込みと違う設定で領域を計算する（#14）。cli.py の build_parser() を直接呼んで
+    値を借りることで、既定値の唯一の正を cli.py 側に保つ。
+    """
+    from . import cli as _cli
+
+    out: dict[str, object] = {}
+    for action in _cli.build_parser()._actions:
+        for opt in action.option_strings:
+            if opt.startswith("--"):
+                out[opt] = action.default
+    return out
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m automosaic.review",
@@ -2001,27 +2018,58 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # 帯とプレビューは焼き込みと同じ領域計算でなければ意味がないので、
-    # cli.py の時間方向オプションと同じ既定値を持たせる。
+    # cli.py の時間方向オプションと同じ既定値を持たせる。既定値は cli.py の
+    # build_parser() から借りる（_cli_defaults）。数値をここに書き写さないのは、
+    # 過去に書き写した2つ（margin-scale/margin-cap）が実際に食い違って、レビュー画面
+    # が焼き込みより広く塗って見せていたため（#14: 実測で5,950フレームぶん）。
+    cd = _cli_defaults()
     t = p.add_argument_group("時間方向（cli と同じ既定値）")
-    t.add_argument("--classes", default="default")
-    t.add_argument("--max-gap", type=int, default=12)
-    t.add_argument("--memory", type=int, default=6)
-    t.add_argument("--memory-before", type=int, default=0)
-    t.add_argument("--stitch-gap", type=int, default=90)
-    t.add_argument("--stitch-dist", type=float, default=0.12)
-    t.add_argument("--margin-scale", type=float, default=1.0)
-    t.add_argument("--margin-cap", type=float, default=0.0)
-    t.add_argument("--motion-weight", type=float, default=2.0)
-    t.add_argument("--motion-cap", type=float, default=60.0)
-    t.add_argument("--hold-growth", type=float, default=0.5)
-    t.add_argument("--estimated-factor", type=float, default=1.3)
-    t.add_argument("--max-area-ratio", type=float, default=0.35)
-    t.add_argument("--track-min-peak", type=float, default=0.0)
-    t.add_argument("--bridge-max", type=int, default=150)
-    t.add_argument("--no-bridge", action="store_true")
-    t.add_argument("--no-despike", action="store_true")
-    t.add_argument("--frame-step", type=int, default=1)
+    t.add_argument("--classes", default=cd["--classes"])
+    t.add_argument("--max-gap", type=int, default=cd["--max-gap"])
+    t.add_argument("--memory", type=int, default=cd["--memory"])
+    t.add_argument("--memory-before", type=int, default=cd["--memory-before"])
+    t.add_argument("--stitch-gap", type=int, default=cd["--stitch-gap"])
+    t.add_argument("--stitch-dist", type=float, default=cd["--stitch-dist"])
+    t.add_argument("--margin-scale", type=float, default=cd["--margin-scale"])
+    t.add_argument("--margin-cap", type=float, default=cd["--margin-cap"])
+    t.add_argument("--motion-weight", type=float, default=cd["--motion-weight"])
+    t.add_argument("--motion-cap", type=float, default=cd["--motion-cap"])
+    t.add_argument("--hold-growth", type=float, default=cd["--hold-growth"])
+    t.add_argument("--estimated-factor", type=float, default=cd["--estimated-factor"])
+    t.add_argument("--max-area-ratio", type=float, default=cd["--max-area-ratio"])
+    t.add_argument("--track-min-peak", type=float, default=cd["--track-min-peak"])
+    t.add_argument("--bridge-max", type=int, default=cd["--bridge-max"])
+    t.add_argument("--no-bridge", action="store_true", default=cd["--no-bridge"])
+    t.add_argument("--despike", action="store_true", default=cd["--despike"])
+    t.add_argument("--no-despike", action="store_true", default=cd["--no-despike"])
+    t.add_argument("--frame-step", type=int, default=cd["--frame-step"])
+    t.add_argument(
+        "--estimate-gaps",
+        action="store_true",
+        default=cd["--estimate-gaps"],
+        help="cli.py と同じ意味。検出が途切れた区間を推定で埋める"
+        "（memory・橋渡し・不確かさ膨張が有効になる）。既定は無効で、cli.py が"
+        "既定ジョブで絞り込む memory / memory-before / bridge-max / hold-growth /"
+        " motion-weight を、レビューも同じ式で絞り込む",
+    )
     return p
+
+
+def explicit_options(argv: list[str] | None) -> set[str]:
+    """レビューのコマンドラインで実際に指定されたオプション名を返す。
+
+    cli.py の同名関数と同じ手口。既定値と同じ値を明示指定することもあるので、
+    値の比較では判別できない。既定値を全部 None にしたパーサでもう一度読み、
+    埋まったものだけを拾う。
+    """
+    p = build_parser()
+    for action in p._actions:
+        action.default = None
+    try:
+        parsed = p.parse_args(argv)
+    except SystemExit:
+        return set()
+    return {k for k, v in vars(parsed).items() if v is not None}
 
 
 def resolve_classes(spec: str) -> set[str]:
@@ -2032,10 +2080,24 @@ def resolve_classes(spec: str) -> set[str]:
     return {c.strip() for c in spec.split(",") if c.strip()}
 
 
-def session_from_args(args) -> ReviewSession:
+def session_from_args(args, argv: list[str] | None = None) -> ReviewSession:
+    """引数から ReviewSession を組む。
+
+    `argv` は `--estimate-gaps` が明示指定されたかどうかの判別にだけ使う
+    （cli.py と同じ絞り込みを、明示指定を上書きせずに行うため）。省略した場合は
+    「何も明示指定されていない」として扱う。
+    """
     src = args.input
     if not src or not os.path.exists(src):
         raise SystemExit(f"元動画が見つかりません: {src}")
+
+    # cli.py と同じ矛盾検査。--despike は既定オフの明示的な opt-in、--no-despike は
+    # 後方互換のためだけに残っている（cli.py の意味と同じ）。黙ってどちらかに倒さない
+    if args.despike and args.no_despike:
+        raise SystemExit(
+            "--despike と --no-despike は同時に指定できません（矛盾する指定を黙って"
+            "どちらかに倒さない）"
+        )
 
     width, height, fps, n_frames = probe_with_cv2(src)
 
@@ -2058,13 +2120,51 @@ def session_from_args(args) -> ReviewSession:
         }
     per_frame = {f: per_frame.get(f, []) for f in range(n_frames)}
 
+    # cli.py の main() と同じ絞り込み。--estimate-gaps 無しが既定で、これは
+    # 「実際に検出できた箇所だけ」を塗る方針（塗り過ぎを避ける）。この絞り込みが
+    # 無いと、レビューは常に memory/橋渡し/不確かさ膨張ありで領域を計算し、
+    # 焼き込みでは塗られない橋渡し・memory 領域を「塗られている」と見せてしまう
+    # （#14: 実測で bench3 素材 9,344 フレームぶん。issue #14 記載の実素材では
+    # 5,950フレーム）。明示指定された値は上書きしない。
+    if not args.estimate_gaps:
+        given = explicit_options(argv)
+        narrowed = [
+            ("memory", "--memory", args.memory, min(args.memory, 2)),
+            ("memory_before", "--memory-before",
+             args.memory_before, min(args.memory_before or 2, 2)),
+            ("bridge_max", "--bridge-max", args.bridge_max, 0),
+            ("hold_growth", "--hold-growth", args.hold_growth, 0.0),
+            ("motion_weight", "--motion-weight",
+             args.motion_weight, min(args.motion_weight, 1.0)),
+        ]
+        applied: list[str] = []
+        kept: list[str] = []
+        for name, flag, old, new in narrowed:
+            if name in given:
+                if old != new:
+                    kept.append(f"{flag} {old}")
+                continue
+            if old != new:
+                setattr(args, name, new)
+                applied.append(f"{flag} {old} -> {new}")
+
+        # cli.py の C-6 と同じ理由。実効設定が画面の見た目に直結するので黙って絞らない
+        if applied:
+            print(
+                "--estimate-gaps 無しのため推定で広げる設定を絞りました: "
+                + ", ".join(applied),
+                file=sys.stderr,
+            )
+        if kept:
+            print("明示指定を優先: " + ", ".join(kept), file=sys.stderr)
+
     classes = resolve_classes(args.classes)
     cfg = TemporalConfig(
         max_gap=args.max_gap,
         memory=args.memory,
         margin_scale=args.margin_scale,
         max_area_ratio=args.max_area_ratio,
-        min_track_len=0 if args.no_despike else 2,
+        min_track_len=2 if args.despike else 0,
         bridge_max=0 if args.no_bridge else args.bridge_max,
         frame_step=max(1, args.frame_step),
         track_min_peak=args.track_min_peak,
@@ -2171,7 +2271,7 @@ def print_banner(session: ReviewSession, host: str, port: int, token: str, no_qr
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    session = session_from_args(args)
+    session = session_from_args(args, argv)
 
     if args.export_dataset:
         export_dataset(session, args.export_dataset)
