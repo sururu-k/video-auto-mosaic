@@ -35,6 +35,7 @@ const el = {
   size: $("size"),
   sizeLabel: $("size-label"),
   spanRow: $("span-row"),
+  markTitle: $("mark-title"),
   confirm: $("btn-confirm"),
   sheet: $("sheet"),
   sheetInfo: $("sheet-info"),
@@ -52,11 +53,41 @@ const S = {
   pending: null,   // 置いた矩形 [x, y, w, h]（動画座標）
   tap: null,       // 正規化タップ座標。サーバへはこちらを送る
   marking: false,
+  // 位置指定モードの種類。"add" は漏れを塞ぐ、"shrink" は塗り過ぎを狭める。
+  // 画面部品は共用なので、どちらのつもりで置いた矩形かをここで持つ
+  markMode: null,
   busy: false,
   imgWidth: 720,
 };
 
 const SRC_COLOR = { d: "#4a9eff", i: "#ffd479", m: "#ffd479", b: "#ffb347", x: "#ff5a5a" };
+
+// 位置指定モードごとの文言と、サーバへ送る判定名。
+// verdict をここに持たせておかないと、確定処理がモードごとの分岐だらけになる
+const MARK_MODES = {
+  add: {
+    verdict: "fixed",
+    title: "漏れている場所を指定",
+    hint: "漏れている場所を、画像の上で直接タップしてください",
+    wait: "画像をタップしてください",
+    confirm: "この位置で確定",
+  },
+  shrink: {
+    verdict: "toobig",
+    title: "残す範囲を指定（枠内の自動領域は消えます）",
+    hint: "枠で囲まれた自動領域を消して、タップした範囲だけを残します",
+    wait: "残したい範囲をタップしてください",
+    confirm: "この範囲にする",
+  },
+};
+
+// 判定済みの表示。progress の集計キーとも揃えてある
+const VERDICT_LABEL = {
+  ok: "問題なし",
+  fixed: "塞いだ",
+  unsure: "保留",
+  toobig: "範囲を狭めた",
+};
 
 // --------------------------------------------------------------------
 // 起動
@@ -148,7 +179,7 @@ function show() {
   drawBoxes();
   prefetch();
   if (it.verdict) {
-    banner({ ok: "判定済み: 問題なし", fixed: "判定済み: 塞いだ", unsure: "判定済み: 保留" }[it.verdict]);
+    banner("判定済み: " + (VERDICT_LABEL[it.verdict] || it.verdict));
   } else {
     banner("");
   }
@@ -163,6 +194,13 @@ function prefetch() {
   }
 }
 
+function autoBoxes() {
+  // 自動で置かれた領域だけ。手で足したもの（x）は remove の対象外なので、
+  // 「でかすぎる」で狭められるのはこちらだけ
+  const it = cur();
+  return ((it && it.boxes) || []).filter((r) => r[4] !== "x");
+}
+
 function clearOverlay() {
   const ctx = el.ov.getContext("2d");
   ctx.clearRect(0, 0, el.ov.width, el.ov.height);
@@ -170,12 +208,24 @@ function clearOverlay() {
 
 function drawBoxes() {
   clearOverlay();
-  if (!$("opt-boxes").checked && !S.pending) return;
+  const shrink = S.markMode === "shrink";
+  if (!$("opt-boxes").checked && !S.pending && !shrink) return;
   const ctx = el.ov.getContext("2d");
   // 端末では画面に対して縮んで表示されるので、線幅は解像度に比例させる
   const lw = Math.max(2, Math.round(S.state.width / 400));
 
-  if ($("opt-boxes").checked) {
+  if (shrink) {
+    // 狭めるモードでは枠の表示設定に関係なく自動領域を出す。何を狭めようと
+    // しているのか分からないまま範囲を置かせると、逆に広げる操作になる。
+    // 薄く塗りつぶすのは、線だけでは「どれがでかいのか」が読み取りにくいから
+    ctx.lineWidth = lw * 1.5;
+    for (const r of autoBoxes()) {
+      ctx.fillStyle = "rgba(255, 165, 60, .22)";
+      ctx.fillRect(r[0], r[1], r[2], r[3]);
+      ctx.strokeStyle = "#ffa53c";
+      ctx.strokeRect(r[0], r[1], r[2], r[3]);
+    }
+  } else if ($("opt-boxes").checked) {
     const it = cur();
     ctx.lineWidth = lw;
     for (const r of (it && it.boxes) || []) {
@@ -208,7 +258,8 @@ function updateProgress(p) {
   el.fill.style.width = pct.toFixed(1) + "%";
   el.sheetInfo.textContent =
     `${p.total} 枚中 ${p.done} 枚判定済み（残り ${p.remaining}）` +
-    `  問題なし ${p.counts.ok} / 塞いだ ${p.counts.fixed} / 保留 ${p.counts.unsure}`;
+    `  問題なし ${p.counts.ok} / 塞いだ ${p.counts.fixed}` +
+    ` / 狭めた ${p.counts.toobig || 0} / 保留 ${p.counts.unsure}`;
   $("btn-undo").disabled = !p.can_undo;
   $("btn-undo2").disabled = !p.can_undo;
 }
@@ -294,26 +345,39 @@ async function undo() {
 // 位置の指定
 // --------------------------------------------------------------------
 
-function startMark() {
+function startMark(mode) {
   if (!cur()) return;
+  const m = MARK_MODES[mode];
+  if (!m) return;
+  if (mode === "shrink" && !autoBoxes().length) {
+    // 消す相手がいないのに範囲だけ置かせると、ただ塗る範囲が増える。
+    // 「でかすぎる」は狭める操作なので、狭める先が無いなら入らせない
+    banner("このコマには自動で塗った領域がありません。狭める対象がありません");
+    return;
+  }
   S.marking = true;
+  S.markMode = mode;
   S.pending = null;
   S.tap = null;
   document.body.classList.add("marking");
+  document.body.classList.toggle("shrinking", mode === "shrink");
   el.judge.classList.add("hidden");
   el.mark.classList.remove("hidden");
+  el.markTitle.textContent = m.title;
   el.confirm.disabled = true;
-  el.confirm.textContent = "画像をタップしてください";
-  banner("漏れている場所を、画像の上で直接タップしてください");
+  el.confirm.textContent = m.wait;
+  banner(m.hint);
   drawBoxes();
 }
 
 function cancelMark() {
   if (!S.marking) return;
   S.marking = false;
+  S.markMode = null;
   S.pending = null;
   S.tap = null;
   document.body.classList.remove("marking");
+  document.body.classList.remove("shrinking");
   el.judge.classList.remove("hidden");
   el.mark.classList.add("hidden");
   banner("");
@@ -345,7 +409,7 @@ function placeFromTap(nx, ny) {
     h,
   ];
   el.confirm.disabled = false;
-  el.confirm.textContent = "この位置で確定";
+  el.confirm.textContent = (MARK_MODES[S.markMode] || MARK_MODES.add).confirm;
   banner("大きさは下のスライダで調整できます");
   drawBoxes();
 }
@@ -419,13 +483,18 @@ async function reloadQueue(params) {
 
 $("btn-ok").onclick = () => judge("ok");
 $("btn-unsure").onclick = () => judge("unsure");
-$("btn-ng").onclick = startMark;
+$("btn-ng").onclick = () => startMark("add");
+$("btn-big").onclick = () => startMark("shrink");
 $("btn-undo").onclick = undo;
 $("btn-undo2").onclick = undo;
 $("btn-cancel").onclick = cancelMark;
 
 el.confirm.onclick = () => {
+  // 範囲が置かれていなければ何もしない。「でかすぎる」で範囲なしを通すと、
+  // 自動領域を消すだけの修正になり、そのコマが素通しになる
   if (!S.tap) return;
+  const m = MARK_MODES[S.markMode];
+  if (!m) return;
   const [w, h] = boxSize();
   const payload = {
     x: S.tap[0], y: S.tap[1], w, h,
@@ -433,7 +502,7 @@ el.confirm.onclick = () => {
     class: el.optClass.value || S.state.default_class,
   };
   cancelMark();
-  judge("fixed", payload);
+  judge(m.verdict, payload);
 };
 
 el.size.oninput = () => {
@@ -466,8 +535,9 @@ document.addEventListener("keydown", (ev) => {
   if (ev.target.tagName === "INPUT" || ev.target.tagName === "SELECT") return;
   switch (ev.key) {
     case "1": judge("ok"); break;
-    case "2": startMark(); break;
+    case "2": startMark("add"); break;
     case "3": judge("unsure"); break;
+    case "4": startMark("shrink"); break;
     case "u": case "U": undo(); break;
     case "ArrowLeft": goto(S.idx - 1); break;
     case "ArrowRight": goto(S.idx + 1); break;

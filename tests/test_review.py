@@ -36,6 +36,7 @@ from automosaic.review import (  # noqa: E402
     ReviewSession,
     build_queue,
     cookie_token,
+    cover_box,
     dominant_class,
     export_dataset,
     lan_addresses,
@@ -581,6 +582,198 @@ def test_mark_rejects_unknown_verdict():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# -- でかすぎる（塗り過ぎを狭める） --------------------------------------
+
+
+def _auto_boxes(session, frame):
+    """そのフレームで自動的に置かれている矩形（手修正を除く）。"""
+    return [b for b, r in session.regions.get(frame, []) if r.source != "manual"]
+
+
+def test_cover_box_wraps_and_clips():
+    """包む矩形は外側に丸め、フレームからははみ出さないこと。
+
+    内側に丸めると、接しているだけの自動領域が remove から外れて残る。
+    """
+    assert cover_box([(10.2, 20.7, 30.0, 40.0)], 640, 480) == (10.0, 20.0, 31.0, 41.0)
+    assert cover_box(
+        [(0.0, 0.0, 10.0, 10.0), (600.0, 400.0, 100.0, 100.0)], 640, 480
+    ) == (0.0, 0.0, 640.0, 480.0)
+    assert cover_box([], 640, 480) is None
+    print("  自動領域を包む矩形 OK")
+
+
+def test_mark_toobig_saves_remove_and_add():
+    """「でかすぎる」で remove と add が組で保存されること。
+
+    remove だけだとそのコマが素通しになる。add だけだと塗る範囲が増えるだけで
+    「でかすぎる」の意味が逆になる。必ず両方でなければならない。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        auto = _auto_boxes(s, 25)
+        assert auto, "前提が崩れている（frame 25 に自動領域が無い）"
+
+        n = s.mark(25, "toobig", tap=(0.5, 0.5), size=(20, 20), span=0, cls=CLS)
+        assert n == 2, n
+        kinds = sorted(c.kind for c in s.corrections.items)
+        assert kinds == ["add", "remove"], kinds
+        assert s.verdicts[25] == "toobig"
+
+        rem = next(c for c in s.corrections.items if c.kind == "remove")
+        for b in auto:
+            assert rem.box[0] <= b[0] and rem.box[1] <= b[1], (rem.box, b)
+            assert rem.box[0] + rem.box[2] >= b[0] + b[2], (rem.box, b)
+            assert rem.box[1] + rem.box[3] >= b[1] + b[3], (rem.box, b)
+
+        add = next(c for c in s.corrections.items if c.kind == "add")
+        assert add.box == (310.0, 230.0, 20.0, 20.0), add.box
+        # 狭める操作なので、残る面積は元より小さくなければ意味が無い
+        assert add.box[2] * add.box[3] < sum(b[2] * b[3] for b in auto)
+        print("  でかすぎる判定で remove + add が保存される OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_toobig_remove_drops_automatic_region():
+    """保存した remove が、実際に自動領域を落とすこと。
+
+    セッション内の値だけを見ても、修正ファイルを経由したときに効くとは
+    限らない（保存で小数第1位に丸められる）。ファイルから読み直し、
+    process() -> apply() の本来の経路を通して確かめる。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        from automosaic.temporal import process
+
+        s = make_session(tmp)
+        before = _auto_boxes(s, 25)
+        assert before
+
+        s.mark(25, "toobig", tap=(0.5, 0.5), size=(20, 20), span=0, cls=CLS)
+        assert [r.source for _, r in s.regions[25]] == ["manual"], s.regions[25]
+
+        loaded = CorrectionSet.load(s.corrections_path)
+        base, _ = process(
+            s.per_frame, s.n_frames, s.width, s.height, s.classes, s.cfg
+        )
+        assert _auto_boxes(s, 25) == [], "セッション側で自動領域が残っている"
+        out = apply_corrections(base, loaded)
+        assert [r.source for _, r in out[25]] == ["manual"], out[25]
+        assert out[25][0][0] == (310.0, 230.0, 20.0, 20.0), out[25][0][0]
+        # 素通しにはしない。狭めた範囲は残る
+        assert s.coverage[25] == COV_REAL, s.coverage[25]
+        print("  remove が自動領域を落とす OK（ファイル経由で確認）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_toobig_rejects_missing_box():
+    """範囲の指定なしでは確定させないこと。
+
+    remove だけ置くと、そのコマは何も塗られない状態で残る。「でかすぎる」は
+    狭める操作であって、塗らない操作ではない。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        try:
+            s.mark(25, "toobig")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("位置なしの toobig が通ってしまった")
+        assert not s.corrections.items, "拒否したのに修正が残っている"
+        assert 25 not in s.verdicts, "拒否したのに判定が記録されている"
+        assert not s.history, "拒否したのに履歴が積まれている"
+        assert s.coverage[25] == COV_ESTIMATED, "自動領域が消えている"
+        print("  範囲なしの でかすぎる の拒否 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_undo_toobig_restores_both():
+    """ひとつ戻すで remove と add が同時に取り消されること。
+
+    片方だけ残ると、素通し（remove だけ）か塗り過ぎのまま二重（add だけ）に
+    なる。どちらも取り消したつもりの利用者には見えない壊れ方をする。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        before = _auto_boxes(s, 25)
+        s.mark(25, "toobig", tap=(0.5, 0.5), size=(20, 20), span=0, cls=CLS)
+        assert len(s.corrections.items) == 2
+
+        h = s.undo()
+        assert h["frame"] == 25 and h["added"] == 2, h
+        assert not s.corrections.items, "戻したのに修正が残っている"
+        assert 25 not in s.verdicts
+        assert _auto_boxes(s, 25) == before, "戻したのに自動領域が復活していない"
+        assert s.coverage[25] == COV_ESTIMATED
+        print("  でかすぎる のひとつ戻す OK（remove と add の両方）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_toobig_span_applies_to_both():
+    """span が remove と add の両方に効くこと。
+
+    キューは間引いて出しているので、1コマだけ狭めても隣のコマは大きいまま。
+    remove はフレームごとに作り直す。対象が動いていると位置も大きさも違い、
+    1枚を使い回すと端が残る。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        for f in range(23, 28):
+            assert _auto_boxes(s, f), f
+
+        n = s.mark(25, "toobig", tap=(0.5, 0.5), size=(20, 20), span=2, cls=CLS)
+        assert n == 10, n  # 5 フレーム x (remove + add)
+        for f in range(23, 28):
+            kinds = sorted(c.kind for c in s.corrections.items if c.frame == f)
+            assert kinds == ["add", "remove"], (f, kinds)
+            assert [r.source for _, r in s.regions[f]] == ["manual"], (f, s.regions[f])
+            assert s.coverage[f] == COV_REAL, f
+        # 範囲の外は触らない
+        assert _auto_boxes(s, 22) and _auto_boxes(s, 28)
+        print("  でかすぎる の適用範囲 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_progress_keeps_toobig_and_drops_unknown():
+    """判定の記録に toobig が増えても、読み書きが壊れないこと。
+
+    知らない判定は黙って捨てる。古い版が書いた記録も、新しい版が書いた記録も、
+    開けなくなるくらいなら判定が1つ消えたほうがいい。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        s.mark(25, "toobig", tap=(0.5, 0.5), size=(20, 20), span=0, cls=CLS)
+        other = next(it["frame"] for it in s.queue if it["frame"] != 25)
+        s.mark(other, "ok")
+        p = s.progress_payload()
+        assert "toobig" in p["counts"], p["counts"]
+
+        with open(s.progress_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        assert saved["verdicts"]["25"] == "toobig", saved["verdicts"]
+        saved["verdicts"]["31"] = "mirai_no_hantei"  # 知らない判定を混ぜる
+        with open(s.progress_path, "w", encoding="utf-8") as f:
+            json.dump(saved, f, ensure_ascii=False)
+
+        again = make_session(tmp, corrections=CorrectionSet.load(s.corrections_path))
+        assert again.verdicts.get(25) == "toobig"
+        assert 31 not in again.verdicts, "知らない判定が読み込まれている"
+        print("  判定記録の互換 OK（toobig は残り、未知の判定は捨てる）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # -- トークン ------------------------------------------------------------
 
 
@@ -819,6 +1012,42 @@ def test_http_frame_image_is_scaled_and_mosaicked():
         assert len(body) < 200_000, len(body)
         print(f"  /frame の縮小と JPEG 化 OK（640px PNG {len(full.tobytes())//1024}KB 相当 "
               f"-> 320px JPEG {len(body)//1024}KB）")
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_http_toobig_roundtrip():
+    """HTTP 越しに でかすぎる を投げ、狭まって、戻せること。"""
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    try:
+        s = make_session(tmp)
+        tok = "testtoken1234"
+        httpd, base = _serve(s, tok)
+
+        code, d = _post(
+            f"{base}/api/mark?t={tok}",
+            {"frame": 25, "verdict": "toobig", "x": 0.5, "y": 0.5,
+             "w": 20, "h": 20, "span": 0, "class": CLS},
+        )
+        assert code == 200, d
+        assert d["added"] == 2 and d["n_corrections"] == 2, d
+        assert [r[4] for r in d["regions"]] == ["x"], d["regions"]
+        assert d["progress"]["counts"]["toobig"] == 1, d["progress"]
+
+        # 範囲なしは 400。素通しになる修正をサーバ側でも作らせない
+        code, d = _post(f"{base}/api/mark?t={tok}", {"frame": 30, "verdict": "toobig"})
+        assert code == 400, (code, d)
+        assert len(s.corrections.items) == 2, "拒否したのに修正が増えている"
+
+        code, d = _post(f"{base}/api/undo?t={tok}", {})
+        assert code == 200 and d["removed"] == 2, d
+        assert d["n_corrections"] == 0
+        assert [r[4] for r in d["regions"]] != ["x"], d["regions"]
+        print("  HTTP 越しの でかすぎる OK")
     finally:
         if httpd:
             httpd.shutdown()

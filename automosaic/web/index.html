@@ -31,15 +31,22 @@
   <!-- 判定モード。ここだけで1枚が終わるのが普通の流れ -->
   <div id="judge">
     <button id="btn-ok" class="big ok">問題なし</button>
-    <button id="btn-ng" class="big ng">漏れている</button>
+    <!-- 範囲を直す2つ。縦に4つ積むと縦持ちで画像面が潰れるので横に並べる。
+         高さは他と同じ 64px のままにして、指の狙いやすさを落とさない -->
+    <div class="row">
+      <button id="btn-ng" class="big ng">漏れている</button>
+      <button id="btn-big" class="big warn">でかすぎる</button>
+    </div>
     <div class="row">
       <button id="btn-unsure" class="mid">判断できない</button>
       <button id="btn-undo" class="mid">ひとつ戻す</button>
     </div>
   </div>
 
-  <!-- 位置指定モード -->
+  <!-- 位置指定モード。「漏れている」と「でかすぎる」で共用する。
+       操作系を分けると、片方だけ手に馴染まないものになる -->
   <div id="mark" class="hidden">
+    <div id="mark-title" class="mark-title"></div>
     <div class="row size-row">
       <button id="btn-minus" class="sq">−</button>
       <input id="size" type="range" min="20" max="400" step="5" value="100"
@@ -89,8 +96,8 @@
       <a id="link-timeline" href="/timeline">タイムライン画面（PC 向け）</a>
     </p>
     <p class="info">
-      キー: 1 問題なし / 2 漏れている / 3 判断できない / U ひとつ戻す /
-      ← → 前後の1枚
+      キー: 1 問題なし / 2 漏れている / 3 判断できない / 4 でかすぎる /
+      U ひとつ戻す / ← → 前後の1枚 / Esc やめる
     </p>
 
     <button id="btn-close-sheet" class="big">閉じる</button>

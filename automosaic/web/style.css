@@ -135,6 +135,9 @@ button, .tag, #imgwrap, #ov {
 }
 /* 位置指定中だけ、押せる面であることを見た目で示す */
 body.marking #ov { cursor: crosshair; box-shadow: inset 0 0 0 3px #ffd479; }
+/* 狭めるモードは枠色を変える。足すモードと同じ見た目だと、逆の操作をしても
+   気づけない */
+body.shrinking #ov { box-shadow: inset 0 0 0 3px #ffa53c; }
 
 #banner {
   position: absolute;
@@ -186,6 +189,10 @@ button.mid {
 }
 button.mid.wide { flex: 1 1 100%; }
 
+/* 行の中に入れた .big。高さ 64px は保ったまま幅だけ等分する。
+   4つ目の判定を縦に積むと、縦持ちで画像面が潰れて絵が読めなくなる */
+.row > button.big { width: auto; flex: 1 1 0; font-size: 19px; }
+
 button.sq {
   flex: 0 0 auto;
   width: 56px;
@@ -195,8 +202,19 @@ button.sq {
 
 button.ok { background: #1f6b3a; border-color: #2c8a4d; color: #f2fff5; }
 button.ng { background: #8a2f2b; border-color: #a83b36; color: #fff2f1; }
+/* 「でかすぎる」。漏れ（赤）と取り違えると逆の修正をしてしまうので、
+   赤とも緑とも離れた琥珀にする */
+button.warn { background: #8a5d1f; border-color: #a8752c; color: #fff8ec; }
 button:active { filter: brightness(1.35); }
 button:disabled { opacity: .45; }
+
+/* 位置指定モードの見出し。いま何を指定させられているのかを言葉でも出す */
+.mark-title {
+  font-size: 14px;
+  color: #ffd479;
+  text-align: center;
+  min-height: 20px;
+}
 
 .size-row { align-items: center; }
 #size {

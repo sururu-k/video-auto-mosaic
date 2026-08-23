@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import json
+import math
 import mimetypes
 import os
 import re
@@ -72,7 +73,19 @@ QUEUE_REASONS = {
     "sampled": (5, "定期確認"),
 }
 
-VERDICTS = ("ok", "fixed", "unsure")
+# 判定の種類。
+#   ok      問題なし
+#   fixed   漏れていたので塗る範囲を足した
+#   unsure  判断できない
+#   toobig  塗り過ぎていたので範囲を狭めた（remove + add の組で記録する）
+#
+# .progress.json の読み込みはこの並びに無い値を捨てる。増やすぶんには
+# 古い記録がそのまま読めるし、古い版で新しい記録を開いても未知の判定が
+# 落ちるだけで壊れない。順番には意味が無いので末尾に足す。
+VERDICTS = ("ok", "fixed", "unsure", "toobig")
+
+# 矩形を置かせる判定。押しただけでは終わらず、位置指定モードに入る
+BOX_VERDICTS = ("fixed", "toobig")
 
 COOKIE_NAME = "automosaic_t"
 
@@ -712,6 +725,33 @@ def tap_to_box(
     return (round(x, 1), round(y, 1), round(w, 1), round(h, 1))
 
 
+def cover_box(
+    boxes: list, width: int, height: int
+) -> tuple[float, float, float, float] | None:
+    """渡した矩形をすべて含む最小の矩形。1つも無ければ None。
+
+    「でかすぎる」で置く remove の範囲に使う。corrections.apply() は
+    remove と重なる自動領域を落とす実装なので、打ち消したい領域を確実に
+    含む1枚でなければ、狭めたはずの縁が残る。
+
+    外側に丸めるのは、保存時に小数第1位へ丸められて境界がわずかに内側へ
+    寄っても、接しているだけの領域を取り逃がさないため。
+    """
+    if not boxes:
+        return None
+    x0 = min(b[0] for b in boxes)
+    y0 = min(b[1] for b in boxes)
+    x1 = max(b[0] + b[2] for b in boxes)
+    y1 = max(b[1] + b[3] for b in boxes)
+    x0 = max(0.0, float(math.floor(x0)))
+    y0 = max(0.0, float(math.floor(y0)))
+    x1 = min(float(width), float(math.ceil(x1)))
+    y1 = min(float(height), float(math.ceil(y1)))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
 def _thin(frames: list[int], step: int) -> list[int]:
     """近すぎるフレームを間引く。同じ現象で連続して足踏みさせないため。"""
     out: list[int] = []
@@ -950,6 +990,19 @@ class ReviewSession:
             for b, r in self.regions.get(n, [])
         ]
 
+    def auto_cover_box(self, frame: int) -> tuple[float, float, float, float] | None:
+        """そのフレームの自動領域をまとめて包む矩形。無ければ None。
+
+        手で足した領域は含めない。remove は自動領域だけを落とす実装なので、
+        手修正まで包んで広げても効果は無く、無駄に大きい否定領域が
+        修正ファイルに残るだけになる。
+
+        包むのは膨張後の矩形（実際にモザイクが乗る範囲）。検出そのものの
+        矩形で包むと、膨張したぶんの縁が remove から外れて残る。
+        """
+        boxes = [b for b, r in self.regions.get(frame, []) if r.source != "manual"]
+        return cover_box(boxes, self.width, self.height)
+
     def regions_payload(self) -> dict:
         out: dict[str, list] = {}
         for f in range(self.n_frames):
@@ -970,7 +1023,7 @@ class ReviewSession:
         }
 
     def progress_payload(self) -> dict:
-        counts = {"ok": 0, "fixed": 0, "unsure": 0}
+        counts = {"ok": 0, "fixed": 0, "unsure": 0, "toobig": 0}
         done = 0
         for it in self.queue:
             v = self.verdicts.get(it["frame"])
@@ -1070,24 +1123,50 @@ class ReviewSession:
         span: int = 0,
         cls: str | None = None,
     ) -> int:
-        """1フレームの判定を記録する。「漏れている」なら矩形も足す。
+        """1フレームの判定を記録する。矩形を伴う判定なら修正も足す。
+
+        fixed  指定範囲を add する。漏れを塞ぐ
+        toobig 自動領域を包む remove と、指定範囲の add を組で置く。
+               remove だけだとそのフレームが素通しになるので、add を必ず伴う。
+               「でかすぎる」は塗る範囲を狭める操作であって、塗らない操作ではない
 
         span は前後に何フレーム広げるか。キューは間引いて出しているので、
-        1コマだけ塞いでも隣のコマは漏れたまま。既定で間引き幅ぶん広げる。
-        戻り値は足した修正の件数（ひとつ戻すで消す件数でもある）。
+        1コマだけ直しても隣のコマは元のまま。既定で間引き幅ぶん広げる。
+        remove は「そのフレームの」自動領域から作る。対象が動いていると
+        フレームごとに位置も大きさも違うので、1枚を使い回すと端が残る。
+
+        戻り値は足した修正の件数（ひとつ戻すで消す件数でもある）。remove と
+        add を両方置いたフレームは 2 件と数える。まとめて末尾に積むので、
+        undo は件数ぶん切り落とすだけで remove と add が同時に取り消される。
         """
         if verdict not in VERDICTS:
             raise ValueError(f"不明な判定: {verdict}")
         frame = max(0, min(self.n_frames - 1, int(frame)))
 
         added = 0
-        if verdict == "fixed":
+        if verdict in BOX_VERDICTS:
             if tap is None:
+                # toobig で remove だけが残ると、そのフレームは素通しになる。
+                # 位置が無いなら判定ごと拒否して、記録も進捗も動かさない
                 raise ValueError("位置が指定されていません")
             box = tap_to_box(tap[0], tap[1], size or self.default_size, self.width, self.height)
             lo = max(0, frame - max(0, int(span)))
             hi = min(self.n_frames - 1, frame + max(0, int(span)))
             for f in range(lo, hi + 1):
+                if verdict == "toobig":
+                    cover = self.auto_cover_box(f)
+                    # 自動領域が無いフレームには remove を置かない。効果が無い
+                    # うえ、あとから検出をやり直したときに効いてしまう
+                    if cover is not None:
+                        self.corrections.items.append(
+                            Correction(
+                                frame=f,
+                                box=cover,
+                                cls=cls or self.default_class,
+                                kind="remove",
+                            )
+                        )
+                        added += 1
                 self.corrections.items.append(
                     Correction(frame=f, box=box, cls=cls or self.default_class, kind="add")
                 )
