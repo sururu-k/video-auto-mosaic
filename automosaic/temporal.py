@@ -867,6 +867,25 @@ def uncovered_ranges(
     return out
 
 
+def frames_with_mosaic_count(
+    regions_per_frame: dict[int, list[tuple[Box, "Region"]]],
+    n_frames: int,
+) -> int:
+    """issue #41: regions を数え直して、実際に領域が1つでもあるフレーム数を返す。
+
+    `process()` が返す stats["frames_with_mosaic"] は corr.apply() を通す前の
+    値であり、手修正（とくに add を伴わない bare remove）で regions が空になった
+    フレームがあっても減らない。「モザイク適用率」はこの値から計算されるので、
+    `uncovered_ranges()` で数え直した素通し区間と矛盾した数字が同じ画面に並ぶ
+    （実測: 適用率100.0%・uncovered_gaps 0 と、素通し区間10フレームが同時に出た）。
+
+    呼び出し側（cli.py）は corr.apply() 済みの regions_per_frame を渡すこと。
+    `uncovered_ranges()` と対になる数え方（空でないフレームの数）なので、
+    n_frames からこの戻り値を引いたものが uncovered_ranges の総フレーム数と一致する。
+    """
+    return sum(1 for f in range(n_frames) if regions_per_frame.get(f))
+
+
 def estimated_only_ranges(
     regions_per_frame: dict[int, list[tuple[Box, Region]]],
     n_frames: int,

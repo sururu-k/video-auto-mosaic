@@ -1007,6 +1007,123 @@ def test_uncovered_ranges_recomputed_after_corrections():
     print("  素通し区間の再計算（add で消える／remove で出る） OK")
 
 
+def test_stats_match_uncovered_ranges_after_corrections():
+    """issue #41: stats["frames_with_mosaic"] / stats["uncovered_gaps"] が
+    corr.apply() 前の値のまま残っていた回帰ガード。
+
+    直す前は、bare remove で自動領域が空になったフレームがあっても
+    stats["frames_with_mosaic"] / stats["uncovered_gaps"]（つまり画面の
+    「モザイク適用率」と stats テーブルの uncovered_gaps）が旧値のまま
+    （適用率100.0%・uncovered_gaps 0）で、直後に表示される
+    「[未処理のまま残った区間 N 件]」と矛盾していた（issue #41 の再現手順、
+    合成素材 320x240/60フレーム・全フレーム検出・frame 20-29 に
+    add を伴わない bare remove）。
+
+    合わせて、手修正が触らない生検出/トラック段階由来のキー
+    （geometric_dropped, oversized_kept, raw_detections, tracks_final,
+    median_track_speed_px_per_frame）と、自動処理の内訳を示す診断キー
+    （regions_interpolated, regions_from_memory, regions_bridged,
+    frames_bridged）が、手修正の有無で変わらないことも確認する
+    （手修正の有無だけを変えて process() 側の入力は同一なので、
+    これらは corr.apply() を通しても値が変わらないはず）。
+    """
+    if not _have_ffmpeg():
+        print("  stats と素通し件数の整合 SKIP (ffmpeg 無し)")
+        return
+    from automosaic import corrections as corr
+
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.mp4")
+        det = os.path.join(d, "det.json")
+        n = 60
+        w, h = 320, 240
+        _make_video(src, w, h, n)
+
+        box = [0, 0, w, h]
+        dets = {str(f): [{"class": "FEMALE_GENITALIA_EXPOSED", "score": 0.9, "box": box}]
+                for f in range(n)}
+        _write_detections(det, n, w, h, complete=True, dets=dets)
+
+        # ベースライン: 手修正なし。ここでは適用率100%・uncovered_gaps 0 が正しい
+        report_base = os.path.join(d, "report_base.json")
+        rc = cli.main([src, "--detections", det, "--reuse-detections",
+                       "--detect-only", "--report", report_base, "--quiet"])
+        assert rc == 0
+        with open(report_base, encoding="utf-8") as f:
+            rep_base = json.load(f)
+        assert rep_base["stats"]["frames_with_mosaic"] == n
+        assert rep_base["stats"]["uncovered_gaps"] == 0
+        assert rep_base["uncovered_ranges"] == []
+
+        # frame 20-29 を add を伴わない bare remove で消す（「誤検知」判定の
+        # 通常操作）。素通しになるはずの10フレーム。
+        cset = corr.CorrectionSet(video=src, width=w, height=h)
+        for fr in range(20, 30):
+            cset.add(corr.Correction(frame=fr, box=(0, 0, w, h), kind="remove"))
+        corr_path = os.path.join(d, "corr.json")
+        cset.save(corr_path)
+
+        report_corr = os.path.join(d, "report_corr.json")
+        proc = subprocess.run(
+            [sys.executable, "-m", "automosaic",
+             src, "--detections", det, "--reuse-detections",
+             "--corrections", corr_path,
+             "--detect-only", "--report", report_corr, "--quiet"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            capture_output=True,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        )
+        assert proc.returncode == 0, proc.stderr.decode("utf-8", errors="replace")
+        err = proc.stderr.decode("utf-8", errors="replace")
+
+        with open(report_corr, encoding="utf-8") as f:
+            rep_corr = json.load(f)
+        stats = rep_corr["stats"]
+        uncovered = rep_corr["uncovered_ranges"]
+
+        # 中心の主張: 「適用率」の元になる frames_with_mosaic と、
+        # stats テーブルの uncovered_gaps が、実際の素通し区間と矛盾しないこと。
+        assert uncovered, "前提が崩れている: bare remove で素通しができなかった"
+        gap_frames_total = sum(u["frames"] for u in uncovered)
+        assert gap_frames_total == 10, f"想定外の素通しフレーム数: {uncovered}"
+        assert stats["frames_with_mosaic"] == n - gap_frames_total, (
+            "frames_with_mosaic が corr.apply() 後の regions と矛盾している: "
+            f"frames_with_mosaic={stats['frames_with_mosaic']} "
+            f"uncovered_ranges={uncovered}"
+        )
+        assert stats["uncovered_gaps"] == len(uncovered), (
+            "stats[\"uncovered_gaps\"] が実際の素通し区間数と矛盾している: "
+            f"uncovered_gaps={stats['uncovered_gaps']} 件数={len(uncovered)}"
+        )
+        assert stats["frames_with_mosaic"] + gap_frames_total == stats["frames"]
+
+        # --quiet の1行要約も同じ値であること（report.json だけ直って
+        # stderr が古いまま、という半端な直し方を防ぐ）。
+        assert "uncovered_gaps=1" in err, f"--quiet の uncovered_gaps が揃っていない: {err!r}"
+        expected_pct = 100.0 * stats["frames_with_mosaic"] / n
+        assert f"モザイク適用率 {expected_pct:.1f}%" in err, (
+            f"--quiet の適用率が report.json の frames_with_mosaic と揃っていない: {err!r}"
+        )
+
+        # 手修正が触らない段階のキーは、手修正の有無で変わらないこと
+        # （geometric_dropped などを「変わらない性質」として意図的に前の値の
+        # ままにしている設計の回帰ガード）。
+        unaffected_keys = [
+            "raw_detections", "geometric_dropped", "oversized_kept",
+            "tracks_before_despike", "tracks_despiked", "tracks_stitched",
+            "tracks_final", "frames_with_detection",
+            "median_track_speed_px_per_frame",
+            "regions_interpolated", "regions_from_memory",
+            "regions_bridged", "frames_bridged",
+        ]
+        for k in unaffected_keys:
+            assert stats[k] == rep_base["stats"][k], (
+                f"手修正の有無で変わらないはずのキー {k} が変わっている: "
+                f"手修正なし={rep_base['stats'][k]} 手修正あり={stats[k]}"
+            )
+    print("  stats と素通し件数の整合（frames_with_mosaic / uncovered_gaps） OK")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"{len(tests)} 件のテストを実行\n")
