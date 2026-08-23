@@ -9,9 +9,11 @@ urllib から叩いて確かめる。403 を返すつもりで 200 を返して�
 いちばん困る種類の壊れ方で、関数を直接呼んでいると気づけない。
 """
 
+import dataclasses
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -24,6 +26,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from automosaic import cli  # noqa: E402
+from automosaic import review  # noqa: E402
 from automosaic.corrections import Correction, CorrectionSet  # noqa: E402
 from automosaic.corrections import apply as apply_corrections  # noqa: E402
 from automosaic.detector import Detection  # noqa: E402
@@ -52,6 +56,22 @@ from automosaic.review import (  # noqa: E402
 from automosaic.temporal import TemporalConfig  # noqa: E402
 
 CLS = "MALE_GENITALIA_EXPOSED"
+
+
+def _have_ffmpeg() -> bool:
+    return bool(shutil.which("ffmpeg"))
+
+
+def _make_tiny_video(path: str, w: int, h: int, frames: int, fps: int = 30) -> None:
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", f"testsrc2=size={w}x{h}:r={fps}",
+            "-frames:v", str(frames), "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-g", "5", path,
+        ],
+        check=True,
+    )
 
 
 def make_session(tmp, per_frame=None, n_frames=60, corrections=None):
@@ -1596,6 +1616,101 @@ def test_ranges_keep_short_estimated_gaps():
             it["reason"] == "estimated" and 5 <= it["frame"] <= 6 for it in s.queue
         ), s.queue
         print("  短い推定のみ区間（2フレーム）が報告・キューに残る OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# -- review.py と cli.py の TemporalConfig 一致（issue #14） --------------
+
+
+def test_review_cfg_matches_cli_cfg_for_default_job():
+    """review.py が組む cfg が、cli.py が実際に焼くときの cfg とフィールド単位で
+    一致すること（既定ジョブ相当。どちらも明示的な時間方向オプション無し）。
+
+    直す前は margin_scale/margin_cap の既定値が cli.py と食い違い、かつ
+    review.py に --estimate-gaps の絞り込みが無かったため、レビュー画面は
+    焼き込みで使われない memory・橋渡し・不確かさ膨張ぶんの領域を「塗られて
+    いる」と見せていた（実測: bench3 素材で 9,344 フレーム。issue #14 記載の
+    実素材では 5,950 フレーム）。人が「塞がっている」と見て OK にしたフレームが
+    出力では素通しになる、という漏れる方向の壊れ方だった。
+
+    cli.py 側は python -m automosaic を --detect-only --reuse-detections で
+    実際に走らせ、本番と同じコード経路（--estimate-gaps 無しの絞り込みを含む）で
+    組んだ TemporalConfig を temporal.process() の呼び出しから捕まえる。
+    review.py 側も session_from_args() の実コード経路から同様に捕まえ、
+    dataclasses.fields() で全フィールドを突き合わせる。
+    """
+    if not _have_ffmpeg():
+        print("  review cfg == cli cfg (既定ジョブ) SKIP (ffmpeg 無し)")
+        return
+
+    tmp = tempfile.mkdtemp()
+    try:
+        src = os.path.join(tmp, "in.mp4")
+        det = os.path.join(tmp, "det.json")
+        n = 10
+        _make_tiny_video(src, 64, 64, n)
+        with open(det, "w", encoding="utf-8") as f:
+            json.dump(
+                {"n_frames": n, "width": 64, "height": 64,
+                 "complete": True, "detections": {}},
+                f,
+            )
+
+        # cli.py が実際に焼くときに組む cfg を、temporal.process() の呼び出しから
+        # 捕まえる。--detect-only で描画までは進めない
+        captured_cli = {}
+        orig_cli_process = cli.process
+
+        def fake_cli_process(*a, **kw):
+            captured_cli["cfg"] = kw.get("cfg", a[-1] if a else None)
+            return orig_cli_process(*a, **kw)
+
+        cli.process = fake_cli_process
+        try:
+            rc = cli.main(
+                [src, "--detections", det, "--reuse-detections",
+                 "--detect-only", "--quiet"]
+            )
+        finally:
+            cli.process = orig_cli_process
+        assert rc == 0, "cli.main が既定ジョブ相当の引数で失敗した"
+        assert "cfg" in captured_cli, "cli.py 側の cfg を捕まえられなかった"
+
+        # review.py が組む cfg を、同じ経路（session_from_args）から捕まえる
+        captured_rev = {}
+        orig_rev_process = review.process
+
+        def fake_rev_process(*a, **kw):
+            captured_rev["cfg"] = kw.get("cfg", a[-1] if a else None)
+            return orig_rev_process(*a, **kw)
+
+        review.process = fake_rev_process
+        try:
+            argv = [src, "--detections", det]
+            args = review.build_parser().parse_args(argv)
+            session = review.session_from_args(args, argv)
+        finally:
+            review.process = orig_rev_process
+        assert "cfg" in captured_rev, "review.py 側の cfg を捕まえられなかった"
+        session.reader.close()
+
+        cli_cfg = captured_cli["cfg"]
+        rev_cfg = captured_rev["cfg"]
+        mismatches = []
+        for fld in dataclasses.fields(cli_cfg):
+            a = getattr(cli_cfg, fld.name)
+            b = getattr(rev_cfg, fld.name)
+            if a != b:
+                mismatches.append((fld.name, a, b))
+        assert not mismatches, (
+            f"review 側と cli 側の TemporalConfig が食い違う（フィールド, cli値, "
+            f"review値）: {mismatches}"
+        )
+        print(
+            "  review cfg == cli cfg (既定ジョブ, "
+            f"{len(dataclasses.fields(cli_cfg))} フィールド全一致) OK"
+        )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

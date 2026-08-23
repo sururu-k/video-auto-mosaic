@@ -49,7 +49,7 @@ def session_for_job(job: Job, **overrides) -> review.ReviewSession:
             argv += [f"--{k.replace('_', '-')}", str(v)]
 
     args = review.build_parser().parse_args(argv)
-    return review.session_from_args(args)
+    return review.session_from_args(args, argv)
 
 
 class SessionCache:
