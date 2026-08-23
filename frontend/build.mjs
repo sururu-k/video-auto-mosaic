@@ -23,8 +23,6 @@ const REPO = path.resolve(HERE, "..");
 const ENTRIES = [
   { src: "src/review/app.tsx", out: "automosaic/web/app.js" },
   { src: "src/timeline/timeline.tsx", out: "automosaic/web/timeline.js" },
-  // HTML が読み続けているので置いておく互換層。中身は各画面に畳み込んである
-  { src: "src/webapp/common.ts", out: "automosaic/webapp/static/common.js" },
   { src: "src/webapp/index.tsx", out: "automosaic/webapp/static/index.js" },
   { src: "src/webapp/job.tsx", out: "automosaic/webapp/static/job.js" },
   { src: "src/webapp/review.tsx", out: "automosaic/webapp/static/review.js" },

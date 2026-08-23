@@ -82,7 +82,7 @@ def main() -> None:
             )
 
             cinfo = vid.probe(clip)
-            dec_w, dec_h = vid.detection_frame_size(cinfo, args.infer_size)
+            dec_w, dec_h = vid.detection_frame_size(cinfo, args.infer_size, path=clip)
             fb = dec_w * dec_h * 3
             scale_back = cinfo.width / dec_w
             proc = vid.open_detection_reader(clip, args.infer_size, None)

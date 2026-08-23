@@ -213,7 +213,8 @@ export type SettingFlag = (typeof SETTING_FLAGS)[number];
  * 起動設定。画面からは文字列で入るが、meta.json から読み直したものは
  * 数値のこともある（CLI の既定値をそのまま書いてあるため）。
  */
-export type JobSettings = Partial<Record<SettingField, string | number>> &
+/** null は「この項目は指定しない」。キーを落とすと、保存済み設定に残ったままになる */
+export type JobSettings = Partial<Record<SettingField, string | number | null>> &
   Partial<Record<SettingFlag, boolean>>;
 
 /** runner.py の _set_progress() が積む1パスぶんの進捗 */
@@ -263,6 +264,10 @@ export interface JobDetail extends JobSummary {
   stats: Record<string, unknown>;
   argv: string[];
   output_size_bytes: number;
+  /** 素通し（モザイクが1つも乗っていない）区間の数。焼く前は null */
+  n_uncovered_ranges: number | null;
+  /** 検出が1つも無く、補間と memory だけで塗っている区間の数。焼く前は null */
+  n_estimated_only_ranges: number | null;
 }
 
 /** GET /api/jobs/{id}。job_state() は detail に生存確認を足す */

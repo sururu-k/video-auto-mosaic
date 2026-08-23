@@ -79,14 +79,16 @@ function App() {
 
   function settings(): JobSettings {
     const s: JobSettings = {};
+    // 指定しない項目はキーを落とさず null を送る。落とすと、サーバに
+    // 保存された前回の値がそのまま残り、画面から外せなくなる
     for (const f of SETTING_FIELDS) {
       const v = fields[f];
-      if (v !== "") s[f] = v;
+      s[f] = v === "" ? null : v;
     }
     // 0 は「指定しない」の意味にする。--block 0 は CLI 側の自動と同義だが、
     // --limit-frames 0 は「0フレーム処理」になってしまう
-    if (Number(s.block) === 0) delete s.block;
-    if (Number(s.limit_frames) === 0) delete s.limit_frames;
+    if (Number(s.block) === 0) s.block = null;
+    if (Number(s.limit_frames) === 0) s.limit_frames = null;
     for (const f of SETTING_FLAGS) s[f] = flags[f];
     return s;
   }
@@ -367,6 +369,18 @@ function App() {
                       })();
                     }}>ジョブを消す</button>
           </div>
+          {d?.has_output && d.n_uncovered_ranges !== null &&
+           d.n_uncovered_ranges !== undefined ? (
+            <p id="coverage" class={d.n_uncovered_ranges ? "warn" : "dim"}>
+              {d.n_uncovered_ranges
+                ? `素通しの区間が ${d.n_uncovered_ranges} 件あります` +
+                  `（モザイクが1つも乗っていません）。検査キューで確かめてください`
+                : "素通しの区間はありません"}
+              {d.n_estimated_only_ranges
+                ? `  /  推定だけで塗っている区間 ${d.n_estimated_only_ranges} 件`
+                : ""}
+            </p>
+          ) : null}
           <p id="dsmsg" class="dim">{dsmsg}</p>
           <video id="preview" class={d?.has_output ? "" : "hidden"} controls playsInline
                  src={d?.has_output ? link(`/api/jobs/${JOB}/video`) : undefined}

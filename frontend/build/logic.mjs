@@ -102,6 +102,37 @@ function eraseSummary(boxes, picked, span) {
     banner: (all ? "確定するとこのコマのモザイクは全部消えます（無処理になります）。" : `確定するとこのコマのモザイク ${n} / ${total} 個が消えます。`) + extra + scope
   };
 }
+function pairPartner(items, i) {
+  const c = items[i];
+  if (!c) return null;
+  if (c.kind === "add") {
+    const prev = items[i - 1];
+    return prev && prev.kind === "remove" && prev.frame === c.frame ? i - 1 : null;
+  }
+  const next = items[i + 1];
+  return next && next.kind === "add" && next.frame === c.frame ? i + 1 : null;
+}
+function correctionsAfterDrop(items, drop) {
+  const gone = /* @__PURE__ */ new Set();
+  for (const i of drop) {
+    if (i < 0 || i >= items.length) continue;
+    gone.add(i);
+    const p = pairPartner(items, i);
+    if (p !== null) gone.add(p);
+  }
+  if (!gone.size) return items.slice();
+  const frames = /* @__PURE__ */ new Set();
+  for (const i of gone) frames.add(items[i].frame);
+  for (const f of frames) {
+    const hadAdd = items.some((c) => c.frame === f && c.kind === "add");
+    const rest = items.filter((c, i) => c.frame === f && !gone.has(i));
+    if (!hadAdd || !rest.length || rest.some((c) => c.kind === "add")) continue;
+    items.forEach((c, i) => {
+      if (c.frame === f) gone.add(i);
+    });
+  }
+  return items.filter((_, i) => !gone.has(i));
+}
 function firstUnjudged(items, from) {
   for (let i = from; i < items.length; i++) if (!items[i]?.verdict) return i;
   for (let i = 0; i < from; i++) if (!items[i]?.verdict) return i;
@@ -113,6 +144,12 @@ function spanOptions(step) {
     { v: step, label: `前後 ${step}` },
     { v: step * 3, label: `前後 ${step * 3}` }
   ];
+}
+function numOr(v, fallback) {
+  const t = v.trim();
+  if (t === "") return fallback;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : fallback;
 }
 function progressPercent(p) {
   return p.total ? 100 * p.done / p.total : 0;
@@ -288,6 +325,7 @@ export {
   SRC_NAME,
   VERDICT_LABEL,
   autoBoxes,
+  correctionsAfterDrop,
   drawHandOverlay,
   drawRegionOverlay,
   drawReviewOverlay,
@@ -299,6 +337,7 @@ export {
   framePoint,
   normFromClient,
   normPoint,
+  numOr,
   overlaps,
   pickIndexAt,
   progressPercent,

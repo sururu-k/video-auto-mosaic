@@ -24,7 +24,7 @@ import type {
 import { drawReviewOverlay } from "../shared/canvas-draw.js";
 import { normFromClient, scaledSize, tapToBox } from "../shared/geom.js";
 import type { NormPoint } from "../shared/geom.js";
-import { firstUnjudged, progressPercent, requestWidth, spanOptions } from "../shared/review-logic.js";
+import { firstUnjudged, numOr, progressPercent, requestWidth, spanOptions } from "../shared/review-logic.js";
 import { api, errText, link, url } from "../shared/webapp-net.js";
 
 const JOB = location.pathname.split("/").pop() ?? "";
@@ -391,7 +391,7 @@ function App() {
         <div class="row" style={{ marginTop: "8px" }}>
           <button id="btn-rebuild"
                   onClick={() => void reloadQueue({
-                    step: Math.max(1, Number(stepInput) || 5),
+                    step: Math.max(1, numOr(stepInput, 5)),
                     all: allFrames ? 1 : 0,
                   })}>キューを作り直す</button>
           <button id="btn-unjudged"

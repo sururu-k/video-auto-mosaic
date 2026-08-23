@@ -44,8 +44,9 @@ python -m automosaic in.mp4 --detections det.json --reuse-detections --correctio
 | `--mode` | pixelize | `pixelize`（ブロック平均色）/ `black`（塗り潰し） |
 | `--margin-scale` | 0.35 | 膨張マージンの倍率。大きいと潰しすぎ、小さいと輪郭が出る |
 | `--margin-cap` | 16 | 膨張マージンの絶対上限 px |
-| `--motion-weight` | 2.0 | 動く対象への追従。この分は `--margin-cap` の外 |
+| `--motion-weight` | 2.0（`--estimate-gaps` 無しでは 1.0 に絞られる） | 動く対象への追従。この分は `--margin-cap` の外 |
 | `--estimate-gaps` | off | 検出が途切れた区間を推定で埋める（後述） |
+| `--allow-short-detections` | off | 実尺より短い検出結果でも描画を続ける（後述） |
 | `--corrections` | — | 手修正 JSON を反映する |
 | `--crf` | 16 | x264 CRF。16〜18 が視覚的に無劣化 |
 | `--provider` | auto | `auto` / `cpu` / `dml` / `cuda` |
@@ -65,6 +66,31 @@ python -m automosaic in.mp4 --detections det.json --reuse-detections --correctio
 | `--estimate-gaps` | 20件 / 491フレーム |
 
 「1フレームでも漏らさない」を優先するなら `--estimate-gaps`、塗り過ぎを避けるなら既定。**この選択は法的な posture の選択なので、意識して決めること。**
+
+`--estimate-gaps` を付けない実行では、推定で広げる側のオプションが次のように絞られる。
+絞ったものは起動時に「`--estimate-gaps` 無しのため推定で広げる設定を絞りました」と表示される。
+
+| オプション | 引数の既定 | `--estimate-gaps` 無しでの実効値 |
+|---|---|---|
+| `--memory` | 6 | 2 |
+| `--memory-before` | 0（= `--memory` と同じ） | 2 |
+| `--bridge-max` | 150 | 0 |
+| `--hold-growth` | 0.5 | 0.0 |
+| `--motion-weight` | 2.0 | 1.0 |
+
+**コマンドラインで明示指定した値はこの絞り込みより優先される。**
+`--memory 20` と書けば `--estimate-gaps` 無しでも 20 のまま走り、「明示指定を優先」と表示される。
+
+### 検出結果が実尺より短いとき
+
+`--limit-frames` で作った検出結果や、途中保存（`--checkpoint-every` が書く `complete: false`）を
+`--reuse-detections` で本編に流用すると、検出のない後半が素通しになる。
+そのため既定では**エラーで止める**。
+
+- 途中保存（`complete: false`）は再利用できない。`--resume` で検出を最後まで走らせる
+- 解像度の違う検出 JSON も弾く（座標が別の位置に載るため）
+- 未検出区間があると承知のうえで焼くなら `--allow-short-detections`。
+  この場合は不足の開始フレームと長さが警告に出る（直前フレームの領域を延ばすだけで、塞げている保証はない）
 
 ## 手修正
 
@@ -186,10 +212,12 @@ ONNX の入力が可変（`['batch', 3, 'height', 'width']`）なので推論解
 ## テストと計測
 
 ```bash
-.venv\Scripts\python.exe tests\test_render.py      # 描画と時間方向（ffmpeg不要、20件）
-.venv\Scripts\python.exe tests\test_review.py      # レビューUI（14件）
-.venv\Scripts\python.exe tests\bench_detector.py   # スループット
-.venv\Scripts\python.exe tests\bench_devices.py    # DirectML アダプタ別
+.venv\Scripts\python.exe tests\test_render.py            # 描画と時間方向（ffmpeg不要、24件）
+.venv\Scripts\python.exe tests\test_temporal_fixes.py    # 時間方向の監査回帰（ffmpeg不要、13件）
+.venv\Scripts\python.exe tests\test_video_cli_fixes.py   # CLI/デコードの監査回帰（ffmpeg要、15件）
+.venv\Scripts\python.exe tests\test_review.py            # レビューUI（52件）
+.venv\Scripts\python.exe tests\bench_detector.py         # スループット
+.venv\Scripts\python.exe tests\bench_devices.py          # DirectML アダプタ別
 ```
 
 `tools/` は開発用ユーティリティ。

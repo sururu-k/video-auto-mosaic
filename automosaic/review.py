@@ -151,11 +151,32 @@ def make_token() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(12))
 
 
+def _inside(base: str, path: str) -> bool:
+    """path が base の中にあるか。
+
+    文字列の先頭一致で判定すると兄弟ディレクトリが通ってしまう。
+    base が automosaic/web のとき automosaic/webapp/ が startswith を満たすため、
+    LAN に公開した状態で webapp 配下のソースが読めていた。
+    """
+    base_abs = os.path.abspath(base)
+    try:
+        return os.path.commonpath([base_abs, os.path.abspath(path)]) == base_abs
+    except ValueError:  # ドライブが違う等、共通の親が取れない場合
+        return False
+
+
 def token_matches(expected: str, given: str | None) -> bool:
-    """トークンの照合。長さの違いで早期に返らないよう compare_digest を使う。"""
+    """トークンの照合。長さの違いで早期に返らないよう compare_digest を使う。
+
+    非 ASCII が来ると compare_digest が TypeError を投げるので、先に弾く。
+    """
     if not expected:
         return True  # トークン無効化時（テスト用）
     if not given:
+        return False
+    if not given.isascii():
+        # compare_digest は str 同士だと両方 ASCII を要求する。
+        # 非 ASCII をそのまま渡すと認証の判定ではなく例外で 500 になる
         return False
     return hmac.compare_digest(expected, given)
 
@@ -1173,6 +1194,11 @@ class ReviewSession:
             items=[Correction.from_dict(c) for c in items],
         )
         self.corrections.save(self.corrections_path)
+        # 履歴を捨てる。undo は「末尾から件数ぶん落とす」実装なので、一覧を丸ごと
+        # 差し替えたあとの履歴は別物を指す。件数が一致しても同一性の保証にならず、
+        # 直前の判定ではなく無関係な修正が消える。消えるのは add（漏れを塞いだ矩形）
+        # なので、そのフレームは素通しに戻る。
+        self.history.clear()
         self.recompute()
 
     def mark(
@@ -1473,8 +1499,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def _serve_static(self, rel: str) -> None:
         rel = rel.lstrip("/")
         path = os.path.normpath(os.path.join(WEB_DIR, rel))
-        # LAN に出す以上、web/ の外を読ませる筋は必ず塞ぐ
-        if not path.startswith(WEB_DIR) or not os.path.isfile(path):
+        # LAN に出す以上、web/ の外を読ませる筋は必ず塞ぐ。
+        # 文字列の先頭一致では兄弟ディレクトリが通ってしまう。WEB_DIR が
+        # automosaic/web のとき automosaic/webapp/ が startswith を満たす。
+        if not _inside(WEB_DIR, path) or not os.path.isfile(path):
             self._error(404, "not found")
             return
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
@@ -1545,9 +1573,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         body, ctype = got
         # 世代番号付きで取りに来ているなら、先読みが効くようにキャッシュを許す。
-        # 修正が入れば version が変わり URL も変わるので、古い絵は残らない
+        # 修正が入れば version が変わり URL も変わるので、古い絵は残らない。
+        # ただし原画は絶対にキャッシュさせない。「サーバを閉じたら見えない」という
+        # 前提が崩れ、モザイク前のフレームが端末のディスクに残る。
+        # version はモザイク領域の更新を伝える番号なので、原画には意味も無い。
         extra = dict(self._cookie_header())
-        if (q.get("v") or [None])[0]:
+        if (q.get("v") or [None])[0] and not raw:
             extra["Cache-Control"] = "private, max-age=600"
         self._send_bytes(body, ctype, extra=extra)
 

@@ -77,7 +77,18 @@ def build_argv(job: jobs_mod.Job, settings: dict, reuse: bool = False) -> list[s
         job.report,
     ]
     if reuse and os.path.exists(job.detections):
-        argv.append("--reuse-detections")
+        # 「検出を再利用する」でも、途中保存（complete: false）は再利用できない。
+        # 渡すと cli.py がエラーで止める。止まったところから検出を続けて、
+        # そのまま焼く（--resume）。数時間ぶんの検出は捨てずに済む。
+        #
+        # 足りないぶんを直前フレームの領域で埋める逃げ道（--allow-short-detections）
+        # は絶対に付けない。後半が素通しの完成品が、正常終了として出てくる経路そのもの。
+        state = jobs_mod.detections_complete(job.detections)
+        if state is True:
+            argv.append("--reuse-detections")
+        elif state is False:
+            argv.append("--resume")
+        # 読めない JSON は再利用も再開もできない。パス1をやり直す
     if os.path.exists(job.corrections):
         argv += ["--corrections", job.corrections]
 
@@ -384,13 +395,36 @@ class RunnerRegistry:
             return self._runners.get(job_id)
 
     def start(self, job: jobs_mod.Job, settings: dict, reuse: bool = False) -> JobRunner:
+        """1本だけ起動する。既に走っていれば RuntimeError。
+
+        弾く根拠を2つ持つ。レジストリはこのサーバのメモリにしか無いので、
+        サーバを再起動するとサブプロセスだけが生き残った状態（detached）に
+        なり、レジストリは空になる。そこを見ていないと、同じ output.mp4 へ
+        2本が同時に書き込む。meta.json の pid でも必ず確かめる。
+        """
         with self._lock:
             cur = self._runners.get(job.id)
-            if cur is not None and cur.alive():
+            # proc が None なのは「登録したが Popen する前」の一瞬。そこを
+            # 空きと見なすと、続けて2回押されたときに2本走る
+            if cur is not None and (cur.proc is None or cur.alive()):
                 raise RuntimeError("このジョブは既に実行中です")
+            pid = jobs_mod.running_pid(job)
+            if pid is not None:
+                raise RuntimeError(
+                    f"このジョブは別のプロセス (pid {pid}) が実行中です。"
+                    "終わるまで待つか、そのプロセスを終了させてください"
+                )
             r = JobRunner(job, settings, reuse=reuse)
             self._runners[job.id] = r
-        r.start()
+        try:
+            r.start()
+        except Exception:
+            # 起動に失敗したものを残すと、上の proc is None の判定に引っかかって
+            # そのジョブが二度と起動できなくなる
+            with self._lock:
+                if self._runners.get(job.id) is r:
+                    del self._runners[job.id]
+            raise
         return r
 
     def cancel(self, job_id: str) -> bool:

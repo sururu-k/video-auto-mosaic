@@ -37,6 +37,10 @@ from .session import SessionCache, sync_meta
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
+# 配信範囲の判定は review.py と同じものを使う。文字列の先頭一致で判定すると
+# 兄弟ディレクトリが通るので、実装を2箇所に持たない
+_inside = review._inside
+
 # 素材のアップロードはディスクへ直に流す。数 GB を受けるので、
 # 一度メモリやテンポラリに溜めてから移す実装にはしない。
 UPLOAD_CHUNK = 4 * 1024 * 1024
@@ -172,8 +176,9 @@ def create_app(
     @app.get("/static/{name:path}")
     def static_file(name: str):
         path = os.path.normpath(os.path.join(STATIC_DIR, name))
-        # LAN に出す以上、static/ の外を読ませる筋は必ず塞ぐ
-        if not path.startswith(STATIC_DIR) or not os.path.isfile(path):
+        # LAN に出す以上、static/ の外を読ませる筋は必ず塞ぐ。
+        # 文字列の先頭一致だと兄弟ディレクトリが通る（review.py の _inside と同趣旨）
+        if not _inside(STATIC_DIR, path) or not os.path.isfile(path):
             raise _err(404, "not found")
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
         return FileResponse(path, media_type=ctype)
@@ -277,6 +282,11 @@ def create_app(
         payload = payload or {}
         settings = dict(job.meta.get("settings") or {})
         settings.update(payload.get("settings") or {})
+        # null と空文字は「この項目は指定しない」。落とさないと、保存済み設定に
+        # 混ぜるだけの実装では項目を消せない。試写で入れた --limit-frames が
+        # meta に残り続け、素材の一部しか処理していない完成品が
+        # 「完了」として出てくる（--block も一度小さくすると自動に戻せない）
+        settings = {k: v for k, v in settings.items() if v is not None and v != ""}
         reuse = bool(payload.get("reuse"))
         # 領域計算のキャッシュは焼き直しで無効になる。開いたままにしない
         sessions.drop(job_id)
@@ -427,6 +437,14 @@ def create_app(
         s = get_session(job)
         try:
             frame = int(payload["frame"])
+            # 範囲外を端へ寄せない。寄せると、応答は送った番号を返すのに
+            # 記録は最終フレームに付き、画面と .progress.json が食い違う。
+            # 「判定したはずのコマが未判定のまま」「触っていないコマに
+            # 判定が付く」の両方が黙って起きる
+            if not 0 <= frame < s.n_frames:
+                raise ValueError(
+                    f"フレーム番号が範囲外です: {frame}（0〜{s.n_frames - 1}）"
+                )
             verdict = str(payload["verdict"])
             tap = None
             if "x" in payload and "y" in payload:
@@ -484,7 +502,10 @@ def create_app(
     ):
         job = get_job(job_id)
         s = get_session(job)
-        n = max(0, min(s.n_frames - 1, int(n)))
+        # 範囲外に最終フレームの絵を返さない。同じ番号を /mark に出すと 400 なので、
+        # 絵は出るのに判定は付かない状態になる
+        if not 0 <= n < s.n_frames:
+            raise _err(404, f"フレーム番号が範囲外です: {n}（0〜{s.n_frames - 1}）")
         fmt = "jpg" if fmt in ("jpg", "jpeg") else "png"
         with s.lock:
             got = s.frame_image(n, raw=bool(raw), max_w=max(0, int(w)), fmt=fmt)
@@ -493,8 +514,12 @@ def create_app(
         body, ctype = got
         headers = {}
         # 世代番号付きで取りに来ているなら先読みが効くようにする。
-        # 修正が入れば version が変わり URL も変わるので古い絵は残らない
-        headers["Cache-Control"] = "private, max-age=600" if v else "no-store"
+        # 修正が入れば version が変わり URL も変わるので古い絵は残らない。
+        # ただし原画はキャッシュさせない。モザイク前のフレームが端末のディスクに
+        # 残り、「サーバを閉じたら見えない」という前提が崩れる
+        headers["Cache-Control"] = (
+            "private, max-age=600" if (v and not raw) else "no-store"
+        )
         return Response(content=body, media_type=ctype, headers=headers)
 
     @app.get("/api/jobs/{job_id}/corrections")
@@ -513,9 +538,19 @@ def create_app(
     def api_set_corrections(job_id: str, payload: dict):
         job = get_job(job_id)
         s = get_session(job)
+        # キーが無い本文を「空の一覧で置き換えろ」と読まない。読むと、
+        # 壊れた本文ひとつで手修正が全部消える。判定（.progress.json）は
+        # 残るので、「塞いだ」と表示されたまま塞いだ矩形だけが無い状態になる
+        items = payload.get("corrections")
+        if not isinstance(items, list):
+            raise _err(400, "corrections（配列）が本文にありません")
         try:
             with s.lock:
-                s.set_corrections(payload.get("corrections", []))
+                s.set_corrections(items)
+                # set_corrections は履歴を捨てるが、捨てたことを保存しない。
+                # 保存しないと、セッションを開き直した瞬間に .progress.json から
+                # 古い履歴が生き返り、次の undo が無関係な修正を末尾から削る
+                s.save_progress()
                 out = s.update_payload()
                 sync_meta(job, s)
         except (KeyError, TypeError, ValueError) as e:
@@ -541,9 +576,14 @@ def create_app(
         job = get_job(job_id)
         s = get_session(job)
         try:
-            frame = max(0, min(s.n_frames - 1, int(payload["frame"])))
+            frame = int(payload["frame"])
         except (KeyError, TypeError, ValueError) as e:
             raise _err(400, f"フレーム番号が不正です: {e}")
+        # 端へ寄せない。寄せると、狙ったフレームは素通しのまま別のフレームに
+        # 打点が乗り、そこを起点に補間が走る。DELETE は寄せないので、
+        # 寄せられた打点は送った番号では消せない
+        if not 0 <= frame < s.n_frames:
+            raise _err(400, f"フレーム番号が範囲外です: {frame}（0〜{s.n_frames - 1}）")
 
         if payload.get("absent"):
             items = handdraw.put(job, frame, None, payload.get("class"))
@@ -583,10 +623,20 @@ def create_app(
                 max_interp=int(payload.get("max_interp", 20)),
                 hold=int(payload.get("hold", 4)),
                 default_class=payload.get("class") or s.default_class,
-                merge=bool(payload.get("merge")),
+                # 既定は「既存の手修正に足す」。handdraw.expand の既定と揃える。
+                # キーが無いだけで置き換えにすると、検査キューで塞いだ矩形が
+                # 手描きを一度使うだけで全部消える。判定は「塞いだ」と表示された
+                # まま、塞いだ矩形だけが無い状態になる
+                merge=bool(payload.get("merge", True)),
             )
         except (OSError, ValueError, RuntimeError) as e:
             raise _err(400, f"展開できません: {e}")
+        # corrections.json を直に書き換えたので、「ひとつ戻す」の履歴はもう
+        # 別物を指している。set_corrections と同じ理由で捨てる。残すと次の
+        # undo が、手描きで置いた矩形を末尾から件数ぶん削る
+        with s.lock:
+            s.history.clear()
+            s.save_progress()
         # corrections.json を書き換えたので、開いているセッションは作り直す
         sessions.drop(job_id)
         out["ok"] = True

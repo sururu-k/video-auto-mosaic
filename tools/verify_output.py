@@ -145,7 +145,7 @@ def main() -> None:
     print(f"モード {args.mode}")
     print(f"対象 {args.video}  {info.width}x{info.height}  {n_frames} フレーム")
 
-    dec_w, dec_h = vid.detection_frame_size(info, args.infer_size)
+    dec_w, dec_h = vid.detection_frame_size(info, args.infer_size, path=args.video)
     frame_bytes = dec_w * dec_h * 3
     scale_back = info.width / dec_w
 

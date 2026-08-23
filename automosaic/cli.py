@@ -112,8 +112,24 @@ def save_detections(
     os.replace(tmp, path)
 
 
-def load_partial(path: str) -> tuple[dict[int, list[Detection]], int]:
-    """途中保存された検出結果を読む。戻り値は (検出, 済んだフレーム数)。"""
+def load_partial(
+    path: str, target_info: vid.VideoInfo | None = None
+) -> tuple[dict[int, list[Detection]], int]:
+    """途中保存された検出結果を読む。戻り値は (検出, 済んだフレーム数)。
+
+    target_info を渡すと、これから検出を再開する動画に対してその途中保存が
+    妥当かを検証し、おかしければ RuntimeError を出す（省略時は検証しない。
+    tests/test_render.py の既存呼び出しは省略のままなので挙動は変わらない）。
+
+    検証する2点:
+      - 解像度が入力と違う: 座標系が別物の途中保存を取り違えている
+      - n_frames（＝済んだとされるフレーム数）が入力の推定尺以上: これ以上
+        「途中から再開」しようがない。resume_from が実フレーム数以上だと、
+        run_detection のデコードループは推論を1枚も走らせずにそのまま
+        EOF まで読み飛ばして「済み」扱いになり、そのまま complete=True・
+        入力の解像度で上書き保存されてしまう（中身は元の途中保存のままなのに
+        「完了」を称する壊れたJSONができる＝実測で再現済み）。
+    """
     if not path or not os.path.exists(path):
         return {}, 0
     with open(path, encoding="utf-8") as f:
@@ -121,7 +137,32 @@ def load_partial(path: str) -> tuple[dict[int, list[Detection]], int]:
     per_frame = {
         int(k): [Detection.from_dict(x) for x in v] for k, v in d["detections"].items()
     }
-    return per_frame, int(d.get("n_frames", 0))
+    n_frames = int(d.get("n_frames", 0))
+
+    if target_info is not None:
+        jw, jh = d.get("width"), d.get("height")
+        if jw is not None and jh is not None and (int(jw), int(jh)) != (
+            target_info.width, target_info.height
+        ):
+            raise RuntimeError(
+                f"途中保存 {path} の解像度が入力と違います: "
+                f"JSON {jw}x{jh} / 入力 {target_info.width}x{target_info.height}。"
+                "別の動画の途中保存を取り違えている可能性が高いため再開できません。"
+            )
+        # 推定値が信用できるとき（R-1: nb_frames か映像ストリーム自身の duration が
+        # ある）だけ判断に使う。信用できない推定（コンテナ全体のduration頼み）を
+        # 根拠に弾くと、こちらも誤爆でまともな再開を止めてしまう。
+        if target_info.estimated_frames_reliable():
+            expected = target_info.estimated_frames()
+            if expected and n_frames >= expected:
+                raise RuntimeError(
+                    f"途中保存 {path} の済みフレーム数（{n_frames}）が入力の推定"
+                    f"フレーム数（約 {expected}）以上です。この入力に対しては"
+                    "再開できる続きがありません。別の（より長い）動画の途中保存を"
+                    "取り違えている可能性が高いため中止しました。"
+                )
+
+    return per_frame, n_frames
 
 
 def run_detection(
@@ -139,7 +180,9 @@ def run_detection(
     resume_from: int = 0,
     resume_dets: dict[int, list[Detection]] | None = None,
 ) -> tuple[dict[int, list[Detection]], int]:
-    dec_w, dec_h = vid.detection_frame_size(info, detect_scale)
+    # サイズは計算せず ffmpeg に実際に出させて測る。1バイトずれると以降の全フレームが
+    # 前フレームと混ざった斜めの画像になり、例外も出ないまま検出が丸ごと無意味になる。
+    dec_w, dec_h = vid.detection_frame_size(info, detect_scale, path=src)
     frame_bytes = dec_w * dec_h * 3
     # デコード後フレーム座標 -> 元動画座標 の倍率
     scale_back = info.width / dec_w
@@ -155,10 +198,12 @@ def run_detection(
 
     per_frame: dict[int, list[Detection]] = dict(resume_dets or {})
     idx = 0
+    tail = 0
     try:
         while True:
             raw = proc.stdout.read(frame_bytes)
             if len(raw) < frame_bytes:
+                tail = len(raw)
                 break
             # 再開時は、済んだフレームのデコードだけ流して推論を飛ばす。
             # デコードは推論に比べて桁違いに安いので、正確なシークを作るより
@@ -202,9 +247,69 @@ def run_detection(
 
     if prog:
         prog.done(idx)
-    if proc.returncode not in (0, None) and idx == 0:
-        raise RuntimeError('デコードに失敗しました:\n' + '\n'.join(err[-10:]))
+    # 1フレームでも読めていれば見逃す、はしない。途中で止まったパス1をそのまま通すと、
+    # 止まった以降が丸ごと未検出の状態でパス2に渡る（＝後半が素通しの出力）。
+    if proc.returncode not in (0, None):
+        raise RuntimeError(
+            f"パス1のデコードが異常終了しました（{idx} フレーム目で停止 / "
+            f"終了コード {proc.returncode}）:\n" + "\n".join(err[-10:])
+        )
+    # 末尾が半端に切れている = フレーム境界が合っていない。読み進めていたぶんは
+    # 前フレームと混ざっている可能性があるので、結果を使わせない。
+    if tail:
+        raise RuntimeError(
+            f"デコード出力がフレーム境界で終わっていません"
+            f"（末尾 {tail} / {frame_bytes} バイト, デコードサイズ {dec_w}x{dec_h}）。"
+            "検出結果が信用できないため中止します。"
+        )
+    # 壊れたファイルだと ffmpeg は終了コード0のまま途中でフレームを出し終える。
+    # 尺は推定値なので止めはしないが、黙って短い検出結果を渡さない。
+    expected = info.estimated_frames()
+    if limit_frames:
+        expected = min(expected, limit_frames) if expected else limit_frames
+    if expected and idx < expected:
+        print(
+            f"\n警告: パス1が {idx} フレームで終わりました（この動画は約 {expected} "
+            "フレームのはずです）。入力が壊れている可能性があります。"
+            "この検出結果のまま描画すると不足ぶんが未検出のままになります。",
+            file=sys.stderr,
+        )
+    # 終了コードが0でも、フレーム数が満額なら上の3つのチェックはどれも発火しない。
+    # だが ffmpeg は壊れたフレームをエラーとして stderr に書きつつ、そのまま
+    # デコードを継続して欠けたフレーム数を埋めることがある
+    # （例: 「error while decoding MB」を出しつつ復帰する）。その場合ここまで
+    # 気付けないので、rc=0 でも stderr にエラーらしき出力があれば必ず警告する。
+    if err:
+        print(
+            "\n警告: パス1のデコード中に ffmpeg がエラーを出力していました"
+            "（終了コードは正常でも、そのフレームは壊れている可能性があります）:\n  "
+            + "\n  ".join(err[-10:]),
+            file=sys.stderr,
+        )
     return per_frame, idx
+
+
+def _quarantine_incomplete_output(dst: str) -> None:
+    """ガード発動などで尻切れのまま確定した出力を、完成品と紛れないよう退避する。
+
+    書きかけでも ffmpeg 側は stdin の EOF を受けて正常にコンテナを閉じるため、
+    そのまま置いておくと「短いだけの再生できる mp4」が完成品の顔をして残る。
+    既存の完成品を同じ出力先に書いていた場合は、それを尻切れ版で上書きしてしまう。
+    """
+    if not dst or not os.path.exists(dst):
+        return
+    incomplete = dst + ".incomplete"
+    try:
+        if os.path.exists(incomplete):
+            os.remove(incomplete)
+        os.replace(dst, incomplete)
+        print(
+            f"  途中までの出力は {incomplete} に退避しました"
+            "（完成品と紛れないよう出力先には残しません）。",
+            file=sys.stderr,
+        )
+    except OSError as e:
+        print(f"  警告: 途中までの出力の退避に失敗しました（{dst}）: {e}", file=sys.stderr)
 
 
 def run_render(
@@ -219,6 +324,7 @@ def run_render(
     preset: str,
     limit_frames: int | None,
     quiet: bool,
+    allow_short_detections: bool = False,
 ) -> None:
     pix_fmt = vid.detect_pix_fmt(info)
     ten_bit = pix_fmt.endswith("10le")
@@ -236,6 +342,8 @@ def run_render(
 
     idx = 0
     last_boxes: list = []
+    short_from: int | None = None
+    hit_short_guard = False
     try:
         while True:
             raw = reader.stdout.read(fb.nbytes)
@@ -247,7 +355,17 @@ def run_render(
                 boxes = [b for b, _ in regions_per_frame.get(idx, [])]
                 last_boxes = boxes
             else:
-                # パス1より長い場合。素通しはしない（判断できない = 潰す）
+                # パス1より短い検出しかない。ここから先は「判断できない」ではなく
+                # 「何も知らない」なので、last_boxes を延ばしても塞げる保証がない
+                # （最終フレームが空なら以降は全部素通しになる）。既定では止める。
+                # ここで即 raise せず break するのは、finally でのクリーンアップ
+                # （reader/writer を閉じて確実に終わらせる）を通したあとに
+                # 尻切れ出力の退避までやってから例外にするため。
+                if not allow_short_detections:
+                    hit_short_guard = True
+                    break
+                if short_from is None:
+                    short_from = idx
                 boxes = last_boxes
 
             apply_regions(y, u, v, boxes, block, mode=mode, ten_bit=ten_bit)
@@ -269,8 +387,72 @@ def run_render(
 
     if prog:
         prog.done(idx)
+
+    if hit_short_guard:
+        _quarantine_incomplete_output(dst)
+        raise RuntimeError(
+            f"検出結果が実尺より短いです（検出 {n_frames} フレーム / "
+            f"入力は {idx + 1} フレーム目以降も続く）。"
+            f"{idx} フレーム目以降を塞ぐ根拠が無いため中止しました"
+            f"（出力 {dst} は書き出していません）。\n"
+            "  検出をやり直すか、--limit-frames での試写など未検出区間を"
+            "承知のうえで描画する場合は --allow-short-detections を付けてください。"
+        )
+
+    # パス1（run_detection）には「デコードが途中で死んでいないか」
+    # 「実デコード数が期待どおりか」の照合があるが、パス2にはこれまで無かった。
+    # probe が申告する尺と実デコード数が食い違う壊れた入力だと、期待フレーム数に
+    # 届かないまま reader が正常終了したように見え、尻切れの出力が exit 0 で
+    # 出てしまう（実測: probeは90フレーム/3.0sと言うが実際は39フレームしか
+    # 読めない入力で、警告もエラーも無く39フレームの出力が返った）。
+    if reader.returncode not in (0, None):
+        _quarantine_incomplete_output(dst)
+        raise RuntimeError(
+            f"パス2のデコードが異常終了しました（{idx} フレーム目で停止 / "
+            f"終了コード {reader.returncode}）:\n" + "\n".join(rerr[-10:])
+        )
+    if idx < total:
+        _quarantine_incomplete_output(dst)
+        raise RuntimeError(
+            f"パス2が {idx} フレームで終わりました（検出結果は {n_frames} フレーム分、"
+            f"期待していたのは {total} フレームです）。"
+            f"入力の実デコード数が想定より少なく、出力 {dst} は書き出していません"
+            "（probe の申告する尺が実デコード数と食い違っている可能性があります）。"
+        )
+    # フレーム数の照合を通っても、rc=0 のまま ffmpeg がエラーを出しつつ
+    # 内部で復帰してフレーム数だけ帳尻を合わせることがある（例: 壊れた中間バイトで
+    # 「error while decoding MB」を出しつつデコードを続ける）。この場合は
+    # フレーム数の一致だけでは気付けないので、rc に関わらず出力する。
+    if rerr:
+        print(
+            "\n警告: パス2のデコード中に ffmpeg がエラーを出力していました"
+            "（終了コードもフレーム数も正常ですが、該当フレームが壊れている"
+            "可能性があります）:\n  " + "\n  ".join(rerr[-10:]),
+            file=sys.stderr,
+        )
+
     if writer.returncode not in (0, None):
+        _quarantine_incomplete_output(dst)
         raise RuntimeError("エンコードに失敗しました:\n" + "\n".join(werr[-15:]))
+    # --quiet でも必ず出す。素通しの可能性がある区間を黙って渡さない。
+    if short_from is not None:
+        n_short = idx - short_from
+        if last_boxes:
+            print(
+                f"\n警告: frame {short_from} 以降 {n_short} フレーム"
+                f"（{short_from / info.fps:.2f}s 以降）は検出結果がありません。"
+                f"直前フレームの領域 {len(last_boxes)} 個をそのまま延ばしただけで、"
+                "実際に塞げている保証はありません。目視確認が必須です。",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"\n警告: frame {short_from} 以降 {n_short} フレーム"
+                f"（{short_from / info.fps:.2f}s 以降）は検出結果がありません。"
+                "直前フレームにも領域が無かったため、この区間はモザイクが"
+                "一切かかっていません（完全な素通しです）。必ず目視確認してください。",
+                file=sys.stderr,
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -414,7 +596,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-area-ratio",
         type=float,
         default=0.35,
-        help="フレーム面積に対するこの比を超える検出は誤検出として落とす",
+        help="フレーム面積に対するこの比を超える検出を大きすぎるとして数える（落とさない）",
     )
     t.add_argument("--no-despike", action="store_true", help="デスパイクを無効にする")
     t.add_argument(
@@ -468,6 +650,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="--detections の JSON があればパス1を飛ばす",
     )
+    m.add_argument(
+        "--allow-short-detections",
+        action="store_true",
+        help="検出結果が実尺より短くても描画を続ける。不足区間は直前フレームの領域を"
+        "延ばすだけで、塞げている保証はない（--limit-frames の試写を焼くとき用）。"
+        "既定では実尺より短い検出はエラーで止める",
+    )
     m.add_argument("--report", help="統計とレビュー対象フレームの JSON 出力先")
     m.add_argument(
         "--corrections",
@@ -482,8 +671,25 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def explicit_options(argv: list[str] | None) -> set[str]:
+    """コマンドラインで実際に書かれたオプション名を返す。
+
+    既定値と同じ値を明示指定することもあるので、値の比較では判別できない。
+    既定値を全部 None にしたパーサでもう一度読み、埋まったものだけを拾う。
+    """
+    p = build_parser()
+    for action in p._actions:
+        action.default = None
+    try:
+        parsed = p.parse_args(argv)
+    except SystemExit:
+        return set()
+    return {k for k, v in vars(parsed).items() if v is not None}
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    given = explicit_options(argv)
 
     if args.list_providers:
         print("利用可能なプロバイダ:")
@@ -533,6 +739,62 @@ def main(argv: list[str] | None = None) -> int:
     if args.reuse_detections and args.detections and os.path.exists(args.detections):
         with open(args.detections, encoding="utf-8") as f:
             data = json.load(f)
+
+        # 途中保存を本番の検出として使わせない。後半が丸ごと未検出のまま焼ける。
+        complete = data.get("complete")
+        if complete is False:
+            if args.resume:
+                # --reuse-detections と --resume の同時指定。"--resume を付けて"は
+                # 案内として噛み合わない（既に付いている）ので分けて案内する。
+                print(
+                    f"検出結果が途中保存です（complete: false）: {args.detections}\n"
+                    "  --reuse-detections と --resume は同時に使えません。"
+                    "  まず --resume だけを付けて検出を最後まで終わらせてから、"
+                    "  改めて --reuse-detections を付けて描画してください。",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"検出結果が途中保存です（complete: false）: {args.detections}\n"
+                    "  検出が最後まで終わっていないので、そのまま描画すると後半が素通しになります。"
+                    "  --reuse-detections を外し、代わりに --resume を付けて検出を"
+                    "  続けてから、改めて --reuse-detections で描画してください。",
+                    file=sys.stderr,
+                )
+            return 1
+        if complete is None:
+            print(
+                f"警告: {args.detections} に complete フラグがありません。"
+                "古い形式か手書きの可能性があります。完了済みとして扱います。",
+                file=sys.stderr,
+            )
+
+        # 解像度違いの JSON を流用すると領域が別の場所に載る。幾何フィルタでも
+        # 検知できないので、ここで弾く。width/height 欠落も同様に弾く
+        # （画枠外に出た矩形は render.py の描画クリップで塗られず、それでも
+        # 統計上は「被覆した」と数えられて適用率100%なのに1画素も塗らない
+        # 出力になった実測がある。手元の実データ8本は全て width/height を
+        # 持つので、この判定を厳格化しても既存データは壊さない）。
+        jw, jh = data.get("width"), data.get("height")
+        if jw is None or jh is None:
+            print(
+                f"検出結果に解像度が記録されていません: {args.detections}\n"
+                f"  座標が入力 {info.width}x{info.height} に対応しているか確認できないため"
+                "中止します。検出をやり直すか、width/height を記録している検出結果を"
+                "使ってください。",
+                file=sys.stderr,
+            )
+            return 1
+        if (int(jw), int(jh)) != (info.width, info.height):
+            print(
+                f"検出結果の解像度が入力と違います: "
+                f"JSON {jw}x{jh} / 入力 {info.width}x{info.height}（{args.detections}）\n"
+                "  座標がそのまま別の位置に載るため使えません。"
+                "  その解像度用の検出結果を指定するか、検出をやり直してください。",
+                file=sys.stderr,
+            )
+            return 1
+
         n_frames = data["n_frames"]
         per_frame = {
             int(k): [Detection.from_dict(d) for d in v]
@@ -541,6 +803,54 @@ def main(argv: list[str] | None = None) -> int:
         loaded = True
         if not args.quiet:
             print(f"検出結果を再利用: {args.detections}（{n_frames} フレーム）")
+
+        # 実尺より短い検出は、描画に入る前に弾く。ここで気付けば数十分無駄にしない。
+        # ただし estimated_frames() は duration からの見積りに過ぎず、nb_frames も
+        # 映像ストリーム自身の duration も持たないコンテナ（mkv 等）だと、
+        # コンテナ全体の duration（音声込みの最大長）にフォールバックする。
+        # これは音声コーデックの priming/padding 分だけ実フレーム数より大きく出る
+        # ことがあり（mkv+AAC/MP3 実測: 実150フレームに対し見積り151）、
+        # ここで return 1 すると健全な検出結果が常用不能になり、案内に従った
+        # 利用者が --allow-short-detections を常用するようになる
+        # （それは本物のガード=run_render の実デコード数チェックまで無効化する
+        # ので、この誤検知が最も危険）。
+        # estimated_frames_reliable() が False のときはこの見積りを弾く根拠に
+        # 使わず、情報として出すに留める。本当に短い検出は、描画に進めば
+        # run_render が実デコード数で改めて弾く（そちらは推定に頼らない）。
+        expected = info.estimated_frames()
+        expected_reliable = info.estimated_frames_reliable()
+        if args.limit_frames:
+            if expected is None or args.limit_frames < expected:
+                # --limit-frames 自体は利用者の明示指定なので信頼できる
+                expected = args.limit_frames
+                expected_reliable = True
+        if expected and n_frames < expected and not args.detect_only:
+            msg = (
+                f"検出結果が実尺より短いです: 検出 {n_frames} フレーム / "
+                f"入力は約 {expected} フレーム（{args.detections}）"
+            )
+            if not expected_reliable:
+                if not args.quiet:
+                    print(
+                        msg + "\n  ただしこの入力は nb_frames も映像ストリームの"
+                        "duration も持たないため、この見積りは音声込みの長さからの"
+                        "概算で実フレーム数より多めに出ることがあります。"
+                        "ここでは止めず、描画時に実デコード数で改めて確認します。",
+                        file=sys.stderr,
+                    )
+            elif not args.allow_short_detections:
+                print(
+                    msg + "\n  不足ぶんを塞ぐ根拠が無いため中止します。"
+                    "  検出をやり直すか、承知のうえで焼くなら --allow-short-detections。",
+                    file=sys.stderr,
+                )
+                return 1
+            else:
+                print(
+                    f"警告: {msg}\n"
+                    f"  frame {n_frames} 以降は直前フレームの領域を延ばすだけです。",
+                    file=sys.stderr,
+                )
 
     if not loaded:
         det = Detector(
@@ -571,7 +881,11 @@ def main(argv: list[str] | None = None) -> int:
         resume_dets: dict[int, list[Detection]] = {}
         resume_from = 0
         if args.resume and args.detections:
-            resume_dets, resume_from = load_partial(args.detections)
+            try:
+                resume_dets, resume_from = load_partial(args.detections, target_info=info)
+            except RuntimeError as e:
+                print(str(e), file=sys.stderr)
+                return 1
             if resume_from and not args.quiet:
                 print(f"途中保存から再開: {resume_from} フレームまで済み")
 
@@ -598,11 +912,36 @@ def main(argv: list[str] | None = None) -> int:
     if not args.estimate_gaps:
         # 既定は「実際に検出できた箇所だけ」。推定で広げる要素を落とし、
         # 検出と検出のあいだの補間だけ残す。塗り過ぎを避けるための方針。
-        args.memory = min(args.memory, 2)
-        args.memory_before = min(args.memory_before or 2, 2)
-        args.bridge_max = 0
-        args.hold_growth = 0.0
-        args.motion_weight = min(args.motion_weight, 1.0)
+        # ただし明示指定された値は上書きしない。黙って別の設定で走らせない。
+        narrowed = [
+            ("memory", "--memory", args.memory, min(args.memory, 2)),
+            ("memory_before", "--memory-before",
+             args.memory_before, min(args.memory_before or 2, 2)),
+            ("bridge_max", "--bridge-max", args.bridge_max, 0),
+            ("hold_growth", "--hold-growth", args.hold_growth, 0.0),
+            ("motion_weight", "--motion-weight",
+             args.motion_weight, min(args.motion_weight, 1.0)),
+        ]
+        applied: list[str] = []
+        kept: list[str] = []
+        for name, flag, old, new in narrowed:
+            if name in given:
+                if old != new:
+                    kept.append(f"{flag} {old}")
+                continue
+            if old != new:
+                setattr(args, name, new)
+                applied.append(f"{flag} {old} -> {new}")
+
+        # C-6: 実効設定が明示指定と違う状態で走ることがあるので、--quiet でも出す。
+        if applied:
+            print(
+                "--estimate-gaps 無しのため推定で広げる設定を絞りました: "
+                + ", ".join(applied),
+                file=sys.stderr,
+            )
+        if kept:
+            print("明示指定を優先: " + ", ".join(kept), file=sys.stderr)
 
     cfg = TemporalConfig(
         max_gap=args.max_gap,
@@ -633,30 +972,59 @@ def main(argv: list[str] | None = None) -> int:
     if args.corrections:
         cset = corr.CorrectionSet.load(args.corrections)
         if cset.items:
-            regions = corr.apply(regions, cset)
+            # stats を受け取って実際に反映できた件数を出す。読み込み件数だけを
+            # 出すと「全件反映できた」ように見えるが、範囲外フレームを指す修正は
+            # apply() 内で黙って（stdoutには出さず）弾かれるため、実際の適用数は
+            # それより少ないことがある（実測: 読み込み444件 / 適用26件）。
+            corr_stats: dict = {}
+            regions = corr.apply(regions, cset, stats=corr_stats)
             if not args.quiet:
-                print(f"手修正を反映: {args.corrections}（{len(cset.items)} 件）")
+                dropped = corr_stats.get("dropped_out_of_range", 0)
+                print(
+                    f"手修正を反映: {args.corrections}"
+                    f"（読み込み {corr_stats.get('total', len(cset.items))} 件 / "
+                    f"適用 {corr_stats.get('applied', 0)} 件"
+                    f" [add {corr_stats.get('applied_add', 0)}"
+                    f" / remove {corr_stats.get('applied_remove', 0)}]"
+                    + (f" / 範囲外で不適用 {dropped} 件" if dropped else "")
+                    + "）"
+                )
         elif not args.quiet:
             print(f"手修正ファイルに項目がありません: {args.corrections}")
 
+    covered = stats["frames_with_mosaic"]
+    coverage_pct = 100.0 * covered / n_frames
     if not args.quiet:
         print("\n[検出統計]")
         for k, v in stats.items():
             print(f"  {k:34s} {v}")
-        covered = stats["frames_with_mosaic"]
-        print(f"  モザイク適用率{'':21s} {100.0 * covered / n_frames:.1f}%")
+        print(f"  モザイク適用率{'':21s} {coverage_pct:.1f}%")
+    else:
+        # --quiet でも「漏れている/素通しである」ことを示す数値は落とさない。
+        # 進捗や内訳の全項目は抑制してよいが、被覆率と幾何フィルタで丸ごと
+        # 捨てた件数（geometric_dropped）は素通しの直接の指標なので出す
+        # （実測: --quiet だと「適用率100.0%」が実は1画素も塗っていない
+        # ケースでも一切表示されず気付けなかった）。
+        print(
+            f"[検出統計] モザイク適用率 {coverage_pct:.1f}%  "
+            f"geometric_dropped={stats.get('geometric_dropped', 0)}  "
+            f"uncovered_gaps={stats.get('uncovered_gaps', 0)}",
+            file=sys.stderr,
+        )
 
-    # 埋めなかった未処理区間は必ず表に出す。黙って素通しにしない。
-    if left_open and not args.quiet:
+    # 埋めなかった未処理区間は必ず表に出す。黙って素通しにしない（--quiet でも）。
+    if left_open:
         fps = info.fps
-        print(f"\n[未処理のまま残った区間 {len(left_open)} 件]")
+        out = sys.stderr if args.quiet else sys.stdout
+        print(f"\n[未処理のまま残った区間 {len(left_open)} 件]", file=out)
         for start, end in left_open[:20]:
             print(
                 f"  frame {start:>7}-{end - 1:<7} "
-                f"({start / fps:7.2f}s - {(end - 1) / fps:7.2f}s)  {end - start} フレーム"
+                f"({start / fps:7.2f}s - {(end - 1) / fps:7.2f}s)  {end - start} フレーム",
+                file=out,
             )
         if len(left_open) > 20:
-            print(f"  ... 他 {len(left_open) - 20} 件")
+            print(f"  ... 他 {len(left_open) - 20} 件", file=out)
 
     est_only = estimated_only_ranges(regions, n_frames)
     if est_only and not args.quiet:
@@ -715,19 +1083,28 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # ---- パス2: 描画 ----
-    run_render(
-        src,
-        dst,
-        info,
-        regions,
-        n_frames,
-        block,
-        args.mode,
-        args.crf,
-        args.preset,
-        args.limit_frames,
-        args.quiet,
-    )
+    # run_render は「検出結果が実尺より短い」等をここまで来て初めて実デコード数で
+    # 検知することがある（R-1: 事前チェックは推定値ベースで信用できないことがあり、
+    # そのぶんの本当の判定はここに委ねている）。例外を素通しさせず、他の中止経路と
+    # 同じくメッセージを出して rc=1 で終える。
+    try:
+        run_render(
+            src,
+            dst,
+            info,
+            regions,
+            n_frames,
+            block,
+            args.mode,
+            args.crf,
+            args.preset,
+            args.limit_frames,
+            args.quiet,
+            allow_short_detections=args.allow_short_detections,
+        )
+    except RuntimeError as e:
+        print(f"\n{e}", file=sys.stderr)
+        return 1
 
     if not args.quiet:
         size_mb = os.path.getsize(dst) / (1024 * 1024)

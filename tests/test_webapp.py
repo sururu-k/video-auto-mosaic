@@ -172,15 +172,35 @@ def make_lib() -> str:
 
 def test_job_id_and_ext():
     lib = jobs_mod.Library(make_lib())
-    ids = {jobs_mod.new_job_id(lib.root) for _ in range(50)}
+    drawn = [jobs_mod.new_job_id(lib.root) for _ in range(50)]
+    ids = set(drawn)
     assert len(ids) == 50, "ジョブID が衝突している"
     for i in ids:
         assert jobs_mod.JOB_ID_RE.match(i), i
+        # 発番と同時にディレクトリで確保していること。ここが「見るだけ」だと
+        # 実際の一意性が乱数4桁（16bit）にしか乗らず、同じ秒に 50 件作ると
+        # 2% ほどで衝突して、あとから来たほうが先の案件を上書きする
+        assert os.path.isdir(os.path.join(lib.root, i)), f"確保されていない: {i}"
     # 保存名は拡張子だけ引き継ぐ。パス区切りを混ぜた名前で外へ書かせない
     assert jobs_mod.safe_ext("a.MOV") == ".mov"
     assert jobs_mod.safe_ext("../../evil.exe") == ".mp4"
     assert jobs_mod.safe_ext("") == ".mp4"
-    print(f"  ジョブID {len(ids)} 件が全て一意・拡張子の絞り込み OK")
+    print(f"  ジョブID {len(ids)} 件が全て一意・その場で確保・拡張子の絞り込み OK")
+
+
+def test_job_id_is_reserved_under_race():
+    """同時に引いても衝突しないこと。サーバは要求を並行で処理する。
+
+    「そのIDのディレクトリが無ければ返す」だけの実装だと、見てから使うまでの
+    あいだに同じIDを別の要求が引き当てられる。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    lib = jobs_mod.Library(make_lib())
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        ids = list(ex.map(lambda _: jobs_mod.new_job_id(lib.root), range(50)))
+    assert len(set(ids)) == 50, "同時発番でジョブID が衝突している"
+    print("  同時に 50 件引いても一意 OK")
 
 
 def test_library_rejects_bad_id():
@@ -380,10 +400,46 @@ def test_build_argv():
     assert argv[argv.index("--conf") + 1] == "0.1"
     # 検出結果が無いのに --reuse-detections を付けない（付くと必ず失敗する）
     assert "--reuse-detections" not in runner_mod.build_argv(job, {}, reuse=True)
+    # complete が無い古い形式は、cli.py と同じく完了扱い
     with open(job.detections, "w", encoding="utf-8") as f:
         json.dump({"n_frames": 1, "width": 1, "height": 1, "detections": {}}, f)
     assert "--reuse-detections" in runner_mod.build_argv(job, {}, reuse=True)
-    print("  CLI 引数の組み立て OK")
+    with open(job.detections, "w", encoding="utf-8") as f:
+        json.dump(
+            {"n_frames": 1, "width": 1, "height": 1, "complete": True, "detections": {}}, f
+        )
+    assert "--reuse-detections" in runner_mod.build_argv(job, {}, reuse=True)
+
+    # 途中保存（complete: false）は再利用できない。渡すと cli.py がエラーで止まる。
+    # 止まったところから検出を続ける（--resume）に振り替えること。
+    # 足りないぶんを直前フレームの領域で埋める逃げ道は絶対に付けない
+    with open(job.detections, "w", encoding="utf-8") as f:
+        json.dump(
+            {"n_frames": 1, "width": 1, "height": 1, "complete": False, "detections": {}}, f
+        )
+    argv = runner_mod.build_argv(job, {}, reuse=True)
+    assert "--reuse-detections" not in argv, argv
+    assert "--resume" in argv, argv
+    assert "--allow-short-detections" not in argv, argv
+
+    # 読めない JSON は再利用も再開もできない。パス1をやり直す
+    with open(job.detections, "w", encoding="utf-8") as f:
+        f.write("{ここで壊れている")
+    argv = runner_mod.build_argv(job, {}, reuse=True)
+    assert "--reuse-detections" not in argv and "--resume" not in argv, argv
+    print("  CLI 引数の組み立て OK（途中保存は --resume に振り替える）")
+
+
+def wait_finished(srv, jid: str, timeout: float = 120.0) -> str:
+    """処理が終わるまで待つ。戻り値は最終の status。"""
+    end = time.time() + timeout
+    st = ""
+    while time.time() < end:
+        st = get_json(f"{srv.base}/api/jobs/{jid}?t={TOKEN}")["status"]
+        if st in ("done", "failed", "canceled", "interrupted"):
+            return st
+        time.sleep(0.1)
+    raise AssertionError(f"終わりません: status={st}")
 
 
 def write_fake_detections(job, n_frames: int, width: int, height: int) -> None:
@@ -402,7 +458,15 @@ def write_fake_detections(job, n_frames: int, width: int, height: int) -> None:
     }
     with open(job.detections, "w", encoding="utf-8") as f:
         json.dump(
-            {"n_frames": n_frames, "width": width, "height": height, "detections": dets},
+            {
+                "n_frames": n_frames,
+                "width": width,
+                "height": height,
+                # save_detections が書くものと同じ形にする。これが無いと
+                # 「途中保存かどうか」を見分ける経路を素通りしてしまう
+                "complete": True,
+                "detections": dets,
+            },
             f,
         )
 
@@ -446,6 +510,10 @@ def test_run_and_progress_stream():
         assert detail["elapsed_sec"] is not None
         # meta.json にレポートの数字が取り込まれていること
         assert "stats" in detail and detail["stats"], detail["stats"]
+        # 素通しの区間数が API に出ること。出ていないと、完成品を受け取る前に
+        # 「モザイクが1つも乗っていない区間がある」ことに誰も気づけない
+        assert detail["n_uncovered_ranges"] is not None, detail
+        assert detail["n_estimated_only_ranges"] is not None, detail
         print(
             f"  通し（パス2のみ）OK: {detail['output_size_bytes']} バイト / "
             f"{detail['elapsed_sec']}秒 / 進捗を拾えた={seen_progress}"
@@ -522,6 +590,68 @@ def test_reconcile_after_restart():
         detail = get_json(f"{srv.base}/api/jobs/{jid}?t={TOKEN}")
         assert detail["status"] == "done", detail["status"]
         print("  再起動後の状態復元 OK（中断 / 完成品ありなら完了）")
+    finally:
+        srv.close()
+
+
+def test_no_double_start_across_restart():
+    """サーバ再起動をまたいだ二重起動を弾くこと。
+
+    走っているサブプロセスはサーバの再起動では死なない（detached）。
+    弾く根拠がプロセス内のレジストリだけだと、再起動した瞬間に同じ
+    output.mp4 へ2本が書き込める。meta.json の pid でも確かめること。
+
+    同時に、死んだプロセスの残骸で永久にロックされないことも見る。
+    そこを間違えると、落ちたサーバの pid が残っただけでそのジョブは
+    二度と起動できなくなる。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = upload(srv.base, sample_video())
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        write_fake_detections(job, d["n_frames"], d["width"], d["height"])
+    finally:
+        srv.close()  # ここでレジストリが消える
+
+    # 走りっぱなしのサブプロセスを模す。生きている pid を meta に残す
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        jobs_mod.Library(lib).get(jid).update(
+            status="running", pid=sleeper.pid, detached=True
+        )
+        srv = Server(lib)  # 再起動
+        try:
+            st = get_json(f"{srv.base}/api/jobs/{jid}?t={TOKEN}")
+            assert st["status"] == "running" and st["alive"], st
+            code, r = post_json(
+                f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}", {"reuse": True}
+            )
+            assert code == 409, f"二重起動を通した: {code} {r}"
+            assert str(sleeper.pid) in r["detail"], r
+        finally:
+            srv.close()
+    finally:
+        sleeper.terminate()
+        sleeper.wait()
+
+    # 死んだ pid が残っているだけなら起動できること
+    jobs_mod.Library(lib).get(jid).update(
+        status="running", pid=sleeper.pid, detached=True
+    )
+    srv = Server(lib)
+    try:
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}", {"reuse": True}
+        )
+        assert code == 200, f"死んだ pid の残骸で塞がっている: {code} {r}"
+        for _ in range(600):
+            s = get_json(f"{srv.base}/api/jobs/{jid}?t={TOKEN}")
+            if s["status"] in ("done", "failed", "canceled"):
+                break
+            time.sleep(0.1)
+        print("  再起動をまたいだ二重起動を拒否・死んだ pid では起動できる OK")
     finally:
         srv.close()
 
@@ -665,6 +795,89 @@ def test_mark_roundtrip_and_undo():
         srv.close()
 
 
+def test_toobig_stacks_remove_and_add_as_pairs():
+    """「でかすぎる」が remove と add を隣り合わせの組で積むこと。
+
+    タイムライン画面の取り消し（frontend/src/shared/review-logic.ts の
+    correctionsAfterDrop）は、この並びを見て組を割らないようにしている。
+    積み方が変わればあちらが黙って壊れるので、ここで並びを固定しておく。
+
+    末尾の add だけを落とすと remove が残り、そのフレームは自動領域も
+    手修正も無い完全な素通しになる。それも合わせて示す。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = prepared_job(lib, srv)
+        jid = d["id"]
+        f = 5  # 検出がある区間（0〜9）
+        st = get_json(f"{srv.base}/api/jobs/{jid}/state?light=0&t={TOKEN}")
+        assert st["regions"].get(str(f)), "判定前に自動領域が無い"
+
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/mark?t={TOKEN}",
+            {"frame": f, "verdict": "toobig", "x": 0.5, "y": 0.5, "w": 30, "h": 30, "span": 1},
+        )
+        assert code == 200, r
+        items = get_json(f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}")["corrections"]
+        want = []
+        for n in range(f - 1, f + 2):
+            want += [(n, "remove"), (n, "add")]
+        assert [(c["frame"], c["kind"]) for c in items] == want, items
+
+        # 末尾1件だけ落とすと素通しになる（画面側が組で落とすべき理由）
+        post_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}", {"corrections": items[:-1]}
+        )
+        st = get_json(f"{srv.base}/api/jobs/{jid}/state?light=0&t={TOKEN}")
+        assert not st["regions"].get(str(f + 1)), "remove だけ残っても素通しにならない?"
+
+        # 組で落とせば自動領域が戻る
+        post_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}", {"corrections": items[:-2]}
+        )
+        st = get_json(f"{srv.base}/api/jobs/{jid}/state?light=0&t={TOKEN}")
+        assert st["regions"].get(str(f + 1)), "組で落としたのに素通しのまま"
+        print("  でかすぎる が remove+add を組で積むこと OK（組を割ると素通し）")
+    finally:
+        srv.close()
+
+
+def test_mark_rejects_out_of_range_frame():
+    """範囲外のフレームは弾くこと。端へ寄せない。
+
+    黙って寄せると、応答は送った番号を返すのに記録は最終フレームに付く。
+    判定したはずのコマが未判定のまま残り、触っていないコマに判定が付く。
+    どちらも画面には出ないので、検査が一周したという数字だけが嘘になる。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = prepared_job(lib, srv)
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        n = d["n_frames"]
+        for bad in (n, n + 1, 999999, -1):
+            code, r = post_json(
+                f"{srv.base}/api/jobs/{jid}/mark?t={TOKEN}",
+                {"frame": bad, "verdict": "ok"},
+            )
+            assert code == 400, f"frame={bad} を通した: {code} {r}"
+        prog = os.path.splitext(job.corrections)[0] + ".progress.json"
+        assert not os.path.exists(prog), "弾いたはずの判定が記録されている"
+
+        # 範囲内は通ること
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/mark?t={TOKEN}", {"frame": n - 1, "verdict": "ok"}
+        )
+        assert code == 200 and r["frame"] == n - 1, r
+        with open(prog, encoding="utf-8") as f:
+            assert json.load(f)["verdicts"] == {str(n - 1): "ok"}
+        print(f"  範囲外フレーム（{n}, 999999, -1）の判定を拒否 OK")
+    finally:
+        srv.close()
+
+
 def test_corrections_replace():
     lib = make_lib()
     srv = Server(lib)
@@ -765,12 +978,246 @@ def test_hand_draw_and_expand():
         assert code == 200 and len(json.loads(body)["annotations"]) == 2
         print("  打点の上書き・削除 OK")
 
-        # 展開は既定で置き換え。編集し直すたびに古い矩形が積み残らない
-        code, r = post_json(f"{srv.base}/api/jobs/{jid}/annotations/expand?t={TOKEN}", {})
+        # merge を明示で切れば置き換え。編集し直すたびに古い矩形が積み残らない
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/annotations/expand?t={TOKEN}", {"merge": False}
+        )
         cs2 = CorrectionSet.load(job.corrections)
         assert all(c.frame < 30 for c in cs2.items)
         assert len(cs2.items) == r["corrections"]
-        print("  展開が置き換えになっている OK")
+        print("  merge を切れば置き換えになる OK")
+    finally:
+        srv.close()
+
+
+def test_corrections_payload_must_be_a_list():
+    """corrections キーの無い本文で全消ししないこと。
+
+    「空の一覧で置き換えろ」と読むと、壊れた本文ひとつで手修正が全部消える。
+    判定（.progress.json）は残るので、「塞いだ」と表示されたまま
+    塞いだ矩形だけが無い状態、つまりそのフレームは素通しになる。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = prepared_job(lib, srv)
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        post_json(
+            f"{srv.base}/api/jobs/{jid}/mark?t={TOKEN}",
+            {"frame": 5, "verdict": "fixed", "x": 0.5, "y": 0.5, "w": 40, "h": 40},
+        )
+        assert len(CorrectionSet.load(job.corrections).items) == 1
+
+        for bad in ({}, {"foo": "bar"}, {"corrections": None}, {"corrections": {}}):
+            code, r = post_json(f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}", bad)
+            assert code == 400, f"{bad} を通した: {code} {r}"
+        assert len(CorrectionSet.load(job.corrections).items) == 1, "本文が壊れているのに消えた"
+
+        # 空配列を明示で送ったときだけ全消しになる
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}", {"corrections": []}
+        )
+        assert code == 200 and r["n_corrections"] == 0, r
+        print("  corrections キーの無い本文を拒否 OK（明示の空配列だけ通る）")
+    finally:
+        srv.close()
+
+
+def test_undo_history_does_not_come_back():
+    """一覧を差し替えたあと、履歴がセッションの作り直しで生き返らないこと。
+
+    set_corrections は履歴を捨てるが、捨てたことを保存しないと
+    .progress.json から読み戻される。生き返った履歴は差し替え後の一覧では
+    別物を指すので、undo が無関係な修正（漏れを塞いだ矩形）を末尾から削る。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = prepared_job(lib, srv)
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        for f in (5, 35):
+            post_json(
+                f"{srv.base}/api/jobs/{jid}/mark?t={TOKEN}",
+                {"frame": f, "verdict": "fixed", "x": 0.5, "y": 0.5, "w": 40, "h": 40},
+            )
+        post_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}",
+            {"corrections": [
+                {"frame": 20, "box": [10, 10, 30, 30], "class": CLS, "kind": "add"}
+            ]},
+        )
+    finally:
+        srv.close()
+
+    srv = Server(lib)  # セッションを開き直す（再起動・追い出し・expand と同じ）
+    try:
+        q = get_json(f"{srv.base}/api/jobs/{jid}/queue?t={TOKEN}")
+        assert q["progress"]["can_undo"] is False, "捨てたはずの履歴が生き返っている"
+        before = [(c.frame, c.kind) for c in CorrectionSet.load(job.corrections).items]
+        code, r = post_json(f"{srv.base}/api/jobs/{jid}/undo?t={TOKEN}", {})
+        after = [(c.frame, c.kind) for c in CorrectionSet.load(job.corrections).items]
+        assert r["ok"] is False, r
+        assert after == before, f"戻せないはずなのに消えた: {before} -> {after}"
+        print("  一覧の差し替え後、履歴が生き返らない OK")
+    finally:
+        srv.close()
+
+
+def test_out_of_range_is_rejected_everywhere():
+    """範囲外のフレーム番号を、どの入口も端へ寄せないこと。
+
+    寄せると、狙ったフレームは素通しのまま別のフレームに打点や判定が乗る。
+    /frame だけ絵が返ると「絵は出るのに判定は付かない」食い違いにもなる。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = prepared_job(lib, srv)
+        jid = d["id"]
+        n = d["n_frames"]
+        for bad in (n, 5060, -20):
+            code, r = post_json(
+                f"{srv.base}/api/jobs/{jid}/annotations?t={TOKEN}",
+                {"frame": bad, "box": [10, 10, 30, 30]},
+            )
+            assert code == 400, f"打点 frame={bad} を通した: {code} {r}"
+            code, _r = post_json(
+                f"{srv.base}/api/jobs/{jid}/annotations?t={TOKEN}",
+                {"frame": bad, "absent": True},
+            )
+            assert code == 400, f"「ここには無い」 frame={bad} を通した: {code}"
+            code, _b, _h = request(f"{srv.base}/api/jobs/{jid}/frame?n={bad}&t={TOKEN}")
+            assert code == 404, f"/frame n={bad} が {code} を返した"
+        assert get_json(f"{srv.base}/api/jobs/{jid}/annotations?t={TOKEN}")["annotations"] == []
+
+        # 範囲内は通ること
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/annotations?t={TOKEN}",
+            {"frame": n - 1, "box": [10, 10, 30, 30]},
+        )
+        assert code == 200 and r["frame"] == n - 1, r
+        assert request(f"{srv.base}/api/jobs/{jid}/frame?n={n - 1}&t={TOKEN}")[0] == 200
+        print(f"  範囲外（{n}, 5060, -20）を打点・/frame とも拒否 OK")
+    finally:
+        srv.close()
+
+
+def test_settings_can_be_cleared():
+    """一度入れた設定を画面から外せること。
+
+    保存済み設定に混ぜるだけだと、試写で入れた --limit-frames が残り続ける。
+    素材の一部しか処理していない完成品が「完了」として出てくる。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = upload(srv.base, sample_video())
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        write_fake_detections(job, d["n_frames"], d["width"], d["height"])
+
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}",
+            {"reuse": True, "settings": {"limit_frames": 30, "block": 8}},
+        )
+        assert code == 200 and "--limit-frames" in r["argv"], r["argv"]
+        wait_finished(srv, jid)
+
+        # 画面が「指定しない」を null で送る
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}",
+            {"reuse": True, "settings": {"limit_frames": None, "block": None}},
+        )
+        assert code == 200, r
+        assert "--limit-frames" not in r["argv"], r["argv"]
+        assert "--block" not in r["argv"], r["argv"]
+        wait_finished(srv, jid)
+        meta = jobs_mod.Library(lib).get(jid).meta
+        assert "limit_frames" not in (meta.get("settings") or {}), meta.get("settings")
+        print("  設定の解除 OK（--limit-frames が残らない）")
+    finally:
+        srv.close()
+
+
+def test_annotations_survive_parallel_writes():
+    """同時に置いた打点が消えないこと。
+
+    打点の保存は「読んで・足して・書く」なので、鍵が無いと片方が消える。
+    しかも消えたほうも 200 を返すので、画面からは気づけない。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = prepared_job(lib, srv)
+        jid = d["id"]
+        frames = list(range(0, 40))
+
+        def put(f):
+            code, _ = post_json(
+                f"{srv.base}/api/jobs/{jid}/annotations?t={TOKEN}",
+                {"frame": f, "box": [10, 10, 30, 30]},
+            )
+            return code
+
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            codes = list(ex.map(put, frames))
+        assert set(codes) == {200}, sorted(set(codes))
+        got = get_json(f"{srv.base}/api/jobs/{jid}/annotations?t={TOKEN}")["annotations"]
+        assert sorted(int(a["frame"]) for a in got) == frames, len(got)
+        print(f"  同時に置いた打点 {len(frames)} 件が全部残る OK")
+    finally:
+        srv.close()
+
+
+def test_expand_keeps_review_work():
+    """手描きの展開が、検査キューで積んだ修正を消さないこと。
+
+    2つある。
+
+    1. merge を送らなかったときの既定。置き換えを既定にすると、検査キューで
+       塞いだ矩形が手描きを一度使うだけで全部消える。判定は「塞いだ」と
+       表示されたまま、塞いだ矩形だけが無い状態になる（＝そのフレームは素通し）
+    2. 展開後の「ひとつ戻す」。展開は corrections.json を直に書き換えるので、
+       .progress.json に残った履歴はもう別物を指す。捨てておかないと、
+       次の undo が手描きで置いた矩形を末尾から削る
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = prepared_job(lib, srv)
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+
+        # 検査キューで1コマ塞ぐ
+        f = 35  # 検出がある区間（30〜39）
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/mark?t={TOKEN}",
+            {"frame": f, "verdict": "fixed", "x": 0.5, "y": 0.5, "w": 40, "h": 40},
+        )
+        assert code == 200 and r["added"] == 1, r
+
+        # 手描きで別の場所に打点を置いて展開する（merge を送らない）
+        post_json(
+            f"{srv.base}/api/jobs/{jid}/annotations?t={TOKEN}",
+            {"frame": 20, "box": [10, 10, 30, 30]},
+        )
+        code, r = post_json(f"{srv.base}/api/jobs/{jid}/annotations/expand?t={TOKEN}", {})
+        assert code == 200, r
+        items = CorrectionSet.load(job.corrections).items
+        assert any(c.frame == f for c in items), "検査キューで塞いだ矩形が消えた"
+
+        # 展開したあとの「ひとつ戻す」が、別物を消さないこと
+        before = [(c.frame, c.kind) for c in items]
+        code, r = post_json(f"{srv.base}/api/jobs/{jid}/undo?t={TOKEN}", {})
+        assert code == 200, r
+        after = [(c.frame, c.kind) for c in CorrectionSet.load(job.corrections).items]
+        assert after == before, f"戻せる履歴が無いのに修正が消えた: {before} -> {after}"
+        assert r["ok"] is False, r  # 履歴は展開で捨てられている
+        print("  展開が検査キューの修正を消さない・展開後の undo が暴走しない OK")
     finally:
         srv.close()
 

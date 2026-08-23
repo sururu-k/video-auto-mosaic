@@ -43,11 +43,24 @@ ALLOWED_EXT = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm", ".ts", ".wmv", "
 
 
 def new_job_id(library: str) -> str:
-    """衝突しないジョブID を作る。"""
+    """衝突しないジョブID を作り、その場でディレクトリを作って確保する。
+
+    「存在しなければ返す」だけだと、確保していない ID を返すことになる。
+    見てから使うまでの間に別の要求が同じ ID を引き当てられるので、実際の
+    一意性は乱数4桁（16bit）だけに乗る。同じ秒に 50 件作れば 2% ほどで
+    衝突し、あとから来たほうが先の案件のディレクトリに素材を上書きする。
+
+    作る側で排他（exist_ok=False）を取り、作れたものだけを返す。
+    戻り値の ID のディレクトリは、この関数を抜けた時点で既に存在する。
+    """
+    os.makedirs(library, exist_ok=True)
     for _ in range(100):
         jid = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
-        if not os.path.exists(os.path.join(library, jid)):
-            return jid
+        try:
+            os.mkdir(os.path.join(library, jid))
+        except FileExistsError:
+            continue
+        return jid
     raise RuntimeError("ジョブID を確保できません")
 
 
@@ -156,6 +169,12 @@ class Job:
         d["output_size_bytes"] = (
             os.path.getsize(self.output) if os.path.exists(self.output) else 0
         )
+        # 素通しの区間数は、完成品を受け取る前に見えていないと意味がない。
+        # 「完了・ダウンロード」しか語らない画面だと、モザイクが1つも
+        # 乗っていない区間があることに誰も気づけない。
+        # 数字は _merge_report が meta に入れてある（レポートは読み直さない）
+        d["n_uncovered_ranges"] = self.meta.get("n_uncovered_ranges")
+        d["n_estimated_only_ranges"] = self.meta.get("n_estimated_only_ranges")
         return d
 
 
@@ -210,9 +229,9 @@ class Library:
         アップロードは数 GB になる。ここでファイル本体を受け取る形にすると
         メモリに載せる実装を誘発するので、置き場だけ作って返す。
         """
+        # new_job_id がディレクトリごと確保して返す。ここで作り直さない
         jid = new_job_id(self.root)
         d = os.path.join(self.root, jid)
-        os.makedirs(d, exist_ok=False)
         job = Job(
             id=jid,
             dir=d,
@@ -227,7 +246,14 @@ class Library:
                 "progress": {},
             },
         )
-        job.save()
+        try:
+            job.save()
+        except OSError:
+            # meta.json を書けなかったディレクトリは、一覧にも出ず消せもしない
+            # 孤児になる（list は meta の無いものを読み飛ばし、get は 404）。
+            # 確保しただけのものは、ここで片付けてから投げる
+            shutil.rmtree(d, ignore_errors=True)
+            raise
         return job
 
     def delete(self, job_id: str) -> None:
@@ -270,6 +296,24 @@ def count_corrections(job: Job) -> int:
         return 0
 
 
+def detections_complete(path: str) -> bool | None:
+    """検出結果 JSON が最後まで終わっているか。読めなければ None。
+
+    `--checkpoint-every` が書く途中保存には `complete: false` が入っている。
+    これを `--reuse-detections` に渡すと、cli.py がエラーで止める（止めないと
+    後半が丸ごと未検出のまま焼かれ、素通しの完成品が正常終了として出てくる）。
+    Web から押した操作がその場で失敗しないよう、渡す前にこちらで見分ける。
+
+    `complete` が無い古い形式は、cli.py と同じく完了扱いにする。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return d.get("complete", True) is not False
+
+
 def pid_alive(pid: int | None) -> bool:
     """プロセスが生きているか。サーバ再起動後の状態復元に使う。
 
@@ -300,6 +344,28 @@ def pid_alive(pid: int | None) -> bool:
     except OSError:
         return False
     return True
+
+
+def running_pid(job: Job) -> int | None:
+    """このジョブを処理しているプロセスの pid。走っていなければ None。
+
+    走っているかどうかの唯一の根拠は meta.json の pid と、その pid が
+    実在するかどうか。サーバのメモリ上のレジストリはサーバを再起動すると
+    空になるが、サブプロセスは生き残る（RunnerRegistry.shutdown を見よ）。
+    レジストリだけを見て二重起動を弾いていると、再起動をまたいだ瞬間に
+    同じ output.mp4 へ2本が書き込む状態を作れてしまう。
+
+    死んだプロセスの pid には pid_alive が False を返すので、落ちたサーバの
+    残骸でジョブが永久に起動できなくなることはない。
+    """
+    pid = job.meta.get("pid")
+    if not pid:
+        return None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid_alive(pid) else None
 
 
 def settle(job: Job) -> bool:

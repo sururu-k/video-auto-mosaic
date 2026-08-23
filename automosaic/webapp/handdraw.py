@@ -45,6 +45,21 @@ def _tool():
     return _tool_mod
 
 
+# ジョブごとの書き込み鍵。打点の保存は「読んで・足して・書く」なので、
+# 鍵が無いと同時操作（別タブ・PC と携帯）で片方の打点が黙って消える。
+# しかも消えたほうも 200 を返すので、画面からは気づけない。
+_job_locks: dict[str, threading.Lock] = {}
+_job_locks_guard = threading.Lock()
+
+
+def _lock_for(job: Job) -> threading.Lock:
+    with _job_locks_guard:
+        lk = _job_locks.get(job.id)
+        if lk is None:
+            lk = _job_locks[job.id] = threading.Lock()
+        return lk
+
+
 def load(job: Job) -> list[dict]:
     """打点の一覧。フレーム順。"""
     try:
@@ -61,7 +76,9 @@ def load(job: Job) -> list[dict]:
 
 def save(job: Job, items: list[dict]) -> None:
     items = sorted(items, key=lambda a: int(a["frame"]))
-    tmp = job.annotations + ".tmp"
+    # 一時ファイルの名前は書き手ごとに分ける。同じ名前を使うと、同時に
+    # 書いた片方がもう片方の書きかけを置き換えて中身が混ざる
+    tmp = f"{job.annotations}.{os.getpid()}.{threading.get_ident()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"annotations": items}, f, ensure_ascii=False, indent=1)
     os.replace(tmp, job.annotations)
@@ -75,19 +92,24 @@ def put(job: Job, frame: int, box, cls: str | None) -> list[dict]:
     決まらない。置き直しは上書きにする。
     box が None なら「ここには無い」の意味で、そこで補間が止まる。
     """
-    items = [a for a in load(job) if int(a["frame"]) != int(frame)]
-    entry: dict = {"frame": int(frame), "box": None if box is None else [float(v) for v in box]}
-    if cls:
-        entry["class"] = cls
-    items.append(entry)
-    save(job, items)
-    return items
+    with _lock_for(job):
+        items = [a for a in load(job) if int(a["frame"]) != int(frame)]
+        entry: dict = {
+            "frame": int(frame),
+            "box": None if box is None else [float(v) for v in box],
+        }
+        if cls:
+            entry["class"] = cls
+        items.append(entry)
+        save(job, items)
+        return items
 
 
 def delete(job: Job, frame: int) -> list[dict]:
-    items = [a for a in load(job) if int(a["frame"]) != int(frame)]
-    save(job, items)
-    return items
+    with _lock_for(job):
+        items = [a for a in load(job) if int(a["frame"]) != int(frame)]
+        save(job, items)
+        return items
 
 
 def expand(
@@ -95,15 +117,28 @@ def expand(
     max_interp: int = 20,
     hold: int = 4,
     default_class: str | None = None,
-    merge: bool = False,
+    merge: bool = True,
 ) -> dict:
     """打点を補間して corrections.json に展開する。
 
-    既定は置き換え。手描きの打点を編集し直すたびに追記していくと、
-    消したはずの位置の矩形が corrections に残り続けて取れなくなる。
-    自動検出の結果に手描きを足したい場合だけ merge=True にする。
+    既定は「既存の手修正に足す」。以前は置き換えを既定にしていたが、
+    検査キューで積んだ修正（漏れを塞いだ矩形、狭めた矩形、誤検知の打ち消し）が
+    手描きを一度使うだけで全部消えていた。1周ぶんの目視検査が無駄になる。
+
+    しかも置き換えは corrections.json だけを書き換えて .progress.json の
+    history を残すので、次の「ひとつ戻す」が存在しない修正を指して別物を削る。
+    置き換えたい場合は、呼び出し側で履歴も一緒に捨てること。
+
+    手描きの打点を編集し直すたびに追記されるのは merge の副作用だが、
+    打点の編集は draw 画面の annotations 側で行うので、そちらを直せば済む。
     """
     tool = _tool()
+    with _lock_for(job):
+        return _expand_locked(job, tool, max_interp, hold, default_class, merge)
+
+
+def _expand_locked(job, tool, max_interp, hold, default_class, merge) -> dict:
+    """expand の本体。打点の書き込みと同じ鍵の内側で動かす。"""
     items = load(job)
     cls = default_class or tool.DEFAULT_CLASS
     built = tool.build(items, max_interp, cls, hold)

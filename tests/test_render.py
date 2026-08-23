@@ -353,12 +353,43 @@ def test_high_score_single_frame_survives():
     print("  高スコア単発の残存 OK")
 
 
-def test_geometric_filter_drops_huge_boxes():
-    dets = {0: [Detection("FEMALE_GENITALIA_EXPOSED", 0.9, (0, 0, 640, 480))]}
+def test_geometric_filter_keeps_large_boxes():
+    """max_area_ratio を超える検出でも、位置の情報を持つ限り捨てられないこと。
+
+    以前は「大きい検出を落とす」テストだったが、実際には max_area_ratio を
+    いくつに変えても（0.35 でも 0.99 でも 0.0=無効でも）drop_area_ratio の
+    既定 1.0 が先に効いて常に1件落ちており、max_area_ratio の指定は無意味
+    だった（テスト名と実態が乖離）。再監査で drop_area_ratio の既定を
+    無効(0)に変えたので、いまは max_area_ratio だけを見るテストになる。
+    """
+    dets = {0: [Detection("FEMALE_GENITALIA_EXPOSED", 0.9, (10, 10, 600, 460))]}
     cfg = TemporalConfig(max_area_ratio=0.35)
     _, stats = process(dets, 1, 640, 480, {"FEMALE_GENITALIA_EXPOSED"}, cfg)
-    assert stats["geometric_dropped"] == 1
-    print("  幾何フィルタ OK")
+    assert stats["geometric_dropped"] == 0, "大きいだけの検出が落とされている"
+    assert stats["oversized_kept"] == 1
+    print("  幾何フィルタ: 大面積検出は残る OK")
+
+
+def test_geometric_filter_full_closeup_coverage_is_not_zero():
+    """全編ドアップ（検出が毎フレーム画面全体を覆う）でも被覆が 0 にならないこと。
+
+    検出器は box をフレームにクランプせず外接矩形を出すので、画面ぴったりの
+    矩形は可視面積比がちょうど 1.0 になる。以前の既定 drop_area_ratio=1.0 は
+    これを「フレーム全体を覆う＝位置情報が無い」として捨てており、全編ドアップの
+    素材で被覆が 60/60 -> 0/60 まで落ちていた。全面ドアップは「いちばん塞ぐべき
+    場面」なので、全画面がモザイクになるのが正しい出力。
+    """
+    dets = {
+        f: [Detection("FEMALE_GENITALIA_EXPOSED", 0.9, (0, 0, 640, 480))]
+        for f in range(60)
+    }
+    cfg = TemporalConfig()
+    _, stats = process(dets, 60, 640, 480, {"FEMALE_GENITALIA_EXPOSED"}, cfg)
+    assert stats["frames_with_mosaic"] == 60, (
+        f"全編ドアップで被覆が {stats['frames_with_mosaic']}/60 に落ちている"
+    )
+    assert stats["geometric_dropped"] == 0
+    print("  幾何フィルタ: 全面ドアップでも被覆0にならない OK")
 
 
 def test_margin_expands_region():

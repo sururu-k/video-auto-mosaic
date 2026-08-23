@@ -1,10 +1,20 @@
 """時間方向の安定化。
 
-処理順は docs/01-technical-design.md の通り:
-    幾何フィルタ -> トラッキング -> デスパイク -> 補間 -> frame memory -> 膨張
+実装の処理順（process() の呼び出し順がこれ）:
+    幾何フィルタ -> トラッキング -> 結合 -> デスパイク
+    -> 補間 + frame memory -> 橋渡し -> 膨張
 
-「デスパイクは補間より先」が重要。順序を逆にすると、一瞬の誤検出が補間で
-長い区間に引き伸ばされる。
+docs/01-technical-design.md の設計は「幾何フィルタ -> トラッキング -> デスパイク
+-> 補間」の4段で、結合と橋渡しは後から足した段。位置は上の通り。
+
+順序で効いているのは2つ。
+
+「デスパイクは補間より先」。順序を逆にすると、一瞬の誤検出が補間で長い区間に
+引き伸ばされる。
+
+「結合はデスパイクより先」。逆にすると、単発の弱い検出が「短命かつ低スコア」
+として先に捨てられ、結合処理がそれを見る前に消える。実素材で、位置が15pxしか
+離れていない検出が繋がらずに1.8秒の穴になっていた。
 
 バッチ処理なので未来フレームも使える。前後どちらにも検出があるフレームは
 必ず埋められるため、単発〜数フレームの検出漏れは構造的にゼロにできる。
@@ -91,7 +101,22 @@ class TemporalConfig:
     despike_conf: float = 0.35 # 最大スコアがこれ未満の短いトラックだけ落とす
     track_min_peak: float = 0.0  # トラック内の最大スコアがこれ未満なら丸ごと捨てる（0で無効）
     min_area_ratio: float = 0.0000  # フレーム面積比の下限（0で無効）
-    max_area_ratio: float = 0.35    # これを超える検出は誤検出とみなす
+    # フレーム面積比がこれを超える検出は「大きすぎる」として数える。捨てはしない。
+    # 以前はここで捨てていたが、接写や全画面のアップは「大きく映っている＝いちばん
+    # 塞ぐべき」場面で、実測で比 0.36 の検出が全フレーム落ちて被覆 0 になっていた。
+    # 塗り過ぎは許容できるが漏れは許容できないので、捨てずに残して件数だけ報告する。
+    max_area_ratio: float = 0.35
+    # フレームをまるごと覆う検出を捨てる比の閾値（0で無効）。既定は無効。
+    # 「見えている面積で比を計算する」に変えた副作用で、画面を覆い切る矩形は
+    # 位置に関わらずすべて visible_ratio が厳密に 1.0 に潰れるようになった
+    # （検出器は box をフレームにクランプせず外接矩形を出すので、四方どこにはみ
+    # 出していても 1.0 になる）。全面ドアップは「いちばん塞ぐべき場面」であり、
+    # 全画面がモザイクになるのは正しい出力。誤検出が画面全体を覆っても塗り過ぎ側
+    # （許容できる）に倒れるだけなので、既定では捨てない。実測で全編ドアップの
+    # 動画が 60/60 -> 0/60 まで落ちるのを確認して既定を無効に変えた。
+    # 値そのものは残してあるので、位置情報を持たない矩形を明示的に弾きたい
+    # 特殊な用途があれば 1.0 などを指定すればよい。
+    drop_area_ratio: float = 0.0
     margin_scale: float = 1.0    # 膨張マージン全体の倍率
     jpeg_margin: int = 4         # 圧縮アーティファクトの染み出し対策
     base_ratio: float = 0.15     # 基礎マージン = sqrt(面積) * この比
@@ -132,25 +157,70 @@ def geometric_filter(
     frame_w: int,
     frame_h: int,
     cfg: TemporalConfig,
-) -> tuple[dict[int, list[Detection]], int]:
-    """ありえない大きさの検出を落とす。落とした件数も返す。"""
+) -> tuple[dict[int, list[Detection]], int, int]:
+    """ありえない大きさの検出を落とす。落とした件数と、大きすぎた件数も返す。
+
+    落とすのは次の2つだけ。どちらも「塞ぐ範囲を決められない」もの。
+      - 幅か高さが 1px 以下（面積ゼロで塗りようがない）
+      - 生の面積比が min_area_ratio 未満（既定0で無効。検出器のノイズ由来の
+        極小矩形を想定）
+      - フレームをまるごと覆う（drop_area_ratio。既定0で無効。位置の情報が無い）
+
+    max_area_ratio を超えるだけの検出は落とさない。大きく映っている場面ほど
+    塞ぐべきなので、ここで捨てると漏れる側に外れる。件数だけ数えて返す。
+
+    min_area_ratio は「見えている面積」でなく矩形そのものの生の面積比で見る。
+    可視面積で判定すると、対象自体は十分な大きさでも画面端に来た瞬間に比が
+    縮んで「小さすぎる」として捨てられる方向に倒れる（漏れる側）。実測で
+    (600,440,200,200)（右下にはみ出し）が生の比0.13・可視比0.005になり、
+    min_area_ratio=0.01 では可視比だと drop・生の比なら keep だった。
+    対象の実サイズをそのまま評価するため生の面積を使う。
+
+    drop_area_ratio（フレーム全体を覆っているかの判定）は逆に「はみ出した分を
+    除いた実際に見えている面積」で見る。はみ出した矩形の生の面積で判定すると、
+    画面の一部しか覆っていない検出まで比 1.0 超と数えられて捨てられてしまう。
+
+    戻り値: (残した検出, 落とした件数, 大きすぎた件数)
+    """
     frame_area = float(frame_w * frame_h)
     out: dict[int, list[Detection]] = {}
     dropped = 0
+    oversized = 0
     for f, dets in per_frame.items():
         kept = []
         for d in dets:
-            area = d.box[2] * d.box[3]
-            ratio = area / frame_area if frame_area else 0.0
-            if ratio > cfg.max_area_ratio or ratio < cfg.min_area_ratio:
-                dropped += 1
-                continue
             if d.box[2] <= 1 or d.box[3] <= 1:
                 dropped += 1
                 continue
+            raw_ratio = (
+                (float(d.box[2]) * float(d.box[3])) / frame_area if frame_area else 0.0
+            )
+            if raw_ratio < cfg.min_area_ratio:
+                dropped += 1
+                continue
+            visible_ratio = _visible_ratio(d.box, frame_w, frame_h) if frame_area else 0.0
+            if cfg.drop_area_ratio > 0 and visible_ratio >= cfg.drop_area_ratio:
+                dropped += 1
+                continue
+            if cfg.max_area_ratio > 0 and visible_ratio > cfg.max_area_ratio:
+                oversized += 1
             kept.append(d)
         out[f] = kept
-    return out, dropped
+    return out, dropped, oversized
+
+
+def _visible_ratio(box: Box, frame_w: int, frame_h: int) -> float:
+    """矩形のうちフレーム内に入っている面積の、フレーム面積に対する比。"""
+    frame_area = float(frame_w * frame_h)
+    if frame_area <= 0:
+        return 0.0
+    x0 = max(0.0, float(box[0]))
+    y0 = max(0.0, float(box[1]))
+    x1 = min(float(frame_w), float(box[0]) + float(box[2]))
+    y1 = min(float(frame_h), float(box[1]) + float(box[3]))
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0) / frame_area
 
 
 def _assign(cost: list[list[float]], max_cost: float) -> list[tuple[int, int]]:
@@ -650,7 +720,9 @@ def process(
     filtered = filter_classes(per_frame_dets, classes)
     n_raw = sum(len(v) for v in filtered.values())
 
-    filtered, n_geo_dropped = geometric_filter(filtered, frame_w, frame_h, cfg)
+    filtered, n_geo_dropped, n_oversized = geometric_filter(
+        filtered, frame_w, frame_h, cfg
+    )
     tracks = build_tracks(filtered, n_frames, cfg)
     n_tracks_before = len(tracks)
     # 結合を先に、デスパイクを後に行う。順序が逆だと、単発の低スコア検出が
@@ -690,6 +762,7 @@ def process(
         "frames": n_frames,
         "raw_detections": n_raw,
         "geometric_dropped": n_geo_dropped,
+        "oversized_kept": n_oversized,
         "tracks_before_despike": n_tracks_before,
         "tracks_despiked": n_despiked,
         "tracks_stitched": n_stitched,
@@ -707,17 +780,78 @@ def process(
     return out, stats
 
 
+def _infer_frame_step(
+    regions_per_frame: dict[int, list[tuple[Box, Region]]], n_frames: int
+) -> int:
+    """実観測（source=="detected"）フレームの間隔から、検出のサンプリング刻みを推す。
+
+    --frame-step N で間引き検出した素材は、実観測が N フレームおきにしか無い。
+    その隙間は「検出器が働いていない」のではなく、そもそも検出していないだけ
+    なので、estimated_only_ranges から見ると N-1 フレームの推定区間が構造的に
+    大量発生する。これはノイズであって漏れの情報を持たない。
+
+    間隔は「複数回現れて初めて信用する」。1回しか現れない間隔は、たまたま
+    実観測が離れて出ただけ（本物の検出漏れ）の可能性が高く、それを間引きの
+    刻みとして扱うと本物の短い漏れを握りつぶしてしまう（漏れる側に外れる）。
+    そのため2回以上現れる間隔の最小値だけを刻みとみなし、無ければ 1
+    （＝間引きなし・フィルタしない）を返す。
+
+    実測（data/bench3, 55303フレーム, 5フレーム刻み検出）: 実観測間隔の内訳は
+    5(10800件) / 10(55件) / 15(16件) / それ以外少数、最小の再現間隔は 5 で
+    実際の --frame-step と一致した。
+    """
+    frames = sorted(
+        f
+        for f in range(n_frames)
+        if any(r.source == "detected" for _, r in regions_per_frame.get(f, []))
+    )
+    if len(frames) < 2:
+        return 1
+    counts: dict[int, int] = {}
+    for a, b in zip(frames, frames[1:]):
+        d = b - a
+        if d > 0:
+            counts[d] = counts.get(d, 0) + 1
+    repeated = [d for d, c in counts.items() if c >= 2]
+    return min(repeated) if repeated else 1
+
+
 def estimated_only_ranges(
     regions_per_frame: dict[int, list[tuple[Box, Region]]],
     n_frames: int,
-    min_len: int = 5,
+    min_len: int = 1,
+    frame_step: int = 0,
 ) -> list[tuple[int, int, float]]:
     """実観測が1つも無く、推定だけで覆っているフレームの連続区間。
 
     ここは検出器が実際に効いていない区間で、モザイクの位置は当てずっぽうに近い。
     自動処理の限界がそのまま出るので、人手レビューの最優先対象になる。
     戻り値は (開始, 終了, 区間内の最大 hold)。
+
+    min_len は既定で1、つまり1フレームでも報告から落とさない。以前の既定5では
+    2〜4フレームの区間がまるごと消えていたが、実素材では漏れが 0.2 秒（数フレーム）
+    の粒度で出入りするので、そこが見えないと意味がない。報告から消える方向は
+    見逃す方向なので、短い区間ほど落としてはいけない。
+
+    ただし --frame-step > 1 で間引き検出した素材では、min_len を単純に1に
+    固定すると別の問題が出る。実観測どうしの間が構造的に N-1 フレーム空くため、
+    その間引きの穴そのものが「推定のみ区間」として大量に報告され、本物の漏れが
+    ノイズに埋もれる（実測: bench3 で min_len=1 だと 3524 区間のうち 2399 件が
+    ちょうど間引き幅ぶんの4フレーム区間だった）。
+
+    frame_step はここでは呼び出し側から渡さず（既定0）、regions_per_frame の
+    実観測間隔から自動推定する。呼び出し元（cli.py 等）はこの関数を
+    `estimated_only_ranges(regions, n_frames)` の2引数でしか呼んでおらず、
+    そちらを触らずに直すためにシグネチャは後方互換を保ったまま、既定引数で
+    自動推定を「吸収」している。明示的に frame_step を渡した場合はそちらを使う。
+
+    実効的な最小長は max(min_len, 推定frame_step)。間引きなし（frame_step=1）の
+    素材では従来どおり min_len=1 のまま全区間が報告される。
     """
+    if frame_step <= 0:
+        frame_step = _infer_frame_step(regions_per_frame, n_frames)
+    effective_min_len = max(min_len, frame_step)
+
     out: list[tuple[int, int, float]] = []
     start = None
     peak = 0
@@ -729,10 +863,10 @@ def estimated_only_ranges(
                 start, peak = f, 0
             peak = max(peak, max((r.hold for _, r in regs), default=0))
         else:
-            if start is not None and f - start >= min_len:
+            if start is not None and f - start >= effective_min_len:
                 out.append((start, f - 1, peak))
             start = None
-    if start is not None and n_frames - start >= min_len:
+    if start is not None and n_frames - start >= effective_min_len:
         out.append((start, n_frames - 1, peak))
     return out
 

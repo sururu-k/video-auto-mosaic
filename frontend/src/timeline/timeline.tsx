@@ -14,6 +14,7 @@ import type { Box, Correction, CorrectionsPayload, FrameRange, StateFull, Update
 import { drawRegionOverlay, drawTimelineBand } from "../shared/canvas-draw.js";
 import { frameFromClient } from "../shared/geom.js";
 import type { FramePoint } from "../shared/geom.js";
+import { correctionsAfterDrop } from "../shared/review-logic.js";
 import { errText, url as u } from "../shared/review-net.js";
 
 interface SaveStatus {
@@ -277,16 +278,22 @@ function App() {
   function deleteUnderCursor() {
     const m = mouse.current;
     if (!m) return;
-    // 後ろから見て最初に当たった1件だけ消す（corrections.remove_at と同じ規則）
+    // 後ろから見て最初に当たった1件を選ぶ（corrections.remove_at と同じ規則）。
+    // 実際に落とす件数は correctionsAfterDrop が決める。「でかすぎる」が積んだ
+    // remove+add の組を割ると、そのフレームが素通しになる
     const at = curRef.current;
     for (let i = corrections.length - 1; i >= 0; i--) {
       const c = corrections[i]!;
       if (c.frame !== at) continue;
       const [x, y, w, h] = c.box;
       if (m[0] >= x && m[0] <= x + w && m[1] >= y && m[1] <= y + h) {
-        const next = corrections.slice();
-        next.splice(i, 1);
-        setHint(`frame ${at} の手修正を1件消しました`);
+        const next = correctionsAfterDrop(corrections, [i]);
+        const n = corrections.length - next.length;
+        setHint(
+          n > 1
+            ? `frame ${at} の手修正を ${n} 件消しました（組で積まれたものは組で取り消します）`
+            : `frame ${at} の手修正を1件消しました`,
+        );
         void pushCorrections(next);
         return;
       }
@@ -296,7 +303,10 @@ function App() {
 
   function undoLast() {
     if (!corrections.length) return;
-    void pushCorrections(corrections.slice(0, -1));
+    const next = correctionsAfterDrop(corrections, [corrections.length - 1]);
+    const n = corrections.length - next.length;
+    if (n > 1) setHint(`手修正を ${n} 件取り消しました（組で積まれたものは組で取り消します）`);
+    void pushCorrections(next);
   }
 
   function nextEstimatedRange() {

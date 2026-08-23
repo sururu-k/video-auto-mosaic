@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 .venv-export/
+.venv-mmdet/
 venv/
 
 # 素材・データセットは絶対にコミットしない

@@ -4,7 +4,7 @@
 // 消える」類の事故になるため。node から直接動かして確かめられる状態を保つ。
 // tests/test_frontend.mjs がこの中身をそのまま叩いている。
 
-import type { Progress, Region, Verdict } from "./api.js";
+import type { Correction, Progress, Region, Verdict } from "./api.js";
 
 /** 位置指定モードの種類。add=漏れを塞ぐ shrink=塗り過ぎを狭める erase=誤検知を消す */
 export type MarkMode = "add" | "shrink" | "erase";
@@ -195,6 +195,62 @@ export function eraseSummary(
 }
 
 /**
+ * i 番の手修正と組になっている番号。組でなければ null。
+ *
+ * 検査キューの「でかすぎる」（toobig）は、1フレームにつき
+ * remove（自動領域を打ち消す）と add（代わりに残す範囲）を、必ずこの順で
+ * 隣り合わせに積む。review.py の ReviewSession.mark() がそう書いている。
+ */
+function pairPartner(items: readonly Correction[], i: number): number | null {
+  const c = items[i];
+  if (!c) return null;
+  if (c.kind === "add") {
+    const prev = items[i - 1];
+    return prev && prev.kind === "remove" && prev.frame === c.frame ? i - 1 : null;
+  }
+  const next = items[i + 1];
+  return next && next.kind === "add" && next.frame === c.frame ? i + 1 : null;
+}
+
+/**
+ * 指定した番号の手修正を落とした一覧を返す。組で積まれたものは組で落とす。
+ *
+ * 素直に1件だけ消すと壊れる。組の末尾は add なので、末尾から1件消すと
+ * remove だけが残り、そのフレームは自動領域が打ち消されたまま手修正も無い
+ * **完全な素通し**になる。モザイクが漏れる方向の壊れ方なので、
+ * 「消しすぎる（＝モザイクが増える）」側へ倒す。
+ *
+ * 隣接の組を辿ったうえで、そのフレームから add が全部消えるなら残った
+ * remove も落とす。組で積まれていない remove（誤検知の判定が置くもの）が
+ * 巻き添えで残るのを防ぐための最後の砦。
+ */
+export function correctionsAfterDrop(
+  items: readonly Correction[],
+  drop: readonly number[],
+): Correction[] {
+  const gone = new Set<number>();
+  for (const i of drop) {
+    if (i < 0 || i >= items.length) continue;
+    gone.add(i);
+    const p = pairPartner(items, i);
+    if (p !== null) gone.add(p);
+  }
+  if (!gone.size) return items.slice();
+
+  const frames = new Set<number>();
+  for (const i of gone) frames.add(items[i]!.frame);
+  for (const f of frames) {
+    const hadAdd = items.some((c) => c.frame === f && c.kind === "add");
+    const rest = items.filter((c, i) => c.frame === f && !gone.has(i));
+    if (!hadAdd || !rest.length || rest.some((c) => c.kind === "add")) continue;
+    items.forEach((c, i) => {
+      if (c.frame === f) gone.add(i);
+    });
+  }
+  return items.filter((_, i) => !gone.has(i));
+}
+
+/**
  * from から後ろへ探して最初の未判定。無ければ先頭から from の手前まで。
  * どちらにも無ければ「全部見終わった」を指す位置（items.length）。
  */
@@ -222,6 +278,20 @@ export function spanOptions(step: number): SpanOption[] {
     { v: step, label: `前後 ${step}` },
     { v: step * 3, label: `前後 ${step * 3}` },
   ];
+}
+
+/**
+ * 入力欄の値を数として読む。空欄や数でない文字は既定値に倒す。
+ *
+ * `Number(v) || 0` と書くと空欄が 0 になる。hold（打点の後ろに持たせる
+ * フレーム数）でそれをやると、打点の後ろのモザイクが黙って消える。
+ * `Number(v) || 既定` と書くと、今度は 0 を入れたつもりが既定に化ける。
+ */
+export function numOr(v: string, fallback: number): number {
+  const t = v.trim();
+  if (t === "") return fallback;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 /** 進捗バーの割合 (%) */

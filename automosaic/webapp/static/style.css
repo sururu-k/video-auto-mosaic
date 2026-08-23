@@ -81,6 +81,8 @@ input[type=range] { padding: 0; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; }
 .dim { color: var(--dim); }
+/* 素通しの区間があることを、地の文に埋もれさせない */
+.warn { color: var(--warn); }
 .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
 .hidden { display: none !important; }
 

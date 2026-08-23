@@ -13,7 +13,7 @@ import type { Annotation, AnnotationsPayload, ExpandResponse, StateLight } from 
 import { drawHandOverlay } from "../shared/canvas-draw.js";
 import { normFromClient, scaledSize, tapToBox } from "../shared/geom.js";
 import type { NormPoint } from "../shared/geom.js";
-import { requestWidth } from "../shared/review-logic.js";
+import { numOr, requestWidth } from "../shared/review-logic.js";
 import { api, errText, link, url } from "../shared/webapp-net.js";
 
 const JOB = location.pathname.split("/").pop() ?? "";
@@ -37,7 +37,10 @@ function App() {
   const [stride, setStride] = useState("10");
   const [maxInterp, setMaxInterp] = useState("20");
   const [hold, setHold] = useState("4");
-  const [merge, setMerge] = useState(false);
+  // 既定は「既存の手修正に足す」。切ると展開が置き換えになり、検査キューで
+  // 積んだ修正（漏れを塞いだ矩形・狭めた矩形・誤検知の打ち消し）が手描きを
+  // 一度使うだけで全部消える。handdraw.expand の既定と揃えてある
+  const [merge, setMerge] = useState(true);
   const [expandMsg, setExpandMsg] = useState("");
   const [banner, setBanner] = useState("好きなフレームで画像をタップすると、そこに矩形を置きます");
   const [save, setSave] = useState<SaveState>({ kind: "ok", text: "-" });
@@ -50,7 +53,7 @@ function App() {
   const boxSize = state ? scaledSize(state.default_size, sizePct) : ([64, 64] as [number, number]);
   const pending = tap && state ? tapToBox(tap, boxSize, state.width, state.height) : null;
   const placed = points.find((p) => p.frame === frame) ?? null;
-  const strideN = Math.max(1, Number(stride) || 10);
+  const strideN = Math.max(1, numOr(stride, 10));
 
   useEffect(() => {
     void (async () => {
@@ -268,8 +271,10 @@ function App() {
                         try {
                           const d = await api<ExpandResponse>(API + "/annotations/expand", {
                             json: {
-                              max_interp: Number(maxInterp) || 20,
-                              hold: Number(hold) || 0,
+                              max_interp: numOr(maxInterp, 20),
+                              // 空欄を 0 と読まない。0 だと打点の後ろの
+                              // モザイクが黙って消える（漏れる方向）
+                              hold: numOr(hold, 4),
                               class: cls,
                               merge,
                             },
