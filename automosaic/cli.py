@@ -28,7 +28,13 @@ from .detector import (
 )
 from . import corrections as corr
 from .render import FrameBuffer, apply_regions, default_block_size
-from .temporal import TemporalConfig, estimated_only_ranges, process, review_flags
+from .temporal import (
+    TemporalConfig,
+    estimated_only_ranges,
+    process,
+    review_flags,
+    uncovered_ranges,
+)
 from . import video as vid
 
 
@@ -1032,6 +1038,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
         elif not args.quiet:
             print(f"手修正ファイルに項目がありません: {args.corrections}")
+
+    # issue #4: 「素通しの区間」は corr.apply() 済みの regions から数え直す。
+    # ここより上で left_open に入れていた stats["_left_open"] は corr.apply() を
+    # 通す前の値で、add で埋まった区間も remove で空になった区間も反映されない
+    # （bare remove だけの手修正が「誤検知」判定の通常操作としてこの壊れ方に
+    # 到達する）。手修正が無い場合も regions は process() の出力そのものなので
+    # 結果は変わらない。以降の表示・レポートは必ずこの left_open を使うこと。
+    left_open = uncovered_ranges(regions, n_frames)
 
     covered = stats["frames_with_mosaic"]
     coverage_pct = 100.0 * covered / n_frames

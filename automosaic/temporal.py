@@ -831,6 +831,42 @@ def _infer_frame_step(
     return min(repeated) if repeated else 1
 
 
+def uncovered_ranges(
+    regions_per_frame: dict[int, list[tuple[Box, "Region"]]],
+    n_frames: int,
+) -> list[tuple[int, int]]:
+    """最終的な regions を数え直して、領域が1つも無いフレームの連続区間を返す。
+
+    issue #4: `bridge_uncovered()` が返す left_open は `corr.apply()` を通す前の
+    値であり、その後 add/remove の手修正で regions が書き換わっても反映されない。
+    「誤検知」判定は add を伴わない bare remove を置く操作なので、これで自動領域
+    だけが残っていたフレームが空になっても left_open には現れず、安全表示
+    （素通しの区間 N 件）が 0 件のまま嘘をつく（実測: remove 対象の10フレームが
+    実際は素通しなのに n_uncovered_ranges=0 と表示された）。
+
+    ここでは corr.apply() 済みの regions_per_frame を直接見て空フレームを
+    数え直すので、add で埋まった分は正しく除外され、remove で空になった分は
+    正しく検出される。呼び出し側（cli.py）は手修正の有無に関わらず、
+    ここで数え直した結果だけを「素通しの区間」として表示・レポートすること。
+
+    戻り値の (start, end) は bridge_uncovered() の left_open と同じ半開区間
+    （[start, end)）。手修正が無ければ left_open と同じ結果になる。
+    """
+    out: list[tuple[int, int]] = []
+    start = None
+    for f in range(n_frames):
+        if regions_per_frame.get(f):
+            if start is not None:
+                out.append((start, f))
+                start = None
+        else:
+            if start is None:
+                start = f
+    if start is not None:
+        out.append((start, n_frames))
+    return out
+
+
 def estimated_only_ranges(
     regions_per_frame: dict[int, list[tuple[Box, Region]]],
     n_frames: int,
