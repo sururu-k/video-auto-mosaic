@@ -13,7 +13,7 @@ from automosaic.render import (  # noqa: E402
     default_block_size,
     pixelize_plane,
 )
-from automosaic.detector import Detection  # noqa: E402
+from automosaic.detector import Detection, budget_net_size  # noqa: E402
 from automosaic.temporal import TemporalConfig, process  # noqa: E402
 
 
@@ -415,6 +415,84 @@ def test_estimated_regions_get_thicker_margin():
     interpolated_w = regions[2][0][0][2]
     assert interpolated_w > detected_w
     print(f"  推定領域の厚盛り OK ({detected_w:.0f} -> {interpolated_w:.0f})")
+
+
+def test_budget_net_size_avoids_square_letterbox_waste():
+    """issue #8: 正方レターボックスは16:9で44%が黒帯。非正方ネット解像度に配分し直す。
+
+    実測（data/bench3/clips, 1920x1080）で使った値をそのまま固定して回帰させる。
+    1920x1080 / infer_size=960 のとき、正方なら 960x960=921,600 画素中
+    960x(960*9/16)=540 の実画像以外(43.75%)が黒帯。非正方なら同じ画素予算
+    (921,600) を縦横比なりに配分でき、無駄はほぼ消える。
+    """
+    net_w, net_h = budget_net_size(1920, 1080, 960)
+    assert (net_w, net_h) == (1280, 736), f"1920x1080/960 の想定と食い違う: {(net_w, net_h)}"
+
+    # ネット解像度は入力の縦横比に近いこと（正方に丸めていないか）
+    net_aspect = net_w / net_h
+    src_aspect = 1920 / 1080
+    assert abs(net_aspect - src_aspect) / src_aspect < 0.03, (
+        f"縦横比が入力からずれすぎている: net={net_aspect:.4f} src={src_aspect:.4f}"
+    )
+
+    # 縦横とも stride(既定32) の倍数であること（YOLO系のダウンサンプル制約）
+    assert net_w % 32 == 0 and net_h % 32 == 0
+
+    # 画素予算(infer_size**2)から大きく外れていないこと（丸めの範囲内）
+    budget = 960 * 960
+    assert abs(net_w * net_h - budget) / budget < 0.05, (
+        f"画素予算から外れすぎている: {net_w * net_h} vs {budget}"
+    )
+
+    # 縦長素材でも縦横が入れ替わって正しく非正方になること
+    vnet_w, vnet_h = budget_net_size(1080, 1920, 960)
+    assert (vnet_w, vnet_h) == (net_h, net_w), "縦長素材で縦横比が正しく反転していない"
+
+    # 4:3 素材でも正方に丸めない（1:1 になってしまうと修正前と同じ黒帯が残る）
+    qnet_w, qnet_h = budget_net_size(640, 480, 960)
+    assert qnet_w != qnet_h, "4:3 素材なのに正方になっている（修正が効いていない）"
+    print(f"  非正方ネット解像度の画素予算 OK (1920x1080/960 -> {net_w}x{net_h})")
+
+
+def test_detect_window_non_square_scales_axes_independently():
+    """_detect_window の非正方経路が実際に縦横で別スケールを使っていること。
+
+    実重みを読み込まずに検証する（weights/ は gitignore 対象で常にあるとは
+    限らない）。Detector.__init__ を経由せず、_infer だけ差し替えた最小の
+    インスタンスに対して実際の _detect_window を呼び、ネット解像度座標系の
+    既知の矩形が窓（フレーム）座標系へ正しく戻ることを確認する。
+    これが通っていないと、旧の正方前提の ratio 一本（side/net）のままになり、
+    非正方フレームで x と y が同じ倍率で伸縮してしまう（=ずれた矩形になる）。
+    """
+    from automosaic.detector import Detector
+
+    det = Detector.__new__(Detector)  # __init__ を経由しない（モデル読み込み無し）
+    det.net_w, det.net_h = 1280, 736
+    det.letterbox = False
+    det.conf = 0.1
+    det.nms_iou = 0.45
+    det.merge_mode = "union"
+
+    # ネット解像度(1280x736)座標系での既知の矩形。x=640(中央), y=368(中央), 128x74
+    canned = [(0, 0.9, (640.0, 368.0, 128.0, 74.0))]
+    det._infer = lambda img: canned  # type: ignore[method-assign]
+
+    # 窓は 1920x1080（decode_box=1280 で decode した実素材相当のサイズ）
+    window = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    out = det._detect_window(window, off_x=0, off_y=0, tta=False)
+    assert len(out) == 1
+    _, score, (x, y, bw, bh) = out[0]
+    assert abs(score - 0.9) < 1e-9
+
+    ratio_x = 1920 / 1280  # = 1.5
+    ratio_y = 1080 / 736  # ≈ 1.467。ratio_x と異なることが非正方の本質
+    assert abs(ratio_x - ratio_y) > 1e-6, "テスト条件が退化している(正方相当)"
+
+    assert abs(x - 640.0 * ratio_x) < 1e-6, f"x が窓座標に正しく戻っていない: {x}"
+    assert abs(y - 368.0 * ratio_y) < 1e-6, f"y が窓座標に正しく戻っていない: {y}"
+    assert abs(bw - 128.0 * ratio_x) < 1e-6
+    assert abs(bh - 74.0 * ratio_y) < 1e-6
+    print("  非正方 _detect_window の縦横独立スケール OK")
 
 
 def test_checkpoint_roundtrip():
