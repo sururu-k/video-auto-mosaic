@@ -74,18 +74,24 @@ QUEUE_REASONS = {
 }
 
 # 判定の種類。
-#   ok      問題なし
-#   fixed   漏れていたので塗る範囲を足した
-#   unsure  判断できない
-#   toobig  塗り過ぎていたので範囲を狭めた（remove + add の組で記録する）
+#   ok              問題なし
+#   fixed           漏れていたので塗る範囲を足した
+#   unsure          判断できない
+#   toobig          塗り過ぎていたので範囲を狭めた（remove + add の組で記録する）
+#   false_positive  そもそも局部ではないところに乗っていたので消した（remove だけ）
 #
 # .progress.json の読み込みはこの並びに無い値を捨てる。増やすぶんには
 # 古い記録がそのまま読めるし、古い版で新しい記録を開いても未知の判定が
 # 落ちるだけで壊れない。順番には意味が無いので末尾に足す。
-VERDICTS = ("ok", "fixed", "unsure", "toobig")
+VERDICTS = ("ok", "fixed", "unsure", "toobig", "false_positive")
 
 # 矩形を置かせる判定。押しただけでは終わらず、位置指定モードに入る
 BOX_VERDICTS = ("fixed", "toobig")
+
+# 自動領域を選ばせる判定。位置ではなく「どれを消すか」を指定させる。
+# BOX_VERDICTS と分けてあるのは、こちらは add を一切置かないため。
+# 同じ扱いにすると「消したのに塗り足す」という逆向きの修正が混ざる。
+PICK_VERDICTS = ("false_positive",)
 
 COOKIE_NAME = "automosaic_t"
 
@@ -725,6 +731,37 @@ def tap_to_box(
     return (round(x, 1), round(y, 1), round(w, 1), round(h, 1))
 
 
+def _iou(a, b) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix0, iy0 = max(ax, bx), max(ay, by)
+    ix1, iy1 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+def best_overlap(box, boxes: list) -> int | None:
+    """box といちばん重なる矩形の位置。1つも重ならなければ None。
+
+    「誤検知」を前後のフレームへ広げるときの対応付けに使う。対象が動くと
+    フレームごとに座標が違うので、同じ番号の領域が同じ対象だとは限らない。
+    重なりで選べば、少なくとも「別物を消す」ことは起きない。
+
+    重なりが 0 のものは選ばない。無関係な領域まで消すくらいなら、その
+    フレームには何も置かないほうが安全側になる。
+    """
+    best, best_iou = None, 0.0
+    for i, b in enumerate(boxes):
+        v = _iou(box, b)
+        if v > best_iou:
+            best, best_iou = i, v
+    return best
+
+
 def cover_box(
     boxes: list, width: int, height: int
 ) -> tuple[float, float, float, float] | None:
@@ -884,6 +921,10 @@ class ReviewSession:
     verdicts: dict = field(init=False, default_factory=dict)
     history: list = field(init=False, default_factory=list)
     version: int = field(init=False, default=0)
+    # 「誤検知」と判定された自動領域。{"frame", "box", "class"} の並び。
+    # corrections.json の remove からは「狭めたのか、そもそも違ったのか」を
+    # 区別できないので、否定の例としてここに別建てで持つ。
+    false_positives: list = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
         self.reader = FrameReader(self.video)
@@ -948,12 +989,27 @@ class ReviewSession:
             with open(self.progress_path, encoding="utf-8") as f:
                 d = json.load(f)
             self.verdicts = {int(k): v for k, v in d.get("verdicts", {}).items() if v in VERDICTS}
+            # fp は「誤検知」を足したときに増えた鍵。古い記録には無いので既定 0。
+            # 無いものを 0 として読めば、旧版が書いた履歴もそのまま戻せる
             self.history = [
-                {"frame": int(h["frame"]), "prev": h.get("prev"), "added": int(h.get("added", 0))}
+                {
+                    "frame": int(h["frame"]),
+                    "prev": h.get("prev"),
+                    "added": int(h.get("added", 0)),
+                    "fp": int(h.get("fp", 0)),
+                }
                 for h in d.get("history", [])
             ]
+            self.false_positives = [
+                {
+                    "frame": int(p["frame"]),
+                    "box": [float(v) for v in p["box"]],
+                    "class": p.get("class", self.default_class),
+                }
+                for p in d.get("false_positives", [])
+            ]
         except Exception:  # noqa: BLE001
-            self.verdicts, self.history = {}, []
+            self.verdicts, self.history, self.false_positives = {}, [], []
 
     def save_progress(self) -> None:
         if not self.progress_path:
@@ -965,6 +1021,7 @@ class ReviewSession:
                     "video": os.path.basename(self.video),
                     "verdicts": {str(k): v for k, v in self.verdicts.items()},
                     "history": self.history,
+                    "false_positives": self.false_positives,
                 },
                 f,
                 ensure_ascii=False,
@@ -990,18 +1047,21 @@ class ReviewSession:
             for b, r in self.regions.get(n, [])
         ]
 
-    def auto_cover_box(self, frame: int) -> tuple[float, float, float, float] | None:
-        """そのフレームの自動領域をまとめて包む矩形。無ければ None。
+    def auto_regions(self, frame: int) -> list:
+        """そのフレームの自動領域。(膨張後の矩形, Region) の組で返す。
 
         手で足した領域は含めない。remove は自動領域だけを落とす実装なので、
-        手修正まで包んで広げても効果は無く、無駄に大きい否定領域が
-        修正ファイルに残るだけになる。
+        手修正まで対象にしても効果が無く、無駄な否定領域が残るだけになる。
+        """
+        return [(b, r) for b, r in self.regions.get(frame, []) if r.source != "manual"]
+
+    def auto_cover_box(self, frame: int) -> tuple[float, float, float, float] | None:
+        """そのフレームの自動領域をまとめて包む矩形。無ければ None。
 
         包むのは膨張後の矩形（実際にモザイクが乗る範囲）。検出そのものの
         矩形で包むと、膨張したぶんの縁が remove から外れて残る。
         """
-        boxes = [b for b, r in self.regions.get(frame, []) if r.source != "manual"]
-        return cover_box(boxes, self.width, self.height)
+        return cover_box([b for b, _ in self.auto_regions(frame)], self.width, self.height)
 
     def regions_payload(self) -> dict:
         out: dict[str, list] = {}
@@ -1023,7 +1083,8 @@ class ReviewSession:
         }
 
     def progress_payload(self) -> dict:
-        counts = {"ok": 0, "fixed": 0, "unsure": 0, "toobig": 0}
+        # 判定の種類から作る。判定を増やしたときに集計だけ落ちるのを防ぐ
+        counts = {v: 0 for v in VERDICTS}
         done = 0
         for it in self.queue:
             v = self.verdicts.get(it["frame"])
@@ -1122,13 +1183,16 @@ class ReviewSession:
         size: tuple[float, float] | None = None,
         span: int = 0,
         cls: str | None = None,
+        pick: list | None = None,
     ) -> int:
         """1フレームの判定を記録する。矩形を伴う判定なら修正も足す。
 
-        fixed  指定範囲を add する。漏れを塞ぐ
-        toobig 自動領域を包む remove と、指定範囲の add を組で置く。
-               remove だけだとそのフレームが素通しになるので、add を必ず伴う。
-               「でかすぎる」は塗る範囲を狭める操作であって、塗らない操作ではない
+        fixed          指定範囲を add する。漏れを塞ぐ
+        toobig         自動領域を包む remove と、指定範囲の add を組で置く。
+                       remove だけだとそのフレームが素通しになるので add を必ず伴う。
+                       「でかすぎる」は塗る範囲を狭める操作であって、塗らない操作ではない
+        false_positive 選ばれた自動領域を包む remove だけを置く。add は置かない。
+                       そこは局部ではなかったのだから、代わりに塗るものが無い
 
         span は前後に何フレーム広げるか。キューは間引いて出しているので、
         1コマだけ直しても隣のコマは元のまま。既定で間引き幅ぶん広げる。
@@ -1144,6 +1208,7 @@ class ReviewSession:
         frame = max(0, min(self.n_frames - 1, int(frame)))
 
         added = 0
+        n_fp = 0
         if verdict in BOX_VERDICTS:
             if tap is None:
                 # toobig で remove だけが残ると、そのフレームは素通しになる。
@@ -1171,18 +1236,99 @@ class ReviewSession:
                     Correction(frame=f, box=box, cls=cls or self.default_class, kind="add")
                 )
                 added += 1
-            self.corrections.video = self.corrections.video or os.path.basename(self.video)
-            self.corrections.width = self.corrections.width or self.width
-            self.corrections.height = self.corrections.height or self.height
-            self.corrections.save(self.corrections_path)
-            self.recompute()
+            self._save_corrections()
+
+        elif verdict in PICK_VERDICTS:
+            added, n_fp = self._mark_false_positive(frame, pick, span, cls)
 
         self.history.append(
-            {"frame": frame, "prev": self.verdicts.get(frame), "added": added}
+            {"frame": frame, "prev": self.verdicts.get(frame), "added": added, "fp": n_fp}
         )
         self.verdicts[frame] = verdict
         self.save_progress()
         return added
+
+    def _save_corrections(self) -> None:
+        """修正一覧をファイルへ書いて、領域を作り直す。
+
+        video/width/height は空のまま保存すると、あとで別の動画の修正と
+        取り違えられる。書き出す直前に埋める。
+        """
+        self.corrections.video = self.corrections.video or os.path.basename(self.video)
+        self.corrections.width = self.corrections.width or self.width
+        self.corrections.height = self.corrections.height or self.height
+        self.corrections.save(self.corrections_path)
+        self.recompute()
+
+    def _mark_false_positive(
+        self, frame: int, pick: list | None, span: int, cls: str | None
+    ) -> tuple[int, int]:
+        """「誤検知」の修正を置く。戻り値は (修正の件数, 否定例の件数)。
+
+        モザイクを消す方向の操作なので、あいまいなら通さない。どの領域を
+        消すのかを利用者が選んだうえでなければ確定させない。全部消すかどうかは
+        画面側で見せるが、サーバでも「選ばれた領域が実在するか」は必ず確かめる。
+
+        span で前後へ広げるときは、選んだ領域と最も重なる領域を各フレームで
+        選び直す。番号で対応付けると、対象が増減した瞬間に無関係な領域を
+        消してしまう。重なる領域が無いフレームには何も置かない。
+        """
+        if not pick:
+            raise ValueError("消す領域が指定されていません")
+
+        here = self.auto_regions(frame)
+        if not here:
+            raise ValueError("このフレームには自動で塗った領域がありません")
+
+        # 画面から届くのは丸めた座標なので、実体の矩形に寄せ直してから使う
+        seeds: list[tuple] = []
+        for p in pick:
+            i = best_overlap(tuple(float(v) for v in p[:4]), [b for b, _ in here])
+            if i is not None and here[i] not in seeds:
+                seeds.append(here[i])
+        if not seeds:
+            raise ValueError("指定された領域が見つかりません")
+
+        added = 0
+        n_fp = 0
+        lo = max(0, frame - max(0, int(span)))
+        hi = min(self.n_frames - 1, frame + max(0, int(span)))
+        for f in range(lo, hi + 1):
+            cands = self.auto_regions(f)
+            boxes = [b for b, _ in cands]
+            taken: list[int] = []
+            for seed_box, _ in seeds:
+                i = best_overlap(seed_box, boxes)
+                if i is not None and i not in taken:
+                    taken.append(i)
+            for i in taken:
+                box, reg = cands[i]
+                cover = cover_box([box], self.width, self.height)
+                if cover is None:
+                    continue
+                # クラスは消される側のものを使う。remove の判定はクラスを見ないが、
+                # 記録としては「何を消したか」が残っていないと後から追えない
+                self.corrections.items.append(
+                    Correction(
+                        frame=f, box=cover, cls=reg.cls or cls or self.default_class, kind="remove"
+                    )
+                )
+                added += 1
+                # 否定例として残すのは検出そのものの矩形。膨張後の矩形で
+                # 覚えると、hard negative に使うときに実際より広い「局部でない
+                # 場所」を教えることになる
+                self.false_positives.append(
+                    {
+                        "frame": f,
+                        "box": [round(float(v), 1) for v in reg.box],
+                        "class": reg.cls or self.default_class,
+                    }
+                )
+                n_fp += 1
+
+        if added:
+            self._save_corrections()
+        return added, n_fp
 
     def undo(self) -> dict | None:
         """直前の判定を取り消す。誤タップを1手で戻せないと画面が信用されない。
@@ -1198,6 +1344,11 @@ class ReviewSession:
             del self.corrections.items[-n:]
             self.corrections.save(self.corrections_path)
             self.recompute()
+        # 否定例も同時に巻き戻す。残したままだと、取り消したはずの矩形が
+        # 学習データ側にだけ「局部ではない」として残る
+        n_fp = int(h.get("fp", 0))
+        if n_fp and len(self.false_positives) >= n_fp:
+            del self.false_positives[-n_fp:]
         if h.get("prev") is None:
             self.verdicts.pop(h["frame"], None)
         else:
@@ -1499,6 +1650,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 size = None
                 if data.get("w") and data.get("h"):
                     size = (float(data["w"]), float(data["h"]))
+                # 「誤検知」で消す自動領域。画面が見て選んだ矩形をそのまま送る。
+                # 番号ではなく座標で送らせるのは、送っている間にキューが
+                # 組み直されても指すものが変わらないようにするため
+                pick = None
+                if data.get("pick"):
+                    pick = [[float(v) for v in b[:4]] for b in data["pick"]]
                 with s.lock:
                     added = s.mark(
                         frame,
@@ -1507,6 +1664,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                         size=size,
                         span=int(data.get("span", 0)),
                         cls=data.get("class"),
+                        pick=pick,
                     )
                     payload = {
                         "ok": True,
@@ -1563,19 +1721,6 @@ class ReviewServer(ThreadingHTTPServer):
 # --------------------------------------------------------------------------
 
 
-def _iou(a, b) -> float:
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    ix0, iy0 = max(ax, bx), max(ay, by)
-    ix1, iy1 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
-    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
-    inter = iw * ih
-    if inter <= 0:
-        return 0.0
-    union = aw * ah + bw * bh - inter
-    return inter / union if union > 0 else 0.0
-
-
 def to_yolo(box, width: int, height: int) -> tuple[float, float, float, float]:
     """(x, y, w, h) ピクセル -> YOLO の (cx, cy, w, h) 正規化。
 
@@ -1599,6 +1744,11 @@ def export_dataset(session: ReviewSession, out_dir: str, quiet: bool = False) ->
 
     書き出すのは手修正のあったフレームだけ。全フレーム出すと、検出できて
     いる大多数の絵ばかりが集まって「取りこぼす絵」が薄まる。
+
+    「誤検知」と判定したフレームも書き出す。そこは局部ではないと人が言った
+    絵なので、ラベルからは外したうえで画像だけ残す。ラベルが空のまま残った
+    フレームは、そのフレーム全体が負例になる。誤検知を減らす学習にはこれが
+    いちばん直接効くので、捨てずに出す。
     """
     names = sorted(session.classes)
     cls_id = {c: i for i, c in enumerate(names)}
@@ -1608,9 +1758,17 @@ def export_dataset(session: ReviewSession, out_dir: str, quiet: bool = False) ->
     os.makedirs(lbl_dir, exist_ok=True)
 
     by_frame = session.corrections.by_frame()
-    frames = sorted(f for f, cs in by_frame.items() if any(c.kind == "add" for c in cs))
+    fp_by_frame: dict[int, list[dict]] = {}
+    for p in session.false_positives:
+        fp_by_frame.setdefault(int(p["frame"]), []).append(p)
+
+    frames = sorted(
+        {f for f, cs in by_frame.items() if any(c.kind == "add" for c in cs)}
+        | set(fp_by_frame)
+    )
 
     written = 0
+    has_image: set[int] = set()
     for f in frames:
         frame = session.reader.read(f)
         if frame is None:
@@ -1619,9 +1777,11 @@ def export_dataset(session: ReviewSession, out_dir: str, quiet: bool = False) ->
             continue
 
         boxes: list[tuple[str, tuple[float, float, float, float]]] = []
-        for c in by_frame[f]:
+        for c in by_frame.get(f, []):
             if c.kind == "add" and c.cls in cls_id:
                 boxes.append((c.cls, c.box))
+
+        fp_boxes = [tuple(float(v) for v in p["box"]) for p in fp_by_frame.get(f, [])]
 
         # 同じフレームの自動検出も一緒に入れる。手修正だけを教師にすると
         # 「他には何も写っていない」という誤った負例を教えることになる。
@@ -1631,12 +1791,19 @@ def export_dataset(session: ReviewSession, out_dir: str, quiet: bool = False) ->
                 continue
             if any(_iou(r.box, b) > 0.5 for _, b in boxes):
                 continue  # 手修正と同じ対象。二重ラベルを避ける
+            if any(_iou(r.box, b) > 0.5 for b in fp_boxes):
+                # 誤検知と判定された矩形。remove が効いていればここには
+                # 残らないが、修正ファイルを差し替えたり検出をやり直したりすると
+                # 復活しうる。「これは局部だ」と教えてしまうと元も子もないので、
+                # ラベルを組む場所でも必ず落とす
+                continue
             boxes.append((r.cls, r.box))
 
-        if not boxes:
+        if not boxes and f not in fp_by_frame:
             continue
 
         cv2.imwrite(os.path.join(img_dir, f"{f:06d}.png"), frame)
+        has_image.add(f)
         lines = []
         for cls, box in boxes:
             cx, cy, bw, bh = to_yolo(box, session.width, session.height)
@@ -1644,8 +1811,27 @@ def export_dataset(session: ReviewSession, out_dir: str, quiet: bool = False) ->
                 continue
             lines.append(f"{cls_id[cls]} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
         with open(os.path.join(lbl_dir, f"{f:06d}.txt"), "w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
+            # 空のラベルは空ファイルにする。改行だけの行を置くと、読み込み側で
+            # 壊れた注釈として弾かれ、せっかくの負例が使われない
+            fh.write("".join(line + "\n" for line in lines))
         written += 1
+
+    # 否定の例。ラベルには入れられないが、hard negative として使えるように
+    # 「どの絵のどこが局部ではなかったか」を別ファイルに残す
+    fp_items = []
+    for f in sorted(fp_by_frame):
+        img = f"images/{f:06d}.png" if f in has_image else None
+        for p in fp_by_frame[f]:
+            fp_items.append(
+                {
+                    "frame": f,
+                    "box": [round(float(v), 1) for v in p["box"]],
+                    "class": p.get("class", ""),
+                    "note": f"誤検知（{img}）" if img else "誤検知（画像なし）",
+                }
+            )
+    with open(os.path.join(out_dir, "false_positives.json"), "w", encoding="utf-8") as fh:
+        json.dump(fp_items, fh, ensure_ascii=False, indent=1)
 
     with open(os.path.join(out_dir, "classes.txt"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(names) + "\n")
@@ -1663,6 +1849,8 @@ def export_dataset(session: ReviewSession, out_dir: str, quiet: bool = False) ->
 
     if not quiet:
         print(f"学習データを書き出しました: {out_dir}（{written} フレーム）")
+        if fp_items:
+            print(f"  誤検知 {len(fp_items)} 件を false_positives.json に出しました")
     return written
 
 

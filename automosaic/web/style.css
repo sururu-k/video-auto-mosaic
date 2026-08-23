@@ -59,7 +59,14 @@ button, .tag, #imgwrap, #ov {
   min-height: 40px;
 }
 
-#pos { font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* 上段は 360px 幅に「位置・理由・保存状態・戻す・設定」を並べる。
+   数字は詰めて置いて、伸び縮みするのは理由タグだけにする */
+#pos {
+  flex: 0 0 auto;                 /* 縮ませない。縮むと数字が枠外へ溢れる */
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  font-size: 13px;
+}
 
 .tag {
   flex: 1 1 auto;
@@ -77,6 +84,7 @@ button, .tag, #imgwrap, #ov {
 .tag.p2 { background: #4a1f1d; color: #ff9b95; }   /* 未処理 */
 
 .save {
+  flex: 0 0 auto;                 /* 詰まったときに削るのは理由タグだけにする */
   font-size: 12px;
   padding: 2px 7px;
   border-radius: 10px;
@@ -92,7 +100,7 @@ button, .tag, #imgwrap, #ov {
   color: #cdd4dd;
   border: 1px solid #39404b;
   border-radius: 8px;
-  padding: 6px 10px;
+  padding: 6px 8px;
   font: inherit;
   font-size: 13px;
 }
@@ -138,6 +146,8 @@ body.marking #ov { cursor: crosshair; box-shadow: inset 0 0 0 3px #ffd479; }
 /* 狭めるモードは枠色を変える。足すモードと同じ見た目だと、逆の操作をしても
    気づけない */
 body.shrinking #ov { box-shadow: inset 0 0 0 3px #ffa53c; }
+/* 誤検知モード。塗る操作ではないので、他の2つと違って暖色を使わない */
+body.erasing #ov { box-shadow: inset 0 0 0 3px #98a2b0; }
 
 #banner {
   position: absolute;
@@ -205,6 +215,9 @@ button.ng { background: #8a2f2b; border-color: #a83b36; color: #fff2f1; }
 /* 「でかすぎる」。漏れ（赤）と取り違えると逆の修正をしてしまうので、
    赤とも緑とも離れた琥珀にする */
 button.warn { background: #8a5d1f; border-color: #a8752c; color: #fff8ec; }
+/* 「誤検知」。モザイクを消す方向の操作なので、色で誘わない。
+   他の判定より一段沈めて、指が流れて当たっても気づける見た目にする */
+button.dim { background: #23272e; border-color: #3a414c; color: #aeb6c1; }
 button:active { filter: brightness(1.35); }
 button:disabled { opacity: .45; }
 
@@ -215,6 +228,20 @@ button:disabled { opacity: .45; }
   text-align: center;
   min-height: 20px;
 }
+/* 消す操作の見出しだけ赤にする。文言を読み飛ばしても色で気づけるように */
+.mark-title.danger { color: #ff9b95; }
+
+/* 誤検知は大きさを指定しない。使えないスライダを残すと、動かして
+   「効いていない」と思わせる。行ごと畳んでボタンを近づける */
+body.erasing .size-row { display: none; }
+/* 確定ボタンは緑にしない。押した先で起きるのは「塗る」ではなく「消す」 */
+body.erasing #btn-confirm {
+  background: #8a2f2b;
+  border-color: #a83b36;
+  color: #fff2f1;
+}
+/* そのコマの自動領域を全部消す場合。文字だけでなく縁でも知らせる */
+body.erasing.erase-all #btn-confirm { border-color: #ff9b95; border-width: 2px; }
 
 .size-row { align-items: center; }
 #size {

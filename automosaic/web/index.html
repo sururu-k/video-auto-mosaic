@@ -15,6 +15,10 @@
     <span id="pos">読み込み中</span>
     <span id="reason" class="tag"></span>
     <span id="save" class="save ok">保存済</span>
+    <!-- ひとつ戻すは上に置く。判定が5つになって下段が埋まったのもあるが、
+         取り消しは頻度が低いわりに押し間違えると判定が1つ消える。
+         判定ボタンの並びから離しておくほうが安全 -->
+    <button id="btn-undo" class="icon" aria-label="ひとつ戻す">戻す</button>
     <button id="btn-menu" class="icon" aria-label="設定">設定</button>
   </div>
 </header>
@@ -37,14 +41,18 @@
       <button id="btn-ng" class="big ng">漏れている</button>
       <button id="btn-big" class="big warn">でかすぎる</button>
     </div>
+    <!-- 3段目は 52px に落とす。判定は5つあるが、この2つは「ここを直す」では
+         ないので、押しやすさより画像面の高さを優先する。
+         誤検知はモザイクを消す方向なので、色を灰にして目立たせない -->
     <div class="row">
+      <button id="btn-fp" class="mid dim">誤検知</button>
       <button id="btn-unsure" class="mid">判断できない</button>
-      <button id="btn-undo" class="mid">ひとつ戻す</button>
     </div>
   </div>
 
-  <!-- 位置指定モード。「漏れている」と「でかすぎる」で共用する。
-       操作系を分けると、片方だけ手に馴染まないものになる -->
+  <!-- 位置指定モード。「漏れている」「でかすぎる」「誤検知」で共用する。
+       操作系を分けると、どれかだけ手に馴染まないものになる。
+       誤検知だけは大きさの指定が要らないので、その行だけ CSS で畳む -->
   <div id="mark" class="hidden">
     <div id="mark-title" class="mark-title"></div>
     <div class="row size-row">
@@ -97,7 +105,7 @@
     </p>
     <p class="info">
       キー: 1 問題なし / 2 漏れている / 3 判断できない / 4 でかすぎる /
-      U ひとつ戻す / ← → 前後の1枚 / Esc やめる
+      5 誤検知 / U ひとつ戻す / ← → 前後の1枚 / Esc やめる
     </p>
 
     <button id="btn-close-sheet" class="big">閉じる</button>

@@ -52,9 +52,10 @@ const S = {
   span: 0,
   pending: null,   // 置いた矩形 [x, y, w, h]（動画座標）
   tap: null,       // 正規化タップ座標。サーバへはこちらを送る
+  picked: [],      // 「誤検知」で選んだ自動領域の番号（autoBoxes() の添字）
   marking: false,
-  // 位置指定モードの種類。"add" は漏れを塞ぐ、"shrink" は塗り過ぎを狭める。
-  // 画面部品は共用なので、どちらのつもりで置いた矩形かをここで持つ
+  // 位置指定モードの種類。"add" は漏れを塞ぐ、"shrink" は塗り過ぎを狭める、
+  // "erase" は誤検知を消す。画面部品は共用なので、どのつもりの操作かをここで持つ
   markMode: null,
   busy: false,
   imgWidth: 720,
@@ -79,6 +80,17 @@ const MARK_MODES = {
     wait: "残したい範囲をタップしてください",
     confirm: "この範囲にする",
   },
+  // 誤検知は範囲を置かせず、いま乗っているモザイクから選ばせる。
+  // 消す方向の操作なので、何が消えるのかを見せないまま確定させない
+  erase: {
+    verdict: "false_positive",
+    title: "消すモザイクを選ぶ",
+    hint: "局部ではない場所に乗っているモザイクを、枠をタップして選びます",
+    wait: "消す枠をタップしてください",
+    confirm: "これを消す",
+    confirmAll: "このコマは無処理になる",
+    pick: true,
+  },
 };
 
 // 判定済みの表示。progress の集計キーとも揃えてある
@@ -87,6 +99,7 @@ const VERDICT_LABEL = {
   fixed: "塞いだ",
   unsure: "保留",
   toobig: "範囲を狭めた",
+  false_positive: "誤検知として消した",
 };
 
 // --------------------------------------------------------------------
@@ -201,6 +214,28 @@ function autoBoxes() {
   return ((it && it.boxes) || []).filter((r) => r[4] !== "x");
 }
 
+function overlaps(a, b) {
+  // 辺が接しているだけは重なりとみなさない。corrections.apply の判定と同じ
+  return !(a[0] + a[2] <= b[0] || b[0] + b[2] <= a[0] ||
+           a[1] + a[3] <= b[1] || b[1] + b[3] <= a[1]);
+}
+
+// 誤検知を確定したときに実際に消える自動領域の番号。
+//
+// remove は「その矩形と重なる自動領域」を落とす実装なので、選んだ枠に
+// 重なっている別の枠も一緒に消える。実素材では推定どうしがほとんど
+// 重なって並ぶことがあり、1つ選んだつもりで2つ消えることが起きる。
+// 選んだものだけを描いて確定させると、消える前に気づけない
+function eraseVictims() {
+  const boxes = autoBoxes();
+  const chosen = S.picked.map((i) => boxes[i]);
+  const out = new Set(S.picked);
+  boxes.forEach((r, i) => {
+    if (chosen.some((c) => overlaps(r, c))) out.add(i);
+  });
+  return out;
+}
+
 function clearOverlay() {
   const ctx = el.ov.getContext("2d");
   ctx.clearRect(0, 0, el.ov.width, el.ov.height);
@@ -209,10 +244,45 @@ function clearOverlay() {
 function drawBoxes() {
   clearOverlay();
   const shrink = S.markMode === "shrink";
-  if (!$("opt-boxes").checked && !S.pending && !shrink) return;
+  const erase = S.markMode === "erase";
+  if (!$("opt-boxes").checked && !S.pending && !shrink && !erase) return;
   const ctx = el.ov.getContext("2d");
   // 端末では画面に対して縮んで表示されるので、線幅は解像度に比例させる
   const lw = Math.max(2, Math.round(S.state.width / 400));
+
+  if (erase) {
+    // 誤検知モードでは、枠の表示設定に関係なく自動領域を全部出す。
+    // どれを消すのかが見えないまま消させてはいけない。
+    // 選んだものは塗りつぶし、選んでいないものは細い破線にして、
+    // 「いま消えるのはこれだけ」が一目で分かるようにする
+    const boxes = autoBoxes();
+    const victims = eraseVictims();
+    boxes.forEach((r, i) => {
+      const on = victims.has(i);
+      const chosen = S.picked.includes(i);
+      // 選んだものは実線、巻き添えで消えるものは点線。どちらも赤で描く。
+      // 消えることに変わりはないので、色まで分けると見落とす
+      ctx.setLineDash(on && !chosen ? [lw * 4, lw * 2] : on ? [] : [lw * 3, lw * 3]);
+      ctx.lineWidth = on ? lw * 2 : lw;
+      if (on) {
+        ctx.fillStyle = "rgba(224, 90, 86, .30)";
+        ctx.fillRect(r[0], r[1], r[2], r[3]);
+      }
+      ctx.strokeStyle = on ? "#ff6b66" : "#98a2b0";
+      ctx.strokeRect(r[0], r[1], r[2], r[3]);
+      if (chosen) {
+        // 消える印。塗りだけだと「選択」と「削除」の区別がつかない
+        ctx.beginPath();
+        ctx.moveTo(r[0], r[1]);
+        ctx.lineTo(r[0] + r[2], r[1] + r[3]);
+        ctx.moveTo(r[0] + r[2], r[1]);
+        ctx.lineTo(r[0], r[1] + r[3]);
+        ctx.stroke();
+      }
+    });
+    ctx.setLineDash([]);
+    return;
+  }
 
   if (shrink) {
     // 狭めるモードでは枠の表示設定に関係なく自動領域を出す。何を狭めようと
@@ -259,7 +329,8 @@ function updateProgress(p) {
   el.sheetInfo.textContent =
     `${p.total} 枚中 ${p.done} 枚判定済み（残り ${p.remaining}）` +
     `  問題なし ${p.counts.ok} / 塞いだ ${p.counts.fixed}` +
-    ` / 狭めた ${p.counts.toobig || 0} / 保留 ${p.counts.unsure}`;
+    ` / 狭めた ${p.counts.toobig || 0} / 誤検知 ${p.counts.false_positive || 0}` +
+    ` / 保留 ${p.counts.unsure}`;
   $("btn-undo").disabled = !p.can_undo;
   $("btn-undo2").disabled = !p.can_undo;
 }
@@ -349,24 +420,34 @@ function startMark(mode) {
   if (!cur()) return;
   const m = MARK_MODES[mode];
   if (!m) return;
-  if (mode === "shrink" && !autoBoxes().length) {
+  const autos = autoBoxes();
+  if ((mode === "shrink" || mode === "erase") && !autos.length) {
     // 消す相手がいないのに範囲だけ置かせると、ただ塗る範囲が増える。
-    // 「でかすぎる」は狭める操作なので、狭める先が無いなら入らせない
-    banner("このコマには自動で塗った領域がありません。狭める対象がありません");
+    // どちらも自動領域が前提の操作なので、無いなら入らせない
+    banner("このコマには自動で塗った領域がありません");
     return;
   }
   S.marking = true;
   S.markMode = mode;
   S.pending = null;
   S.tap = null;
+  S.picked = [];
   document.body.classList.add("marking");
   document.body.classList.toggle("shrinking", mode === "shrink");
+  document.body.classList.toggle("erasing", mode === "erase");
   el.judge.classList.add("hidden");
   el.mark.classList.remove("hidden");
   el.markTitle.textContent = m.title;
+  el.markTitle.classList.toggle("danger", mode === "erase");
   el.confirm.disabled = true;
   el.confirm.textContent = m.wait;
   banner(m.hint);
+  if (mode === "erase") {
+    // 1つしかないなら選びようがない。それでも確定は押させる（消えるのが
+    // 見えてから確定する、という手順自体は省かない）
+    if (autos.length === 1) S.picked = [0];
+    updateErase();
+  }
   drawBoxes();
 }
 
@@ -376,12 +457,46 @@ function cancelMark() {
   S.markMode = null;
   S.pending = null;
   S.tap = null;
+  S.picked = [];
   document.body.classList.remove("marking");
   document.body.classList.remove("shrinking");
+  document.body.classList.remove("erasing");
+  document.body.classList.remove("erase-all");
+  el.markTitle.classList.remove("danger");
   el.judge.classList.remove("hidden");
   el.mark.classList.add("hidden");
   banner("");
   drawBoxes();
+}
+
+// 誤検知モードの確定ボタンと注意書きを、いまの選択に合わせて書き換える
+function updateErase() {
+  const total = autoBoxes().length;
+  // 数えるのは「選んだ数」ではなく「消える数」。重なった枠は巻き添えで
+  // 消えるので、選んだ数で案内すると実際より少なく見える
+  const n = S.picked.length ? eraseVictims().size : 0;
+  const all = n > 0 && n >= total;
+  const m = MARK_MODES.erase;
+
+  document.body.classList.toggle("erase-all", all);
+  el.confirm.disabled = n === 0;
+  el.confirm.textContent = n === 0 ? m.wait : all ? m.confirmAll : m.confirm;
+
+  if (n === 0) {
+    banner(m.hint);
+    return;
+  }
+  // 何が起きるかを言葉でも出す。押す前に「消える」と読めることが要る。
+  // 適用範囲を前後に広げているときは、消えるのが1コマではないことも書く
+  const scope = S.span ? `前後 ${S.span} コマにも同じ領域の削除が入ります。` : "";
+  const extra = n > S.picked.length ? "重なっている枠も一緒に消えます。" : "";
+  banner(
+    (all
+      ? "確定するとこのコマのモザイクは全部消えます（無処理になります）。"
+      : `確定するとこのコマのモザイク ${n} / ${total} 個が消えます。`) +
+      extra +
+      scope
+  );
 }
 
 function boxSize() {
@@ -436,6 +551,8 @@ function buildSpanButtons(step) {
       S.span = o.v;
       for (const c of el.spanRow.children) c.classList.remove("on");
       b.classList.add("on");
+      // 誤検知の注意書きは「何コマぶん消えるか」を含む。ここでも書き直す
+      if (S.markMode === "erase") updateErase();
     };
     el.spanRow.appendChild(b);
   }
@@ -448,11 +565,39 @@ function tapAt(ev) {
   return [(t.clientX - r.left) / r.width, (t.clientY - r.top) / r.height];
 }
 
+// 誤検知モードのタップ。押した点から「どの枠のことか」を決める。
+// 入れ子になっている枠では小さいほうを選ぶ。大きい枠は外側をタップすれば
+// 選べるが、内側の小さい枠は中でしか選べないため
+function pickAt(nx, ny) {
+  const boxes = autoBoxes();
+  const x = nx * S.state.width;
+  const y = ny * S.state.height;
+  let best = -1;
+  let bestArea = Infinity;
+  boxes.forEach((r, i) => {
+    if (x < r[0] || x > r[0] + r[2] || y < r[1] || y > r[1] + r[3]) return;
+    const a = r[2] * r[3];
+    if (a < bestArea) { best = i; bestArea = a; }
+  });
+  if (best < 0) {
+    // 枠の外。近い枠を勝手に選ぶと「押した覚えのないものが消える」ので、
+    // 何もせずに押す場所だけ教える
+    banner("消したい枠の中をタップしてください");
+    return;
+  }
+  const at = S.picked.indexOf(best);
+  if (at >= 0) S.picked.splice(at, 1);
+  else S.picked.push(best);
+  updateErase();
+  drawBoxes();
+}
+
 el.ov.addEventListener("pointerdown", (ev) => {
   if (!S.marking) return;
   ev.preventDefault();
   const [nx, ny] = tapAt(ev);
-  placeFromTap(nx, ny);
+  if (S.markMode === "erase") pickAt(nx, ny);
+  else placeFromTap(nx, ny);
 });
 
 // --------------------------------------------------------------------
@@ -485,22 +630,33 @@ $("btn-ok").onclick = () => judge("ok");
 $("btn-unsure").onclick = () => judge("unsure");
 $("btn-ng").onclick = () => startMark("add");
 $("btn-big").onclick = () => startMark("shrink");
+$("btn-fp").onclick = () => startMark("erase");
 $("btn-undo").onclick = undo;
 $("btn-undo2").onclick = undo;
 $("btn-cancel").onclick = cancelMark;
 
 el.confirm.onclick = () => {
-  // 範囲が置かれていなければ何もしない。「でかすぎる」で範囲なしを通すと、
-  // 自動領域を消すだけの修正になり、そのコマが素通しになる
-  if (!S.tap) return;
   const m = MARK_MODES[S.markMode];
   if (!m) return;
-  const [w, h] = boxSize();
-  const payload = {
-    x: S.tap[0], y: S.tap[1], w, h,
-    span: S.span,
-    class: el.optClass.value || S.state.default_class,
-  };
+  const cls = el.optClass.value || S.state.default_class;
+  let payload;
+  if (m.pick) {
+    // 選ばれていなければ何もしない。誤検知は「選んだ枠だけ」を消す操作なので、
+    // 選択なしで通すと何が消えたのか誰にも分からない修正になる
+    if (!S.picked.length) return;
+    const boxes = autoBoxes();
+    payload = {
+      pick: S.picked.map((i) => boxes[i].slice(0, 4)),
+      span: S.span,
+      class: cls,
+    };
+  } else {
+    // 範囲が置かれていなければ何もしない。「でかすぎる」で範囲なしを通すと、
+    // 自動領域を消すだけの修正になり、そのコマが素通しになる
+    if (!S.tap) return;
+    const [w, h] = boxSize();
+    payload = { x: S.tap[0], y: S.tap[1], w, h, span: S.span, class: cls };
+  }
   cancelMark();
   judge(m.verdict, payload);
 };
@@ -538,6 +694,7 @@ document.addEventListener("keydown", (ev) => {
     case "2": startMark("add"); break;
     case "3": judge("unsure"); break;
     case "4": startMark("shrink"); break;
+    case "5": startMark("erase"); break;
     case "u": case "U": undo(); break;
     case "ArrowLeft": goto(S.idx - 1); break;
     case "ArrowRight": goto(S.idx + 1); break;

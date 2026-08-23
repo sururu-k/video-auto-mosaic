@@ -774,6 +774,312 @@ def test_progress_keeps_toobig_and_drops_unknown():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# -- 誤検知（局部ではないところのモザイクを消す） ------------------------
+
+
+def make_two_region_session(tmp, right=None, n_frames=60):
+    """1コマに自動領域が2つ出るセッション。
+
+    誤検知は「選んだ領域だけ」を消す操作なので、区別できる相手がいないと
+    確かめられない。時間方向の補完（memory・橋渡し・繋ぎ直し）は全部切って、
+    検出を出したフレームがそのまま領域になるようにしてある。
+
+    左は frame 20-40 に居座り、右は frame 24-28 にだけ出る。right に
+    (frame -> box) を渡せば右側を動かせる。
+    """
+    per_frame = {f: [] for f in range(n_frames)}
+    for f in range(20, 41):
+        per_frame[f].append(Detection(CLS, 0.8, (80, 80, 60, 60)))
+    for f in range(24, 29):
+        box = right(f) if right else (420, 300, 60, 60)
+        per_frame[f].append(Detection(CLS, 0.8, box))
+    s = make_session(tmp, per_frame=per_frame, n_frames=n_frames)
+    s.cfg = TemporalConfig(
+        max_gap=0,
+        memory=0,
+        memory_before=0,
+        bridge_max=0,
+        stitch_max_gap=0,
+        min_track_len=0,
+    )
+    s.recompute()
+    s.rebuild_queue()
+    return s
+
+
+def _removes(session, frame=None):
+    return [
+        c
+        for c in session.corrections.items
+        if c.kind == "remove" and (frame is None or c.frame == frame)
+    ]
+
+
+def test_false_positive_saves_remove_only():
+    """「誤検知」で remove だけが保存され、add が保存されないこと。
+
+    そこは局部ではなかったのだから、代わりに塗るものは無い。add が付くと
+    「消したはずの場所に塗り直す」という、判定と逆の修正になる。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_two_region_session(tmp)
+        autos = [b for b, _ in s.auto_regions(26)]
+        assert len(autos) == 2, autos
+        right = autos[1]
+
+        n = s.mark(26, "false_positive", pick=[right], span=0, cls=CLS)
+        assert n == 1, n
+        assert [c.kind for c in s.corrections.items] == ["remove"], s.corrections.items
+        assert s.verdicts[26] == "false_positive"
+
+        rem = s.corrections.items[0]
+        assert rem.frame == 26
+        # 選んだ領域を包み、選んでいない領域には掛からないこと
+        assert rem.box[0] <= right[0] and rem.box[1] <= right[1], rem.box
+        assert rem.box[0] + rem.box[2] >= right[0] + right[2], rem.box
+        assert rem.box[1] + rem.box[3] >= right[1] + right[3], rem.box
+        assert rem.box[0] > autos[0][0] + autos[0][2], "選んでいない領域に掛かっている"
+
+        # 否定の例として、検出そのものの矩形が残ること（膨張後ではない）
+        assert len(s.false_positives) == 1, s.false_positives
+        fp = s.false_positives[0]
+        assert fp["frame"] == 26 and fp["class"] == CLS, fp
+        assert fp["box"] == [420.0, 300.0, 60.0, 60.0], fp["box"]
+        print("  誤検知で remove だけが保存される OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_false_positive_remove_drops_automatic_region():
+    """保存した remove が、実際に選んだ自動領域だけを落とすこと。
+
+    セッション内の値だけでは、修正ファイルを経由したときに効くとは限らない
+    （保存で小数第1位に丸められる）。ファイルから読み直し、
+    process() -> apply() の本来の経路を通して確かめる。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        from automosaic.temporal import process
+
+        s = make_two_region_session(tmp)
+        left, right = [b for b, _ in s.auto_regions(26)]
+
+        s.mark(26, "false_positive", pick=[right], span=0, cls=CLS)
+        remaining = [b for b, _ in s.auto_regions(26)]
+        assert remaining == [left], remaining
+
+        loaded = CorrectionSet.load(s.corrections_path)
+        base, _ = process(s.per_frame, s.n_frames, s.width, s.height, s.classes, s.cfg)
+        out = apply_corrections(base, loaded)
+        got = [b for b, r in out[26] if r.source != "manual"]
+        assert got == [left], got
+        # 左が残っているので素通しにはならない
+        assert s.coverage[26] == COV_REAL, s.coverage[26]
+        print("  誤検知の remove が選んだ領域だけを落とす OK（ファイル経由で確認）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_false_positive_rewraps_each_frame():
+    """複数フレーム適用で、フレームごとに対応する領域を包み直すこと。
+
+    対象が動いていると位置も大きさも違うので、1枚を使い回すと端が残るか、
+    逆に隣の領域まで巻き込む。各フレームで IoU が最大の領域を選び直す。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_two_region_session(tmp, right=lambda f: (380 + (f - 24) * 20, 300, 60, 60))
+        autos = {f: [b for b, _ in s.auto_regions(f)] for f in range(24, 29)}
+        right = autos[26][1]
+
+        n = s.mark(26, "false_positive", pick=[right], span=2, cls=CLS)
+        assert n == 5, n  # 24-28 の5フレーム、各1件
+
+        for f in range(24, 29):
+            rems = _removes(s, f)
+            assert len(rems) == 1, (f, rems)
+            want, other = autos[f][1], autos[f][0]
+            box = rems[0].box
+            assert box[0] <= want[0] and box[1] <= want[1], (f, box, want)
+            assert box[0] + box[2] >= want[0] + want[2], (f, box, want)
+            assert box[0] > other[0] + other[2], (f, "左に掛かっている", box)
+            # 各フレームの領域だけを残していること（左は生き残る）
+            assert [b for b, _ in s.auto_regions(f)] == [other], f
+
+        # 動いているので、フレームごとに違う矩形になっていること
+        xs = {round(_removes(s, f)[0].box[0], 1) for f in range(24, 29)}
+        assert len(xs) == 5, xs
+        print("  誤検知のフレームごとの包み直し OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_false_positive_skips_frames_without_match():
+    """対応する領域が無いフレームには remove を置かないこと。
+
+    重なるものが無いのに近いものを消すと、選んだ覚えのない領域が消える。
+    効果の無い remove をばら撒くと、検出をやり直したときに効いてしまう。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_two_region_session(tmp)
+        right = [b for b, _ in s.auto_regions(26)][1]
+
+        n = s.mark(26, "false_positive", pick=[right], span=5, cls=CLS)
+        assert n == 5, n  # 21-31 のうち、右が出ている 24-28 だけ
+        frames = sorted({c.frame for c in _removes(s)})
+        assert frames == [24, 25, 26, 27, 28], frames
+        # 右が居ないフレームの左は無傷
+        for f in (21, 22, 23, 29, 30, 31):
+            assert len(s.auto_regions(f)) == 1, f
+        assert {p["frame"] for p in s.false_positives} == set(range(24, 29))
+        print("  対応する領域が無いフレームは飛ばす OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_false_positive_rejects_missing_pick():
+    """どれを消すか決まっていない状態では確定させないこと。
+
+    モザイクを消す方向の操作なので、あいまいなら通さない。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_two_region_session(tmp)
+        for pick in (None, [], [[600.0, 10.0, 20.0, 20.0]]):  # 最後は重ならない矩形
+            try:
+                s.mark(26, "false_positive", pick=pick)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"pick={pick} が通ってしまった")
+        assert not s.corrections.items, "拒否したのに修正が残っている"
+        assert not s.false_positives, "拒否したのに否定例が残っている"
+        assert 26 not in s.verdicts, "拒否したのに判定が記録されている"
+        assert not s.history, "拒否したのに履歴が積まれている"
+        assert len(s.auto_regions(26)) == 2, "自動領域が消えている"
+        print("  選択なしの誤検知の拒否 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_undo_false_positive_restores():
+    """ひとつ戻すで、消えた領域も否定例の記録も戻ること。
+
+    修正だけ戻して否定例が残ると、取り消したはずの矩形が学習データ側にだけ
+    「局部ではない」として残る。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_two_region_session(tmp)
+        before = [b for b, _ in s.auto_regions(26)]
+        s.mark(26, "false_positive", pick=[before[1]], span=1, cls=CLS)
+        assert len(s.corrections.items) == 3 and len(s.false_positives) == 3
+
+        h = s.undo()
+        assert h["frame"] == 26 and h["added"] == 3 and h["fp"] == 3, h
+        assert not s.corrections.items, "戻したのに修正が残っている"
+        assert not s.false_positives, "戻したのに否定例が残っている"
+        assert 26 not in s.verdicts
+        assert [b for b, _ in s.auto_regions(26)] == before, "自動領域が復活していない"
+        print("  誤検知のひとつ戻す OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_export_dataset_excludes_false_positives():
+    """誤検知の矩形をラベルから外し、false_positives.json に出すこと。
+
+    誤検知を「これは局部だ」と教え続けると、ファインチューンでいちばん
+    直したいものが直らない。画像そのものは hard negative として使えるので、
+    ラベルを空にして残す。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+
+        class StubReader:
+            def read(self, n):
+                return np.zeros((480, 640, 3), dtype=np.uint8)
+
+        s.reader = StubReader()
+        # frame 5 は正規の手順で誤検知にする（remove が入り、領域が消える）
+        auto5 = [b for b, _ in s.auto_regions(5)]
+        s.mark(5, "false_positive", pick=auto5, span=0, cls=CLS)
+        assert not s.auto_regions(5)
+
+        # frame 45 は否定例の記録だけを直接置く。remove が効いていなくても
+        # ラベルを組む側で落とせることを確かめる（修正ファイルの差し替えや
+        # 検出のやり直しで、消したはずの矩形が復活しうる）
+        raw45 = next(r.box for _, r in s.regions[45] if r.source == "detected")
+        s.false_positives.append(
+            {"frame": 45, "box": [round(v, 1) for v in raw45], "class": CLS}
+        )
+
+        out = os.path.join(tmp, "ds")
+        export_dataset(s, out, quiet=True)
+
+        for f in (5, 45):
+            assert os.path.exists(os.path.join(out, "images", f"{f:06d}.png")), f
+            body = open(
+                os.path.join(out, "labels", f"{f:06d}.txt"), encoding="utf-8"
+            ).read().strip()
+            assert body == "", f"誤検知がラベルに残っている: {f} {body!r}"
+
+        items = json.load(open(os.path.join(out, "false_positives.json"), encoding="utf-8"))
+        assert len(items) == 2, items
+        by_frame = {it["frame"]: it for it in items}
+        assert sorted(by_frame) == [5, 45], items
+        for f, it in by_frame.items():
+            assert set(it) == {"frame", "box", "class", "note"}, it
+            assert it["class"] == CLS
+            assert len(it["box"]) == 4
+            assert f"images/{f:06d}.png" in it["note"], it["note"]
+        print("  誤検知の学習データ書き出し OK（ラベル除外 + false_positives.json）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_progress_keeps_false_positive_and_reads_old_records():
+    """記録に false_positive が残り、古い記録が壊れないこと。
+
+    古い .progress.json には false_positives も履歴の fp も無い。
+    無いものを 0 件として読めれば、版が混ざっても続きから再開できる。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_two_region_session(tmp)
+        right = [b for b, _ in s.auto_regions(26)][1]
+        s.mark(26, "false_positive", pick=[right], span=0, cls=CLS)
+        p = s.progress_payload()
+        assert "false_positive" in p["counts"], p["counts"]
+
+        again = make_two_region_session(tmp)
+        again.corrections = CorrectionSet.load(s.corrections_path)
+        again.load_progress()
+        assert again.verdicts.get(26) == "false_positive"
+        assert len(again.false_positives) == 1, again.false_positives
+
+        # 旧版が書いた形（fp も false_positives も無い）を読ませる
+        with open(s.progress_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        saved.pop("false_positives", None)
+        for h in saved["history"]:
+            h.pop("fp", None)
+        with open(s.progress_path, "w", encoding="utf-8") as f:
+            json.dump(saved, f, ensure_ascii=False)
+
+        old = make_two_region_session(tmp)
+        old.load_progress()
+        assert old.verdicts.get(26) == "false_positive"
+        assert old.false_positives == [], old.false_positives
+        assert old.history and old.history[-1]["fp"] == 0, old.history
+        print("  判定記録の互換 OK（false_positive は残り、旧形式も読める）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # -- トークン ------------------------------------------------------------
 
 
@@ -1048,6 +1354,53 @@ def test_http_toobig_roundtrip():
         assert d["n_corrections"] == 0
         assert [r[4] for r in d["regions"]] != ["x"], d["regions"]
         print("  HTTP 越しの でかすぎる OK")
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_http_false_positive_roundtrip():
+    """HTTP 越しに 誤検知 を投げ、選んだ領域だけが消えて、戻せること。"""
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    try:
+        s = make_two_region_session(tmp)
+        # 検出が続いている区間は既定ではキューに載らない。進捗の集計まで
+        # 見たいので、全フレームを対象にして 25 が並ぶようにする
+        s.queue_all = True
+        s.rebuild_queue()
+        assert any(it["frame"] == 25 for it in s.queue)
+        left, right = [b for b, _ in s.auto_regions(25)]
+        tok = "testtoken1234"
+        httpd, base = _serve(s, tok)
+
+        # 画面は丸めた整数の矩形を返してくるので、そのまま送っても
+        # 実体に寄せ直せることを確かめる
+        pick = [[int(round(v)) for v in right]]
+        code, d = _post(
+            f"{base}/api/mark?t={tok}",
+            {"frame": 25, "verdict": "false_positive", "pick": pick,
+             "span": 0, "class": CLS},
+        )
+        assert code == 200, d
+        assert d["added"] == 1 and d["n_corrections"] == 1, d
+        assert len(d["regions"]) == 1, d["regions"]
+        assert d["regions"][0][:4] == [int(round(v)) for v in left], d["regions"]
+        assert d["progress"]["counts"]["false_positive"] == 1, d["progress"]
+        assert [c.kind for c in s.corrections.items] == ["remove"], s.corrections.items
+
+        # 選択なしは 400。何が消えるか決まっていない修正は作らせない
+        code, d = _post(f"{base}/api/mark?t={tok}", {"frame": 27, "verdict": "false_positive"})
+        assert code == 400, (code, d)
+        assert len(s.corrections.items) == 1, "拒否したのに修正が増えている"
+
+        code, d = _post(f"{base}/api/undo?t={tok}", {})
+        assert code == 200 and d["removed"] == 1, d
+        assert d["n_corrections"] == 0 and len(d["regions"]) == 2, d
+        assert not s.false_positives, s.false_positives
+        print("  HTTP 越しの 誤検知 OK")
     finally:
         if httpd:
             httpd.shutdown()
