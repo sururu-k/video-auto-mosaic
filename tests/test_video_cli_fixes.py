@@ -18,6 +18,9 @@ import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 
+import cv2
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from automosaic import cli  # noqa: E402
@@ -83,6 +86,59 @@ def _make_video_with_audio(path: str, w: int, h: int, seconds: int,
         ],
         check=True,
     )
+
+
+def _make_rotated_video(path: str, base_w: int, base_h: int, frames: int,
+                         degrees: int, fps: int = 15) -> None:
+    """回転メタデータ付きの動画を作る（issue #1 の再現手順）。
+
+    2段階に分ける。まず base_w x base_h の平置き（回転メタデータ無し）動画を
+    作り、次に -display_rotation を付けて -c copy で包み直す。画素はまったく
+    動かさず、side_data_list の Display Matrix だけを足す。ffmpeg はこれを
+    再生・デコード時に自動で適用する（既定で -autorotate 有効）ので、90/270度
+    では実際に流れてくるフレームの幅と高さが入れ替わる。
+    """
+    tmp = path + ".base.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", f"testsrc2=size={base_w}x{base_h}:r={fps}",
+            "-frames:v", str(frames), "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-g", "5", tmp,
+        ],
+        check=True,
+    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-y",
+                # -display_rotation は ffmpeg の CLI パーサ上「入力側」の
+                # オプション扱いなので -i より前に置く（出力側に置くと
+                # 「apply to output url」エラーになる。実測で確認済み）。
+                "-display_rotation:v:0", str(degrees),
+                "-i", tmp, "-c", "copy", path,
+            ],
+            check=True,
+        )
+    finally:
+        os.remove(tmp)
+
+
+def _decode_frame_rgb(path: str):
+    """ffmpeg 自身に先頭フレームを PNG で吐かせて cv2 で読む。
+
+    autorotate 込みで ffmpeg がデコードした「正解」の見た目を得るための、
+    automosaic の実装から独立した手段。
+    """
+    out = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path,
+         "-frames:v", "1", "-f", "image2", "-c:v", "png", "-"],
+        capture_output=True, check=True,
+    )
+    arr = np.frombuffer(out.stdout, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    assert img is not None, f"PNG デコードに失敗: {path}"
+    return img
 
 
 def _count_real_frames(path: str) -> int:
@@ -702,6 +758,91 @@ def test_render_detects_incomplete_pass2_decode():
             raise AssertionError("壊れた入力なのにパス2が正常終了した")
         assert not os.path.exists(dst), "尻切れの出力が退避されずに出力先へ残っている"
     print("  パス2の完走チェック OK")
+
+
+def test_probe_reads_rotation_and_swaps_dimensions():
+    """issue #1 根本原因: probe() が side_data_list の rotation を読み、
+    90/270度では width/height を実際にデコードされる向きへ入れ替えること。
+
+    直す前は常に「箱の中身の生のサイズ」（640x360）をそのまま返しており、
+    ffmpeg が自動回転で実際に流すフレーム（360x640）と食い違っていた。
+    """
+    if not _have_ffmpeg():
+        print("  回転メタデータの読み取り SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        # ffprobe の rotation は正負どちらの表記もある（270度指定は -90 と
+        # 出る。実測済み）。normalize 後の期待値で確認する。
+        cases = [(0, 640, 360), (90, 360, 640), (180, 640, 360), (270, 360, 640)]
+        for deg, exp_w, exp_h in cases:
+            path = os.path.join(d, f"rot{deg}.mp4")
+            if deg == 0:
+                _make_video(path, 640, 360, 3, fps=15)
+            else:
+                _make_rotated_video(path, 640, 360, 3, deg, fps=15)
+            info = vid.probe(path)
+            assert (info.width, info.height) == (exp_w, exp_h), (
+                f"{deg}度: probe() が {info.width}x{info.height} を返した"
+                f"（期待 {exp_w}x{exp_h}）。side_data_list の rotation を"
+                "読めていない、または入れ替え方が違う"
+            )
+            assert info.rotation == deg, (
+                f"{deg}度: info.rotation が {info.rotation}（期待 {deg}）"
+            )
+            # probe() の申告するサイズが、ffmpeg が実際に流すデコード後の
+            # フレームサイズと一致すること。ここがずれると FrameBuffer の
+            # 長さ検査は素通りし、reshape だけが転置される（本 issue の核心）。
+            actual_h, actual_w = _decode_frame_rgb(path).shape[:2]
+            assert (actual_w, actual_h) == (info.width, info.height), (
+                f"{deg}度: 実デコードサイズ {actual_w}x{actual_h} が "
+                f"probe() の申告 {info.width}x{info.height} と食い違う"
+            )
+    print("  回転メタデータの読み取り OK")
+
+
+def test_rotated_video_pixels_not_scrambled():
+    """issue #1: 回転メタデータ付き動画を焼いても、中身が転置スクランブルに
+    ならないこと。モザイク領域は1件も与えず、パス2の幾何だけを見る。
+
+    直す前は probe() が 640x360 のまま返す一方 ffmpeg は 360x640 の
+    フレームを流すため、FrameBuffer(info.width, info.height) の形と実際の
+    バイト列の並びが食い違う。y_size は w*h で 640*360 == 360*640 と一致し、
+    彩度平面も (w//2)*(h//2) が対称に一致するので nbytes の長さ検査は
+    素通りする。実際に落ちるのは reshape の形だけで、出力は例外もエラーも
+    無いまま斜めに裂けたスクランブル画像になる（実測・PR添付ログ参照）。
+    """
+    if not _have_ffmpeg():
+        print("  回転動画の画素破損チェック SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "rot.mp4")
+        dst = os.path.join(d, "out.mp4")
+        n_frames = 5
+        _make_rotated_video(src, 640, 360, n_frames, 90, fps=15)
+        info = vid.probe(src)
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            cli.run_render(src, dst, info, {}, n_frames, 8, "black",
+                           18, "veryfast", None, True)
+
+        expected = _decode_frame_rgb(src)
+        actual = _decode_frame_rgb(dst)
+        assert actual.shape == expected.shape, (
+            f"出力フレームの解像度が入力の表示向きと違う: "
+            f"{actual.shape} (出力) vs {expected.shape} (入力・自動回転込み)。"
+            "縦横が入れ替わったまま焼かれている"
+        )
+        diff = np.abs(actual.astype(np.int16) - expected.astype(np.int16))
+        mean_diff = float(diff.mean())
+        # モザイク領域を1件も与えていないので、再エンコードの劣化以外に
+        # 差が出るはずがない（実測: 直った状態で平均差分 0.3 前後）。
+        # 転置スクランブルが起きると縞模様がまったく別内容になり、
+        # 平均差分は数十まで跳ね上がる。10 は劣化分に十分な余裕を持たせた閾値。
+        assert mean_diff < 10.0, (
+            f"出力フレームが入力（自動回転込み）と大きく違う"
+            f"（平均差分 {mean_diff:.2f}）。転置スクランブルが再発している疑い"
+        )
+    print("  回転動画の画素破損チェック OK")
 
 
 if __name__ == "__main__":
