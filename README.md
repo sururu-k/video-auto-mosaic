@@ -36,7 +36,7 @@ python -m automosaic in.mp4 --detections det.json --reuse-detections --correctio
 
 | オプション | 既定 | 意味 |
 |---|---|---|
-| `--infer-size` | 960 | 推論解像度。**ここが検出率に一番効く** |
+| `--infer-size` | 960 | 推論の画素予算（長辺ではない）。素材の縦横比を保った入力サイズをここから決める。**ここが検出率に一番効く** |
 | `--conf` | 0.06 | 信頼度しきい値。実写ではスコアが低く出るので下げてある |
 | `--tta` | off | 水平反転した推論もマージ。推論2倍、検出+16% |
 | `--classes` | default | `default`(露出のみ) / `conservative`(COVERED も含む) / カンマ区切り |
