@@ -2040,6 +2040,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--track-min-peak", type=float, default=cd["--track-min-peak"])
     t.add_argument("--bridge-max", type=int, default=cd["--bridge-max"])
     t.add_argument("--no-bridge", action="store_true", default=cd["--no-bridge"])
+    t.add_argument("--despike", action="store_true", default=cd["--despike"])
     t.add_argument("--no-despike", action="store_true", default=cd["--no-despike"])
     t.add_argument("--frame-step", type=int, default=cd["--frame-step"])
     t.add_argument(
@@ -2090,6 +2091,14 @@ def session_from_args(args, argv: list[str] | None = None) -> ReviewSession:
     if not src or not os.path.exists(src):
         raise SystemExit(f"元動画が見つかりません: {src}")
 
+    # cli.py と同じ矛盾検査。--despike は既定オフの明示的な opt-in、--no-despike は
+    # 後方互換のためだけに残っている（cli.py の意味と同じ）。黙ってどちらかに倒さない
+    if args.despike and args.no_despike:
+        raise SystemExit(
+            "--despike と --no-despike は同時に指定できません（矛盾する指定を黙って"
+            "どちらかに倒さない）"
+        )
+
     width, height, fps, n_frames = probe_with_cv2(src)
 
     per_frame: dict[int, list[Detection]] = {}
@@ -2120,17 +2129,34 @@ def session_from_args(args, argv: list[str] | None = None) -> ReviewSession:
     if not args.estimate_gaps:
         given = explicit_options(argv)
         narrowed = [
-            ("memory", args.memory, min(args.memory, 2)),
-            ("memory_before", args.memory_before, min(args.memory_before or 2, 2)),
-            ("bridge_max", args.bridge_max, 0),
-            ("hold_growth", args.hold_growth, 0.0),
-            ("motion_weight", args.motion_weight, min(args.motion_weight, 1.0)),
+            ("memory", "--memory", args.memory, min(args.memory, 2)),
+            ("memory_before", "--memory-before",
+             args.memory_before, min(args.memory_before or 2, 2)),
+            ("bridge_max", "--bridge-max", args.bridge_max, 0),
+            ("hold_growth", "--hold-growth", args.hold_growth, 0.0),
+            ("motion_weight", "--motion-weight",
+             args.motion_weight, min(args.motion_weight, 1.0)),
         ]
-        for name, old, new in narrowed:
+        applied: list[str] = []
+        kept: list[str] = []
+        for name, flag, old, new in narrowed:
             if name in given:
+                if old != new:
+                    kept.append(f"{flag} {old}")
                 continue
             if old != new:
                 setattr(args, name, new)
+                applied.append(f"{flag} {old} -> {new}")
+
+        # cli.py の C-6 と同じ理由。実効設定が画面の見た目に直結するので黙って絞らない
+        if applied:
+            print(
+                "--estimate-gaps 無しのため推定で広げる設定を絞りました: "
+                + ", ".join(applied),
+                file=sys.stderr,
+            )
+        if kept:
+            print("明示指定を優先: " + ", ".join(kept), file=sys.stderr)
 
     classes = resolve_classes(args.classes)
     cfg = TemporalConfig(
@@ -2138,7 +2164,7 @@ def session_from_args(args, argv: list[str] | None = None) -> ReviewSession:
         memory=args.memory,
         margin_scale=args.margin_scale,
         max_area_ratio=args.max_area_ratio,
-        min_track_len=0 if args.no_despike else 2,
+        min_track_len=2 if args.despike else 0,
         bridge_max=0 if args.no_bridge else args.bridge_max,
         frame_step=max(1, args.frame_step),
         track_min_peak=args.track_min_peak,
