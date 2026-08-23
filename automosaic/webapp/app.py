@@ -34,7 +34,7 @@ from . import jobs as jobs_mod
 from . import proxy as proxy_mod
 from .jobs import Job, Library
 from .runner import RunnerRegistry
-from .session import SessionCache, sync_meta
+from .session import SessionCache, session_overrides, sync_meta
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -411,8 +411,18 @@ def create_app(
     # 3. 検査キュー
     # ------------------------------------------------------------------
     def get_session(job: Job):
+        # ジョブの settings（焼き込みに使った mode/block/classes/estimate_gaps
+        # など）を、そのままレビューにも渡す。ここを空のまま呼ぶと、レビューは
+        # review.py の argparse 既定（pixelize / 自動ブロック / default 3クラス）
+        # で見せることになり、実際に焼いた絵と食い違う（#15）。
         try:
-            return sessions.get(job)
+            overrides = session_overrides(job.meta.get("settings") or {})
+        except ValueError as e:
+            # 壊れた設定値。黙って無視して既定値で見せると「合ってる」と
+            # 誤認させるので、レビューを止めて利用者に直させる
+            raise _err(400, str(e))
+        try:
+            return sessions.get(job, **overrides)
         except FileNotFoundError as e:
             raise _err(400, str(e))
         except SystemExit as e:  # session_from_args は SystemExit で止める

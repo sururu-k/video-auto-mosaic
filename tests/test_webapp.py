@@ -1299,6 +1299,95 @@ def test_session_cache_get_no_toctou_under_tight_switching():
     )
 
 
+def test_review_session_uses_job_settings():
+    """レビューが焼き込みと同じ mode/block/classes で絵を作ること（issue #15）。
+
+    直す前は app.py の get_session() が sessions.get(job) しか呼ばず、job.meta の
+    settings を1つも渡していなかった。black で焼いたジョブを常にモザイク
+    （pixelize）で見せ、block を大きくしても常に自動サイズ、
+    classes=conservative で焼いても COVERED 系の領域がレビュー画面から
+    丸ごと消えていた（漏れる方向の壊れ方）。
+    """
+    from automosaic.detector import CONSERVATIVE_CLASSES, DEFAULT_CLASSES
+    import cv2
+    import numpy as np
+
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = upload(srv.base, sample_video())
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        # ANUS_COVERED は default クラスに無く、conservative にだけ含まれる。
+        # classes の絞り込みが実際に効くかどうかを、この箱1つで確かめられる
+        box = [40, 30, 30, 30]
+        dets = {
+            str(f): [{"class": "ANUS_COVERED", "score": 0.9, "box": box}]
+            for f in range(d["n_frames"])
+        }
+        with open(job.detections, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "n_frames": d["n_frames"], "width": d["width"], "height": d["height"],
+                    "complete": True, "detections": dets,
+                },
+                f,
+            )
+        cx, cy = box[0] + box[2] // 2, box[1] + box[3] // 2
+
+        # -- settings 無し（既定）: block は自動、classes は default。
+        #    ANUS_COVERED は default に無いので、この箱は塗られない
+        st0 = get_json(f"{srv.base}/api/jobs/{jid}/state?light=1&t={TOKEN}")
+        assert st0["block"] != 40, st0
+        assert set(st0["classes"]) == set(DEFAULT_CLASSES), st0["classes"]
+
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/frame?n=3&fmt=png&t={TOKEN}")
+        assert code == 200, (code, body)
+        before = cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR)
+        px_before = before[cy, cx].tolist()
+        assert max(px_before) > 40, (
+            f"前提が崩れている: settings 無しなのに箱の中心が既に暗い {px_before}"
+        )
+
+        # -- ジョブの meta.settings に mode=black / block=40 / classes=conservative
+        job.update(settings={"mode": "black", "block": "40", "classes": "conservative"})
+
+        st1 = get_json(f"{srv.base}/api/jobs/{jid}/state?light=1&t={TOKEN}")
+        assert st1["block"] == 40, st1
+        assert set(st1["classes"]) == set(CONSERVATIVE_CLASSES), st1["classes"]
+
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/frame?n=3&fmt=png&t={TOKEN}")
+        assert code == 200, (code, body)
+        after = cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR)
+        px_after = after[cy, cx].tolist()
+        assert max(px_after) <= 5, f"mode=black のはずが黒くなっていない: {px_after}"
+        print(
+            f"  settings 反映 OK: block {st0['block']}->{st1['block']}, "
+            f"classes {sorted(st0['classes'])}->{sorted(st1['classes'])}, "
+            f"箱の中心の画素 {px_before}->{px_after}"
+        )
+
+        # -- 壊れた値は 400 で止める。黙って無視するのも、そのまま渡して
+        #    原因不明の例外にするのも良くない（RULES.md 0）
+        job.update(settings={"mode": "black", "block": "abc", "classes": "conservative"})
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/state?light=1&t={TOKEN}")
+        assert code == 400, (code, body)
+        print(f"  壊れた block 値は 400 で止まる（{body[:100]!r}）")
+
+        # -- レビューの絵に関係ない項目（検出・最終エンコードにしか効かない）が
+        #    壊れていても、レビューは開けること。review.py の argparse は
+        #    infer_size / limit_frames を知らないので対象外になる
+        job.update(settings={
+            "mode": "black", "block": "40", "classes": "conservative",
+            "infer_size": "not-a-number", "limit_frames": "not-a-number",
+        })
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/state?light=1&t={TOKEN}")
+        assert code == 200, (code, body)
+        print("  レビューに関係ない項目が壊れていてもレビューは開ける OK")
+    finally:
+        srv.close()
+
+
 def test_mark_roundtrip_and_undo():
     """判定 -> 次のフレーム -> 取り消し の往復。
 

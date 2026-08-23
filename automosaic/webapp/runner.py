@@ -38,6 +38,26 @@ RE_PROGRESS_OPEN = re.compile(r"(パス[12])\s+(\S+)\s+(\d+)\s+フレーム\s+([
 # 保持するログ行数。3〜4時間ぶんの進捗行を全部持つ意味は無い。
 LOG_LIMIT = 400
 
+# 設定キー -> (CLI 引数名, cast)。build_argv() がここを見て argv を組む。
+# session.py もここを見て、レビューの絵に効くキーだけを overrides に写す
+# （#15）。2箇所に書き写すと、キーを片方だけ増やしたときに食い違う
+# （review 画面が新しい設定を無視したまま気づかれない、という同じ壊れ方）。
+SETTINGS_OPTS: tuple[tuple[str, str, type], ...] = (
+    ("infer_size", "--infer-size", int),
+    ("conf", "--conf", float),
+    ("classes", "--classes", str),
+    ("block", "--block", int),
+    ("mode", "--mode", str),
+    ("margin_scale", "--margin-scale", float),
+    ("margin_cap", "--margin-cap", float),
+    ("crf", "--crf", int),
+    ("provider", "--provider", str),
+    ("frame_step", "--frame-step", int),
+    ("limit_frames", "--limit-frames", int),
+)
+# 値を取らない（真偽だけの）設定キー
+SETTINGS_FLAGS: tuple[str, ...] = ("tta", "estimate_gaps", "detect_only")
+
 
 def child_env() -> dict:
     """サブプロセスの環境。
@@ -100,23 +120,11 @@ def build_argv(job: jobs_mod.Job, settings: dict, reuse: bool = False) -> list[s
             return
         argv.extend([flag, str(cast(v))])
 
-    opt("infer_size", "--infer-size", int)
-    opt("conf", "--conf", float)
-    opt("classes", "--classes")
-    opt("block", "--block", int)
-    opt("mode", "--mode")
-    opt("margin_scale", "--margin-scale", float)
-    opt("margin_cap", "--margin-cap", float)
-    opt("crf", "--crf", int)
-    opt("provider", "--provider")
-    opt("frame_step", "--frame-step", int)
-    opt("limit_frames", "--limit-frames", int)
-    if settings.get("tta"):
-        argv.append("--tta")
-    if settings.get("estimate_gaps"):
-        argv.append("--estimate-gaps")
-    if settings.get("detect_only"):
-        argv.append("--detect-only")
+    for key, flag, cast in SETTINGS_OPTS:
+        opt(key, flag, cast)
+    for key in SETTINGS_FLAGS:
+        if settings.get(key):
+            argv.append("--" + key.replace("_", "-"))
     return argv
 
 
