@@ -9,108 +9,21 @@
 </head>
 <body>
 
-<header id="bar">
-  <div id="progress"><div id="progress-fill"></div></div>
-  <div id="bar-row">
-    <span id="pos">読み込み中</span>
-    <span id="reason" class="tag"></span>
-    <span id="save" class="save ok">保存済</span>
-    <!-- ひとつ戻すは上に置く。判定が5つになって下段が埋まったのもあるが、
-         取り消しは頻度が低いわりに押し間違えると判定が1つ消える。
-         判定ボタンの並びから離しておくほうが安全 -->
-    <button id="btn-undo" class="icon" aria-label="ひとつ戻す">戻す</button>
-    <button id="btn-menu" class="icon" aria-label="設定">設定</button>
-  </div>
-</header>
-
-<main id="stage">
-  <div id="imgwrap">
-    <img id="shot" alt="判定対象のフレーム">
-    <canvas id="ov"></canvas>
-  </div>
-  <div id="banner" class="hidden"></div>
-</main>
-
-<footer id="pad">
-  <!-- 判定モード。ここだけで1枚が終わるのが普通の流れ -->
-  <div id="judge">
-    <button id="btn-ok" class="big ok">問題なし</button>
-    <!-- 範囲を直す2つ。縦に4つ積むと縦持ちで画像面が潰れるので横に並べる。
-         高さは他と同じ 64px のままにして、指の狙いやすさを落とさない -->
-    <div class="row">
-      <button id="btn-ng" class="big ng">漏れている</button>
-      <button id="btn-big" class="big warn">でかすぎる</button>
-    </div>
-    <!-- 3段目は 52px に落とす。判定は5つあるが、この2つは「ここを直す」では
-         ないので、押しやすさより画像面の高さを優先する。
-         誤検知はモザイクを消す方向なので、色を灰にして目立たせない -->
-    <div class="row">
-      <button id="btn-fp" class="mid dim">誤検知</button>
-      <button id="btn-unsure" class="mid">判断できない</button>
-    </div>
-  </div>
-
-  <!-- 位置指定モード。「漏れている」「でかすぎる」「誤検知」で共用する。
-       操作系を分けると、どれかだけ手に馴染まないものになる。
-       誤検知だけは大きさの指定が要らないので、その行だけ CSS で畳む -->
-  <div id="mark" class="hidden">
-    <div id="mark-title" class="mark-title"></div>
-    <div class="row size-row">
-      <button id="btn-minus" class="sq">−</button>
-      <input id="size" type="range" min="20" max="400" step="5" value="100"
-             aria-label="矩形の大きさ">
-      <button id="btn-plus" class="sq">＋</button>
-      <span id="size-label" class="size-label">-</span>
-    </div>
-    <div class="row" id="span-row"></div>
-    <button id="btn-confirm" class="big ok" disabled>画像をタップしてください</button>
-    <div class="row">
-      <button id="btn-cancel" class="mid">やめる</button>
-      <button id="btn-undo2" class="mid">ひとつ戻す</button>
-    </div>
-  </div>
-</footer>
-
-<!-- 設定シート。普段は畳んでおく。ここに置くのは頻度の低い操作だけ -->
-<div id="sheet" class="hidden">
-  <div id="sheet-inner">
-    <h2>設定</h2>
-
-    <label class="opt"><input id="opt-raw" type="checkbox"> 原画で確認する（モザイクを外す）</label>
-    <label class="opt"><input id="opt-boxes" type="checkbox" checked> モザイクの範囲を枠で示す</label>
-    <label class="opt"><input id="opt-all" type="checkbox"> 全フレームを対象にする</label>
-
-    <label class="opt-row">間隔
-      <input id="opt-step" type="number" min="1" max="300" value="5"> フレームおき
-    </label>
-
-    <label class="opt-row">クラス
-      <select id="opt-class"></select>
-    </label>
-
-    <div class="opt-row">
-      <button id="btn-rebuild" class="mid wide">キューを作り直す</button>
-    </div>
-    <div class="opt-row">
-      <button id="btn-unjudged" class="mid wide">未判定の先頭へ</button>
-    </div>
-    <div class="opt-row">
-      <button id="btn-prev-item" class="mid">前の1枚</button>
-      <button id="btn-next-item" class="mid">次の1枚</button>
-    </div>
-
-    <p id="sheet-info" class="info"></p>
-    <p class="info">
-      <a id="link-timeline" href="/timeline">タイムライン画面（PC 向け）</a>
-    </p>
-    <p class="info">
-      キー: 1 問題なし / 2 漏れている / 3 判断できない / 4 でかすぎる /
-      5 誤検知 / U ひとつ戻す / ← → 前後の1枚 / Esc やめる
-    </p>
-
-    <button id="btn-close-sheet" class="big">閉じる</button>
-  </div>
-</div>
+<!-- 中身は app.js（Preact 相当のバンドル）が組み立てる。document.body を
+     一度空にしてから描くので、ここに下描きの静的マークアップを置いても
+     JS が動いた瞬間に消える。判定の画面で「押しても何も起きないボタン」が
+     並ぶのがいちばん悪い。押したつもりの判定が記録されないまま、
+     検査が進んだと思い込む。app.js に getElementById / querySelector が
+     無いこと（既存 DOM を読みに来ない実装であること）を確認したうえで
+     このマークアップは削除した -->
+<noscript>
+  <main style="max-width:32em;margin:10vh auto;padding:0 16px;">
+    <h2>JavaScript が必要です</h2>
+    <p>この画面は JavaScript で組み立てています。無効になっているか、
+      <span style="font-family:monospace;">/static/app.js</span> を読めていません。</p>
+    <p style="color:#8b95a2;">このままでは判定を1件も記録できません。JavaScript を有効にしてから開き直してください。</p>
+  </main>
+</noscript>
 
 <script src="/static/app.js"></script>
 </body>

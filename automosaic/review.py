@@ -44,7 +44,7 @@ import numpy as np
 from .corrections import Correction, CorrectionSet
 from .detector import CONSERVATIVE_CLASSES, DEFAULT_CLASSES, Detection
 from .render import apply_regions, default_block_size
-from .temporal import TemporalConfig, process
+from .temporal import TemporalConfig, estimated_only_ranges, process
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
@@ -878,8 +878,12 @@ def build_queue(
         if cur is None or QUEUE_REASONS[reason][0] < QUEUE_REASONS[cur][0]:
             picked[frame] = reason
 
-    # 推定のみ。5フレーム未満の断片は誤差なので拾わない（帯の表示と揃える）
-    for s, e in runs_of(coverage, COV_ESTIMATED, min_len=5):
+    # 推定のみ。temporal.estimated_only_ranges() をそのまま使う。以前はここで
+    # runs_of(coverage, COV_ESTIMATED, min_len=5) を自前で書いており、
+    # サンプリング刻みを考慮しない固定 min_len=5 のせいで1〜4フレームの
+    # 推定のみ区間がまるごとキューから消えていた。あちらは実観測間隔から
+    # 間引き刻みを推定したうえで min_len=1 を効かせるので、短い区間も拾える
+    for s, e, _peak in estimated_only_ranges(regions, n_frames):
         for f in _sample_range(s, e, step):
             add(f, "estimated")
     # 未処理は1フレームでも素通しなので、長さで足切りしない
@@ -1092,11 +1096,14 @@ class ReviewSession:
         return out
 
     def ranges_payload(self) -> dict:
-        est = runs_of(self.coverage, COV_ESTIMATED, min_len=5)
+        # ブラウザの「推定のみの区間」リストと G（次の推定のみ区間）キーが
+        # 見るのはここ。build_queue と同じ理由で、自前の min_len=5 固定をやめ
+        # temporal.estimated_only_ranges() を使う（サンプリング刻みを考慮する）
+        est = estimated_only_ranges(self.regions, self.n_frames)
         unc = runs_of(self.coverage, COV_NONE, min_len=1)
         return {
             "estimated_only_ranges": [
-                {"start": s, "end": e, "frames": e - s + 1} for s, e in est
+                {"start": s, "end": e, "frames": e - s + 1} for s, e, _peak in est
             ],
             "uncovered_ranges": [
                 {"start": s, "end": e, "frames": e - s + 1} for s, e in unc
@@ -1231,7 +1238,14 @@ class ReviewSession:
         """
         if verdict not in VERDICTS:
             raise ValueError(f"不明な判定: {verdict}")
-        frame = max(0, min(self.n_frames - 1, int(frame)))
+        frame = int(frame)
+        # 範囲外を端へ寄せない。寄せると、応答は送った番号を返すのに記録は
+        # 最終フレーム（や 0）に付く。「判定したはずのコマが未判定のまま」
+        # 「触っていないコマに判定が付く」の両方が黙って起きる（webapp と揃える）
+        if not 0 <= frame < self.n_frames:
+            raise ValueError(
+                f"フレーム番号が範囲外です: {frame}（0〜{self.n_frames - 1}）"
+            )
 
         added = 0
         n_fp = 0
@@ -1508,8 +1522,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
         if ctype.startswith("text/") or ctype.endswith("javascript"):
             ctype += "; charset=utf-8"
+        # 明示で no-store を付ける。_send_bytes の既定も no-store だが、ここで
+        # 明示しておかないと「静的ファイルにキャッシュ制御が無い」と読める。
+        # ブラウザのヒューリスティックキャッシュで旧 timeline.js が残ると、
+        # 組を割る旧ロジックが残ったクライアントから素通しを作れてしまう。
+        # ETag は付けない: no-store の下では再検証（If-None-Match）自体が
+        # 起きないので、ETag を足しても効果が無い（実測で no-store のみが
+        # 送られていることを確認済み: curl -I /static/timeline.js）
+        extra = dict(self._cookie_header())
+        extra["Cache-Control"] = "no-store"
         with open(path, "rb") as f:
-            self._send_bytes(f.read(), ctype, extra=self._cookie_header())
+            self._send_bytes(f.read(), ctype, extra=extra)
 
     # -- 動画（Range 対応） ----------------------------------------------
     def _serve_video(self) -> None:
@@ -1662,9 +1685,20 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
 
         if u.path == "/api/corrections":
+            # キーが無い本文を「空の一覧で置き換えろ」と読まない。読むと、
+            # 壊れた本文ひとつで手修正が全部消える。判定（.progress.json）は
+            # 残るので、「塞いだ」と表示されたまま塞いだ矩形だけが無い状態になる
+            items = data.get("corrections")
+            if not isinstance(items, list):
+                self._error(400, "corrections（配列）が本文にありません")
+                return
             try:
                 with s.lock:
-                    s.set_corrections(data.get("corrections", []))
+                    s.set_corrections(items)
+                    # set_corrections は履歴を捨てるが、捨てたことを保存しないと
+                    # セッションを開き直した瞬間に .progress.json から古い履歴が
+                    # 生き返り、次の undo が無関係な修正を末尾から削る（W-1）
+                    s.save_progress()
                     payload = s.update_payload()
             except Exception as e:  # noqa: BLE001
                 self._error(400, f"修正を適用できません: {e}")

@@ -9,98 +9,19 @@
 </head>
 <body>
 
-<header>
-  <div class="titles">
-    <a id="link-queue" href="/">検査キューへ戻る</a>
-    <span class="sep">|</span>
-    <span id="video-name">読み込み中</span>
-    <span class="sep">|</span>
-    <span id="video-meta"></span>
-  </div>
-  <div id="save-status" class="saved">保存済み</div>
-</header>
-
-<main>
-  <section class="stage">
-    <div id="player">
-      <video id="video" preload="metadata"></video>
-      <!-- <video> のシークはフレーム厳密でないので、停止中は
-           サーバから取った厳密なフレーム画像を上に重ねる -->
-      <img id="still" alt="">
-      <canvas id="overlay"></canvas>
-    </div>
-
-    <div class="controls">
-      <button id="btn-play">再生 / 停止 (Space)</button>
-      <button id="btn-prev">&lt; コマ戻し (,)</button>
-      <button id="btn-next">コマ送り (.) &gt;</button>
-      <span class="field">フレーム
-        <input id="frame-input" type="number" min="0" value="0">
-        <span id="frame-total"></span>
-      </span>
-      <span class="field">時刻 <span id="time-label">0.00s</span></span>
-      <button id="btn-next-est">次の推定のみ区間 (G)</button>
-    </div>
-
-    <div class="controls">
-      <span class="field">追加サイズ <span id="size-label">-</span>
-        <button id="btn-smaller">[</button><button id="btn-bigger">]</button>
-      </span>
-      <span class="field">クラス
-        <select id="class-select"></select>
-      </span>
-      <span class="field">2 の適用フレーム数
-        <input id="span-input" type="number" min="1" value="30">
-      </span>
-      <span class="field">信頼度で隠す
-        <input id="conf-slider" type="range" min="0" max="1" step="0.01" value="0">
-        <span id="conf-label">0.00</span>
-      </span>
-      <label class="field"><input id="raw-toggle" type="checkbox"> 原画で確認</label>
-      <span class="field">修正 <span id="corr-count">0</span> 件</span>
-      <button id="btn-undo">直前の修正を取り消す</button>
-    </div>
-
-    <div id="mode-hint" class="hint">
-      M で追加モード → 動画上をクリックして矩形を置く → 1 でこのフレームだけ / 2 で以降に適用
-    </div>
-  </section>
-
-  <section class="timeline-wrap">
-    <canvas id="timeline" height="46"></canvas>
-    <div class="legend">
-      <span><i class="sw sw-real"></i>被覆あり（実観測）</span>
-      <span><i class="sw sw-est"></i>推定のみ</span>
-      <span><i class="sw sw-none"></i>未処理</span>
-      <span><i class="sw sw-manual"></i>手修正あり</span>
-    </div>
-  </section>
-
-  <section class="lists">
-    <div class="list-col">
-      <h2>推定のみの区間 <span id="est-count"></span></h2>
-      <p class="note">検出が1つも無く、補間と memory だけで塗っている。位置は当てずっぽうに近い</p>
-      <ul id="est-list"></ul>
-    </div>
-    <div class="list-col">
-      <h2>未処理の区間 <span id="unc-count"></span></h2>
-      <p class="note">モザイクが1つも乗っていない。素通し</p>
-      <ul id="unc-list"></ul>
-    </div>
-    <div class="list-col">
-      <h2>手修正 <span id="man-count"></span></h2>
-      <p class="note">D でカーソル下の手修正を削除</p>
-      <ul id="man-list"></ul>
-    </div>
-  </section>
-
-  <section class="keys">
-    <b>キー</b>
-    Space 再生/停止 ・ , . コマ移動 ・ [ ] 矩形サイズ ・
-    M 追加モード ・ 1 このフレームだけ ・ 2 ここから N フレーム ・
-    D 削除 ・ G 次の推定のみ区間
-  </section>
-</main>
+<!-- 中身は timeline.js（Preact 相当のバンドル）が組み立てる。index.html と
+     同じ理由で下描きは置かない。timeline.js に getElementById が無いこと
+     （querySelector も id セレクタでは使っていないこと）を確認したうえで、
+     このマークアップは削除した。W-6 の舞台であるこの画面で
+     「押しても何も起きないボタン」が並ぶのがいちばん悪い -->
+<noscript>
+  <main style="max-width:32em;margin:10vh auto;padding:0 16px;">
+    <h2>JavaScript が必要です</h2>
+    <p>この画面は JavaScript で組み立てています。無効になっているか、
+      <span style="font-family:monospace;">/static/timeline.js</span> を読めていません。</p>
+    <p style="color:#8b95a2;">このままでは修正を1件も記録できません。JavaScript を有効にしてから開き直してください。</p>
+  </main>
+</noscript>
 
 <script src="/static/timeline.js"></script>
 </body>

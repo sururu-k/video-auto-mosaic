@@ -409,7 +409,10 @@ def test_build_queue_priority_order():
     並び順は仕様そのもの。
     """
     cov = COV_REAL * 20 + COV_ESTIMATED * 20 + COV_NONE * 5 + COV_REAL * 15
-    q = build_queue(cov, {}, 60, step=5)
+    # 「推定のみ」の判定は regions（temporal.estimated_only_ranges 経由）を見る。
+    # coverage 文字列だけでは判定できないので、20-39 を推定由来の領域にしておく
+    regions = {f: _regs((0.0, 0.0, 10.0, 10.0), 0.1, "interpolated") for f in range(20, 40)}
+    q = build_queue(cov, regions, 60, step=5)
     prios = [it["priority"] for it in q]
     assert prios == sorted(prios), "優先度の順に並んでいない"
     est = [it["frame"] for it in q if it["reason"] == "estimated"]
@@ -1405,6 +1408,195 @@ def test_http_false_positive_roundtrip():
         if httpd:
             httpd.shutdown()
             httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_corrections_payload_must_be_a_list():
+    """corrections キーの無い本文で全消ししないこと（webapp と同じ修正）。
+
+    「空の一覧で置き換えろ」と読むと、壊れた本文ひとつで手修正が全部消える。
+    判定（.progress.json）は残るので、「塞いだ」と表示されたまま
+    塞いだ矩形だけが無い状態、つまりそのフレームは素通しになる。
+    """
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    try:
+        s = make_session(tmp)
+        tok = "testtoken1234"
+        httpd, base = _serve(s, tok)
+
+        code, d = _post(
+            f"{base}/api/mark?t={tok}",
+            {"frame": 5, "verdict": "fixed", "x": 0.5, "y": 0.5, "w": 40, "h": 40},
+        )
+        assert code == 200 and d["added"] == 1, d
+
+        for bad in ({}, {"foo": "bar"}, {"corrections": None}, {"corrections": {}}):
+            code, d = _post(f"{base}/api/corrections?t={tok}", bad)
+            assert code == 400, f"{bad} を通した: {code} {d}"
+        assert len(s.corrections.items) == 1, "本文が壊れているのに消えた"
+
+        # 空配列を明示で送ったときだけ全消しになる
+        code, d = _post(f"{base}/api/corrections?t={tok}", {"corrections": []})
+        assert code == 200 and d["n_corrections"] == 0, d
+        print("  corrections キーの無い本文を拒否 OK（明示の空配列だけ通る）")
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_corrections_replace_does_not_resurrect_history_on_reopen():
+    """一覧を差し替えたあと、履歴がセッションの作り直しで生き返らないこと（W-1）。
+
+    set_corrections は履歴を捨てるが、捨てたことを保存しないと
+    .progress.json から読み戻される。生き返った履歴は差し替え後の一覧では
+    別物を指すので、undo が無関係な修正（漏れを塞いだ矩形）を末尾から削る。
+
+    監査文書の3手をそのまま再現する。
+    A) frame 10 を span=5 で塞ぐ（add 11件、frame 5-15）
+    B) 別端末のタイムラインが、frame 40-50 の add 11件を足した一覧を
+       丸ごと POST（22件）
+    C) セッションを開き直して「ひとつ戻す」
+       -> 直したはずの frame 40-50 が無関係に消えてはいけない
+    """
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    try:
+        s = make_session(tmp)
+        tok = "testtoken1234"
+        httpd, base = _serve(s, tok)
+
+        # A
+        code, d = _post(
+            f"{base}/api/mark?t={tok}",
+            {"frame": 10, "verdict": "fixed", "x": 0.5, "y": 0.5, "w": 64, "h": 64, "span": 5},
+        )
+        assert code == 200 and d["added"] == 11, d
+
+        code, body, _ = _get(f"{base}/api/corrections?t={tok}")
+        cur = json.loads(body)
+
+        # B（別端末視点。この画面自身の session オブジェクトに直接 POST する）
+        extra = [
+            {"frame": f, "box": [400, 400, 60, 60], "class": CLS, "kind": "add"}
+            for f in range(40, 51)
+        ]
+        code, d = _post(
+            f"{base}/api/corrections?t={tok}", {"corrections": cur["corrections"] + extra}
+        )
+        assert code == 200 and d["n_corrections"] == 22, d
+
+        httpd.shutdown()
+        httpd.server_close()
+        httpd = None
+
+        # C（開き直し。別端末・サーバ再起動・展開など、ディスクから読み直す
+        # すべての経路の代表として、ここでは新しい ReviewSession を作る）
+        again = make_session(tmp, corrections=CorrectionSet.load(s.corrections_path))
+        assert not again.history, "捨てたはずの履歴が生き返っている"
+
+        httpd, base = _serve(again, tok)
+        code, d = _post(f"{base}/api/undo?t={tok}", {})
+        assert d["ok"] is False, "戻す履歴が無いはずなのに戻ってしまった"
+
+        code, body, _ = _get(f"{base}/api/corrections?t={tok}")
+        frames = sorted({c["frame"] for c in json.loads(body)["corrections"]})
+        assert frames == list(range(5, 16)) + list(range(40, 51)), (
+            f"frame 40-50 が無関係に消えている: {frames}"
+        )
+        print("  修正の差し替え後、履歴が生き返らず frame 40-50 が消えない OK（W-1）")
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_mark_rejects_out_of_range_frame():
+    """範囲外のフレームを拒否すること（webapp と揃える）。
+
+    黙って端へ寄せると、応答は送った番号を返すのに記録は最終フレーム（や 0）に
+    付く。「判定したはずのコマが未判定のまま」「触っていないコマに判定が付く」
+    の両方が画面には出ないまま起きる。同じ素材を review.py と webapp の
+    両画面で見たときに判定が噛み合わなくなる。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        for bad in (s.n_frames, s.n_frames + 1, 999999, -1, -5):
+            try:
+                s.mark(bad, "ok")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"frame={bad} が通ってしまった")
+        assert not s.verdicts, "拒否したのに判定が記録されている"
+        print("  範囲外フレームの拒否 OK（session.mark 直接）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_http_mark_rejects_out_of_range_frame():
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    try:
+        s = make_session(tmp)
+        tok = "testtoken1234"
+        httpd, base = _serve(s, tok)
+        n = s.n_frames
+        for bad in (n, n + 1, 999999, -1):
+            code, d = _post(f"{base}/api/mark?t={tok}", {"frame": bad, "verdict": "ok"})
+            assert code == 400, f"frame={bad} を通した: {code} {d}"
+        assert not s.verdicts, "拒否したのに判定が記録されている"
+        assert not os.path.exists(s.progress_path) or not json.load(
+            open(s.progress_path, encoding="utf-8")
+        ).get("verdicts"), "拒否したのに進捗ファイルに記録されている"
+
+        # 範囲内は通ること
+        code, d = _post(f"{base}/api/mark?t={tok}", {"frame": n - 1, "verdict": "ok"})
+        assert code == 200 and d["frame"] == n - 1, d
+        print(f"  範囲外フレーム（{n}, 999999, -1）の HTTP 越しの拒否 OK")
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# -- 推定のみ区間（サンプリング刻みを考慮する） ---------------------------
+
+
+def test_ranges_keep_short_estimated_gaps():
+    """1〜4フレームの短い推定のみ区間も、報告とキューから落とさないこと。
+
+    以前はここを自前の runs_of(coverage, COV_ESTIMATED, min_len=5) で
+    実装しており、2〜4フレームの推定のみ区間がまるごと報告から消えていた。
+    人手レビューが実際に行われる画面（タイムラインの区間リストと G キー）が
+    見ているのはここなので、ここが見えないのがいちばん悪い。
+    temporal.estimated_only_ranges() はサンプリング刻みを自動推定したうえで
+    min_len=1 を効かせるので、間引きなしの素材では短い区間も残る。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        n_frames = 40
+        per_frame = {f: [] for f in range(n_frames)}
+        # 連続検出 0-4 と 7-39。5-6 の2フレームだけが推定のみの短い区間になる
+        for f in list(range(0, 5)) + list(range(7, n_frames)):
+            per_frame[f] = [Detection(CLS, 0.8, (200, 200, 60, 60))]
+        s = make_session(tmp, per_frame=per_frame, n_frames=n_frames)
+
+        assert s.coverage[5] == COV_ESTIMATED and s.coverage[6] == COV_ESTIMATED
+        d = s.ranges_payload()
+        assert {"start": 5, "end": 6, "frames": 2} in d["estimated_only_ranges"], (
+            d["estimated_only_ranges"]
+        )
+        assert any(
+            it["reason"] == "estimated" and 5 <= it["frame"] <= 6 for it in s.queue
+        ), s.queue
+        print("  短い推定のみ区間（2フレーム）が報告・キューに残る OK")
+    finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
