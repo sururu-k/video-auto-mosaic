@@ -843,7 +843,78 @@ def test_rotated_video_pixels_not_scrambled():
             f"（平均差分 {mean_diff:.2f}）。転置スクランブルが再発している疑い"
         )
     print("  回転動画の画素破損チェック OK")
+def test_despike_off_by_default_and_reports_when_enabled():
+    """issue #9: min_track_len の既定反転の回帰ガード。
 
+    直す前は既定でデスパイクが有効（min_track_len=2）で、単発かつスコア0.35未満の
+    トラックを黙って捨てていた。実測（docs/09-mosaic-quality.md S4）:
+    確実に映っている区間の実観測125件を捨て、うち40件はそのフレームに他の根拠が
+    無く、捨てた結果そのフレームが素通しになっていた。
+
+    既定では単発の弱い検出でも残ること、--despike を明示したときだけ落ちて
+    かつ捨てた場所（フレーム番号・クラス・スコア）が必ず報告に出ることを固定する。
+    --despike と --no-despike の同時指定はエラーで止めること（既存コマンドラインを
+    黙って別の意味にしない）も併せて確認する。
+    """
+    if not _have_ffmpeg():
+        print("  despike既定オフ + 捨てた場所の報告 SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.mp4")
+        det = os.path.join(d, "det.json")
+        n = 20
+        _make_video(src, 320, 240, n)
+        # 前後に何も無い、単発かつ低スコアの検出。despike の唯一の標的パターン
+        dets = {
+            "10": [{"class": "MALE_GENITALIA_EXPOSED", "score": 0.15,
+                    "box": [10, 10, 20, 20]}],
+        }
+        with open(det, "w", encoding="utf-8") as f:
+            json.dump(
+                {"n_frames": n, "width": 320, "height": 240,
+                 "complete": True, "detections": dets},
+                f,
+            )
+
+        # 既定（フラグ無し）: デスパイクが働かず、単発検出が生き残ること
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cli.main([src, "--detections", det, "--reuse-detections",
+                           "--detect-only"])
+        assert rc == 0
+        text = out.getvalue()
+        assert "tracks_despiked                    0" in text, (
+            f"既定でデスパイクが働いている（反転できていない）:\n{text}"
+        )
+        assert "デスパイクで捨てた実観測" not in text
+
+        # --despike: 明示的に有効化すると従来どおり捨て、かつ場所を報告する
+        out2 = io.StringIO()
+        with redirect_stdout(out2):
+            rc2 = cli.main([src, "--detections", det, "--reuse-detections",
+                            "--detect-only", "--despike"])
+        assert rc2 == 0
+        text2 = out2.getvalue()
+        assert "tracks_despiked                    1" in text2, (
+            f"--despike で捨てているはずが捨てていない:\n{text2}"
+        )
+        assert "デスパイクで捨てた実観測 1 件" in text2, (
+            f"捨てた場所のレポートが出ていない（黙って素通しにしている）:\n{text2}"
+        )
+        assert "frame      10-10" in text2, f"捨てた場所のフレーム番号が無い:\n{text2}"
+
+        # --despike と --no-despike の同時指定は矛盾として弾く（黙ってどちらかに倒さない）
+        buf = io.StringIO()
+        try:
+            with redirect_stderr(buf):
+                cli.main([src, "--detections", det, "--reuse-detections",
+                          "--detect-only", "--despike", "--no-despike"])
+        except SystemExit as e:
+            assert e.code == 2
+        else:
+            raise AssertionError("--despike --no-despike の矛盾指定が通ってしまった")
+        assert "同時に指定できません" in buf.getvalue()
+    print("  despike既定オフ + 捨てた場所の報告 OK")
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

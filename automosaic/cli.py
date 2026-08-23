@@ -598,7 +598,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.35,
         help="フレーム面積に対するこの比を超える検出を大きすぎるとして数える（落とさない）",
     )
-    t.add_argument("--no-despike", action="store_true", help="デスパイクを無効にする")
+    t.add_argument(
+        "--despike",
+        action="store_true",
+        help="デスパイクを有効にする（既定は無効）。単発かつスコア0.35未満のトラックを"
+        "丸ごと捨てる。塗り過ぎ側は許容という設計原則と噛み合わないため既定を切ってある"
+        "（docs/09-mosaic-quality.md S4: 確実に映っている区間の実観測125件を捨て、"
+        "うち40件はそのフレームが素通しになっていた）。それでも有効にした場合、"
+        "捨てた場所（フレーム番号・クラス・最大スコア）は必ず表示・レポートに出す",
+    )
+    t.add_argument(
+        "--no-despike",
+        action="store_true",
+        help="[後方互換のため残置。既定が無効になったので通常は不要] "
+        "デスパイクを無効にする。--despike と同時指定はエラー",
+    )
     t.add_argument(
         "--track-min-peak",
         type=float,
@@ -699,6 +713,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.input:
         build_parser().error("入力動画を指定してください")
+
+    if args.despike and args.no_despike:
+        build_parser().error(
+            "--despike と --no-despike は同時に指定できません（矛盾する指定を黙って"
+            "どちらかに倒さない）"
+        )
 
     src = args.input
     if not os.path.exists(src):
@@ -955,7 +975,7 @@ def main(argv: list[str] | None = None) -> int:
         memory=args.memory,
         margin_scale=args.margin_scale,
         max_area_ratio=args.max_area_ratio,
-        min_track_len=0 if args.no_despike else 2,
+        min_track_len=2 if args.despike else 0,
         bridge_max=0 if args.no_bridge else args.bridge_max,
         frame_step=max(1, args.frame_step),
         track_min_peak=args.track_min_peak,
@@ -972,6 +992,7 @@ def main(argv: list[str] | None = None) -> int:
         per_frame, n_frames, info.width, info.height, classes, cfg
     )
     left_open = stats.pop("_left_open", [])
+    despiked_ranges = stats.pop("_despiked_ranges", [])
 
     # 手修正は自動処理の後段に置く。検出をやり直しても修正が生き残るし、
     # ここで反映しておけば以降のレポートも修正後の状態を映す
@@ -1033,6 +1054,27 @@ def main(argv: list[str] | None = None) -> int:
         if len(left_open) > 20:
             print(f"  ... 他 {len(left_open) - 20} 件", file=out)
 
+    # --despike で捨てた場所は必ず表に出す。「判断できない区間を黙って素通しに
+    # しない」という設計原則は、デスパイクで捨てるという判断自体にも適用される
+    # （--quiet でも出す。素通しの直接の指標なので落とさない）。
+    if despiked_ranges:
+        fps = info.fps
+        out = sys.stderr if args.quiet else sys.stdout
+        print(f"\n[デスパイクで捨てた実観測 {len(despiked_ranges)} 件]", file=out)
+        print(
+            "  --despike は単発かつ低スコアのトラックを丸ごと捨てる。捨てた場所は"
+            "目視で確認すること",
+            file=out,
+        )
+        for start, end, cls, score in despiked_ranges[:20]:
+            print(
+                f"  frame {start:>7}-{end:<7} "
+                f"({start / fps:7.2f}s - {end / fps:7.2f}s)  {cls}  最大score={score:.3f}",
+                file=out,
+            )
+        if len(despiked_ranges) > 20:
+            print(f"  ... 他 {len(despiked_ranges) - 20} 件", file=out)
+
     est_only = estimated_only_ranges(regions, n_frames)
     if est_only and not args.quiet:
         fps = info.fps
@@ -1076,6 +1118,17 @@ def main(argv: list[str] | None = None) -> int:
                             "max_hold": peak,
                         }
                         for s_, e_, peak in est_only
+                    ],
+                    "despiked_ranges": [
+                        {
+                            "start_frame": s_,
+                            "end_frame": e_,
+                            "start_sec": round(s_ / info.fps, 3),
+                            "end_sec": round(e_ / info.fps, 3),
+                            "class": cls,
+                            "max_score": round(sc, 4),
+                        }
+                        for s_, e_, cls, sc in despiked_ranges
                     ],
                     "review_frames": flags,
                 },

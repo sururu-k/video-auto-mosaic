@@ -46,6 +46,7 @@ python -m automosaic in.mp4 --detections det.json --reuse-detections --correctio
 | `--margin-cap` | 16 | 膨張マージンの絶対上限 px |
 | `--motion-weight` | 2.0（`--estimate-gaps` 無しでは 1.0 に絞られる） | 動く対象への追従。この分は `--margin-cap` の外 |
 | `--estimate-gaps` | off | 検出が途切れた区間を推定で埋める（後述） |
+| `--despike` | off | 単発かつスコア0.35未満のトラックを丸ごと捨てる。既定オフ（実測: 確実に映っている区間の実観測125件を誤って捨て、うち40件はそのフレームが素通しになっていた。`docs/09-mosaic-quality.md` S4）。有効にすると捨てた場所を必ず表示・レポートに出す |
 | `--allow-short-detections` | off | 実尺より短い検出結果でも描画を続ける（後述） |
 | `--corrections` | — | 手修正 JSON を反映する |
 | `--crf` | 16 | x264 CRF。16〜18 が視覚的に無劣化 |
