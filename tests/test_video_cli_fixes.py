@@ -916,6 +916,97 @@ def test_despike_off_by_default_and_reports_when_enabled():
         assert "同時に指定できません" in buf.getvalue()
     print("  despike既定オフ + 捨てた場所の報告 OK")
 
+
+def test_uncovered_ranges_recomputed_after_corrections():
+    """issue #4: 「素通しの区間」表示が corr.apply() 前の left_open を使っており、
+    手修正の結果を反映していなかった回帰ガード。
+
+    直す前は、remove だけの手修正（add を伴わない bare remove。「誤検知」判定で
+    通常操作として置かれる）で自動領域が空になったフレームがあっても、
+    report の uncovered_ranges / 画面の「素通しの区間 N 件」が 0 件のまま
+    だった（bridge_uncovered() が返す left_open は corr.apply() より前の値
+    のため）。add で埋めた場合も同様に、埋めた後は消えるべきものが
+    残っていた可能性がある。ここでは両方向を確認する。
+    """
+    if not _have_ffmpeg():
+        print("  素通し区間の再計算 SKIP (ffmpeg 無し)")
+        return
+    from automosaic import corrections as corr
+
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.mp4")
+        det = os.path.join(d, "det.json")
+        n = 40
+        _make_video(src, 320, 240, n)
+
+        box = [80, 60, 120, 120]
+        dets = {}
+        for f in list(range(0, 10)) + list(range(30, n)):
+            dets[str(f)] = [{"class": "FEMALE_GENITALIA_EXPOSED", "score": 0.9, "box": box}]
+        # 10..29 は検出なし（20フレームの内部ギャップ。--estimate-gaps 無しの既定
+        # では bridge_max が絞られ自動では埋まらない。--stitch-gap 0 で
+        # stitch_tracks による再結合＝補間扱いも切り、本当に空のフレームを作る）
+        _write_detections(det, n, 320, 240, complete=True, dets=dets)
+
+        # 前提確認: 手修正なしでは、その内部ギャップが実際に素通しとして出ること
+        report0 = os.path.join(d, "report0.json")
+        rc = cli.main([src, "--detections", det, "--reuse-detections",
+                       "--stitch-gap", "0",
+                       "--detect-only", "--report", report0, "--quiet"])
+        assert rc == 0
+        with open(report0, encoding="utf-8") as f:
+            rep0 = json.load(f)
+        base_gaps = rep0["uncovered_ranges"]
+        assert base_gaps, "前提が崩れている: 内部ギャップが素通しにならなかった"
+        gap_frames = sorted({
+            fr for g in base_gaps for fr in range(g["start_frame"], g["end_frame"] + 1)
+        })
+
+        # add: そのギャップ全部を手修正で埋める -> 素通し表示から消えること
+        cset_add = corr.CorrectionSet(video=src, width=320, height=240)
+        for fr in gap_frames:
+            cset_add.add(corr.Correction(frame=fr, box=(5, 5, 10, 10), kind="add"))
+        corr_add = os.path.join(d, "corr_add.json")
+        cset_add.save(corr_add)
+        report_add = os.path.join(d, "report_add.json")
+        rc = cli.main([src, "--detections", det, "--reuse-detections",
+                       "--stitch-gap", "0",
+                       "--corrections", corr_add,
+                       "--detect-only", "--report", report_add, "--quiet"])
+        assert rc == 0
+        with open(report_add, encoding="utf-8") as f:
+            rep_add = json.load(f)
+        assert rep_add["uncovered_ranges"] == [], (
+            f"add で埋めたのに素通し扱いのまま報告に残っている: "
+            f"{rep_add['uncovered_ranges']}"
+        )
+
+        # remove: 検出がある側 (frame 0-9) をまるごと bare remove で消す
+        # -> add を伴わないので、そのフレームは空になり素通しとして出るべき
+        cset_rm = corr.CorrectionSet(video=src, width=320, height=240)
+        for fr in range(0, 10):
+            cset_rm.add(corr.Correction(frame=fr, box=(0, 0, 320, 240), kind="remove"))
+        corr_rm = os.path.join(d, "corr_rm.json")
+        cset_rm.save(corr_rm)
+        report_rm = os.path.join(d, "report_rm.json")
+        rc = cli.main([src, "--detections", det, "--reuse-detections",
+                       "--stitch-gap", "0",
+                       "--corrections", corr_rm,
+                       "--detect-only", "--report", report_rm, "--quiet"])
+        assert rc == 0
+        with open(report_rm, encoding="utf-8") as f:
+            rep_rm = json.load(f)
+        removed_ranges = rep_rm["uncovered_ranges"]
+        removed_frames = {
+            fr for g in removed_ranges for fr in range(g["start_frame"], g["end_frame"] + 1)
+        }
+        assert set(range(0, 10)) <= removed_frames, (
+            "remove だけの手修正で空になったフレームが素通しとして報告されていない "
+            f"（安全表示が嘘をついている）: uncovered_ranges={removed_ranges}"
+        )
+    print("  素通し区間の再計算（add で消える／remove で出る） OK")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"{len(tests)} 件のテストを実行\n")
