@@ -390,6 +390,78 @@ def test_progress_regex_matches_cli_output():
     print(f"  進捗行の解釈 OK（{lines[0].strip()!r}）")
 
 
+class _FakePipe:
+    """`_pump` に渡す偽のパイプ。バイト列をどこで chunk に切るか自分で決められる。
+
+    実際の OS パイプだと chunk 境界を狙って作れないので、
+    read1() が返す chunk をあらかじめ指定できるようにしてある。
+    """
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks) + [b""]
+        self._i = 0
+
+    def read1(self, n: int = -1) -> bytes:
+        c = self._chunks[self._i]
+        self._i += 1
+        return c
+
+    def close(self) -> None:
+        pass
+
+
+def test_pump_survives_multibyte_split_at_chunk_boundary():
+    """issue #30: 日本語の多バイト文字が chunk 境界をまたいでも壊れないこと。
+
+    `_pump` は chunk ごとに独立して `decode("utf-8", "replace")` していたため、
+    UTF-8 の継続バイトのど真ん中で chunk を切ると、前後どちらの chunk でも
+    デコードに失敗し、化けた上に進捗の正規表現が当たらなくなっていた
+    （稼働中ジョブの実ログで実測: 'ブロック' -> 'ブロ\\udc83ク' 等）。
+
+    cli.Progress が実際に書く2行ぶんの出力を、マルチバイト文字の
+    継続バイト位置すべてで2分割し、それぞれ `_pump` に流し込んで
+    (1) 置換文字が残らないこと (2) 進捗の正規表現が当たり、値が
+    正しく拾えることを確認する。2行目は末尾に区切り文字が無いので
+    ストリーム終端（final=True でのデコーダ確定）の経路も通る。
+    """
+    from automosaic.cli import Progress
+
+    cap = io.StringIO()
+    real, sys.stderr = sys.stderr, cap
+    try:
+        p = Progress(4560, "パス1 検出")
+        p.update(123, force=True)
+        p.update(4560, force=True)
+    finally:
+        sys.stderr = real
+    data = cap.getvalue().encode("utf-8")
+
+    lib = jobs_mod.Library(make_lib())
+    job = lib.create("split.mp4")
+
+    n_boundaries = 0
+    for cut in range(1, len(data)):
+        b = data[cut]
+        if not (0x80 <= b <= 0xBF):
+            continue  # UTF-8 の継続バイトでない = 文字の途中で切れていない
+        n_boundaries += 1
+        r = runner_mod.JobRunner(job, {})
+        r._pump(_FakePipe([data[:cut], data[cut:]]), is_err=True)
+
+        joined = "".join(e["text"] for e in r.log)
+        assert "�" not in joined, f"cut={cut}バイト目: 化けが残った: {joined!r}"
+
+        assert "pass1" in r.progress, (
+            f"cut={cut}バイト目: 境界に当たって進捗の正規表現が外れた: {joined!r}"
+        )
+        # 2行目（4560/4560）が最後に処理されて上書きすること
+        assert r.progress["pass1"]["n"] == 4560, f"cut={cut}バイト目: {r.progress}"
+        assert r.progress["pass1"]["total"] == 4560
+
+    assert n_boundaries > 0, "境界候補が無い（テストとして無意味）"
+    print(f"  chunk境界（継続バイト {n_boundaries} 箇所）をまたいでも化けず進捗も拾える OK")
+
+
 def test_build_argv():
     lib = jobs_mod.Library(make_lib())
     job = lib.create("a.mp4")
