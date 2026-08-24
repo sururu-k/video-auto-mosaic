@@ -20,6 +20,7 @@ import type {
   SettingFlag,
 } from "../shared/api.js";
 import { SETTING_FIELDS, SETTING_FLAGS } from "../shared/api.js";
+import { proxyLabel } from "../shared/job-logic.js";
 import { api, errText, fmtBytes, fmtSec, fmtTime, link, url } from "../shared/webapp-net.js";
 import { StatusBadge } from "./StatusBadge.js";
 
@@ -205,6 +206,21 @@ function App() {
     };
   }, []);
 
+  // プロキシ（issue #18）の生成は、パス2完了後にサーバがバックグラウンドで
+  // 走らせる別スレッドで、ジョブ本体の進捗 SSE には乗らない。「未生成」
+  // 「生成中」から動きがあったかを見るためだけに、ゆるく細切れで detail を
+  // 取り直す。done か failed になったら止める。failed から先は自動で
+  // 再試行しない（次にこのページを開いたときに ensure_started 側が
+  // 自然に拾う。proxy.py 参照）。生成中に再取得しても ensure_started は
+  // 多重起動しないので、無駄な呼び直しにはならない
+  useEffect(() => {
+    if (status !== "done") return;
+    const ps = detail?.proxy_status;
+    if (ps === "done" || ps === "failed") return;
+    const t = setTimeout(() => void loadDetail(), 3000);
+    return () => clearTimeout(t);
+  }, [status, detail?.proxy_status]);
+
   // ----------------------------------------------------------------
   // 操作
   // ----------------------------------------------------------------
@@ -385,6 +401,31 @@ function App() {
           <video id="preview" class={d?.has_output ? "" : "hidden"} controls playsInline
                  src={d?.has_output ? link(`/api/jobs/${JOB}/video`) : undefined}
                  style={{ maxWidth: "100%", marginTop: "10px" }} />
+        </div>
+
+        <div class="card">
+          <h2>確認用プロキシ（全編の下見用）</h2>
+          <p id="proxy-status" class={d?.proxy_status === "failed" ? "warn" : "dim"}>
+            状態: {proxyLabel(d?.proxy_status ?? null)}
+            {!d?.has_output ? "（完成品ができてから作ります）" : ""}
+            {d?.proxy_status === "generating"
+              ? "（低解像度版を作っています。数分かかることがあります）"
+              : ""}
+            {d?.proxy_status === "failed" && d.proxy_error ? "：" + d.proxy_error : ""}
+          </p>
+          {d?.has_output && d.proxy_status === "done" ? (
+            <>
+              <p class="dim">
+                全編を素早く流し見て怪しい場所の見当をつけるための低解像度版です。
+                縮小すると小さいモザイクの欠けは見えなくなります（実測:
+                640px に縮小すると12px未満のモザイクはほぼ見えません）。
+                <strong>判定は原寸（上の完成品）で行ってください。</strong>
+              </p>
+              <video id="proxy-preview" controls playsInline
+                     src={link(`/api/jobs/${JOB}/proxy`)}
+                     style={{ maxWidth: "100%", marginTop: "10px" }} />
+            </>
+          ) : null}
         </div>
 
         <div class="card">

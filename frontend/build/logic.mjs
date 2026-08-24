@@ -319,6 +319,20 @@ function drawHandOverlay(ctx, o) {
     ctx.setLineDash([]);
   }
 }
+
+// src/shared/job-logic.ts
+function proxyLabel(status) {
+  switch (status) {
+    case "generating":
+      return "生成中";
+    case "done":
+      return "完成";
+    case "failed":
+      return "失敗";
+    default:
+      return "未生成";
+  }
+}
 export {
   MARK_MODES,
   SRC_COLOR,
@@ -341,6 +355,7 @@ export {
   overlaps,
   pickIndexAt,
   progressPercent,
+  proxyLabel,
   requestWidth,
   scaledSize,
   spanOptions,
