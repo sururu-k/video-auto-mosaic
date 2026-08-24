@@ -4,7 +4,11 @@
 推定のみ区間の報告漏れ、冒頭 docstring の処理順、および再監査での積み残し
 A（視面積比ちょうど1.0の全面検出が既定で drop される）、
 I（min_area_ratio が可視面積で判定され画面端の検出を誤って落とす）、
-H（--frame-step > 1 の素材で推定のみ区間の報告が間引き由来のノイズで水増しされる）。
+H（--frame-step > 1 の素材で推定のみ区間の報告が間引き由来のノイズで水増しされる）、
+issue #10（bridge_uncovered / estimated_only_ranges がフレーム単位で「矩形が
+1個でもあれば覆われている」と判定していたため、同じフレームに複数対象が
+映る場面で片方の対象の穴がもう片方の矩形に隠れて報告からも橋渡しからも
+消えていた件）。
 """
 
 import math
@@ -311,6 +315,73 @@ def test_frame_step_sampling_noise_is_suppressed_but_real_gaps_survive():
     est1 = estimated_only_ranges(regions1, 40)
     assert len(est1) == 1 and est1[0][1] - est1[0][0] + 1 == 2
     print(f"  間引き由来ノイズの抑制 OK（4フレーム区間は消え、本物の14フレーム漏れは残る）")
+
+
+def test_bridge_is_not_masked_by_other_object():
+    """issue #10: 対象Aの穴が、同じフレームに映る対象Bの矩形に隠れて
+    bridge が起動しない不具合の回帰テスト。
+
+    修正前は `covered = [bool(per_frame.get(f)) for f in range(n_frames)]` が
+    フレーム単位だったため、対象Bが常に映っていると、対象Aのトラックが
+    max_gap を超えて分断されても bridge が一切起動しなかった
+    （実測: regions_bridged が 0 のまま、50フレーム丸ごと対象Aが素通しになる）。
+
+    対象Aは同じ位置に静止（gap前後で位置・大きさが同一）なので、stitch と
+    同じ判定基準を使う系統判定なら同一対象と分かる。ただし stitch_max_gap は
+    意図的に対象Aの穴(50フレーム)より短く設定し、stitch_tracks 自体では
+    繋がらないようにしてある（純粋に bridge 側の系統判定を検証するため）。
+    """
+    N = 150
+    dets: dict[int, list[Detection]] = {f: [] for f in range(N)}
+    # 対象A: 同じ位置に静止。フレーム50-99が検出漏れ
+    for f in list(range(0, 50)) + list(range(100, 150)):
+        dets[f].append(Detection(CLS, 0.8, (50, 50, 40, 40)))
+    # 対象B: 別の位置に、全フレームで途切れず映り続ける
+    for f in range(N):
+        dets[f].append(Detection(CLS, 0.8, (400, 400, 40, 40)))
+
+    cfg = TemporalConfig(
+        max_gap=12, memory=0, stitch_max_gap=40, bridge_max=150, min_track_len=0
+    )
+    regions, stats = process(dets, N, W, H, {CLS}, cfg)
+
+    assert stats["tracks_stitched"] == 0, "対象Aの前後トラックが stitch で繋がってしまっている（前提が崩れている）"
+    assert stats["regions_bridged"] > 0, "対象Aの穴が一切橋渡しされていない"
+
+    for f in range(50, 100):
+        assert len(regions[f]) == 2, (
+            f"フレーム{f}: 対象Bの矩形に隠れて対象Aの穴が橋渡しされていない "
+            f"(regions={[r[0] for r in regions[f]]})"
+        )
+        xs = sorted(b[0] for b, _ in regions[f])
+        assert xs[0] < 100, f"フレーム{f}: 対象A側の矩形が見当たらない ({xs})"
+    print(f"  他対象に隠れた穴の橋渡し OK (regions_bridged={stats['regions_bridged']})")
+
+
+def test_estimated_only_is_not_masked_by_other_object():
+    """issue #10: 対象Aの「推定のみ」区間が、同じフレームの対象Bの実観測に
+    隠れて estimated_only_ranges から消える不具合の回帰テスト。
+
+    修正前は `has_real = any(...)` がフレーム内の全領域を対象にしていたため、
+    対象Aが補間だけで対象Bが毎フレーム実観測なら、対象Aの補間区間が
+    一件も報告されなかった。
+    """
+    N = 20
+    dets: dict[int, list[Detection]] = {f: [] for f in range(N)}
+    # 対象A: フレーム0と10だけ実観測、1-9は補間のみ
+    dets[0].append(Detection(CLS, 0.8, (50, 50, 40, 40)))
+    dets[10].append(Detection(CLS, 0.8, (50, 50, 40, 40)))
+    # 対象B: 毎フレーム実観測
+    for f in range(N):
+        dets[f].append(Detection(CLS, 0.8, (400, 400, 40, 40)))
+
+    cfg = TemporalConfig(max_gap=12, memory=0, min_track_len=0, bridge_max=0)
+    regions, _ = process(dets, N, W, H, {CLS}, cfg)
+    est = estimated_only_ranges(regions, N)
+
+    assert est, "対象Aの推定のみ区間(1-9)が対象Bの実観測に隠れて報告から消えている"
+    assert any(s == 1 and e == 9 for s, e, _ in est), est
+    print(f"  他対象の実観測に隠れた推定のみ区間の報告 OK ({est})")
 
 
 def test_module_docstring_matches_implementation():
