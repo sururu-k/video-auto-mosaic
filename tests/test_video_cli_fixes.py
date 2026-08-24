@@ -519,9 +519,9 @@ def test_subtitle_mkv_to_mkv_still_succeeds():
 
 
 def test_run_render_wraps_writer_oserror_without_preflight():
-    """issue #59 検証の条件1（段1単独）: run_render() 内の
-    `writer.stdin.write` を囲む `except OSError: break` だけを守っている
-    ケースを、main() の preflight を経由せず直接見る。
+    """段1単独: run_render() 内の `writer.stdin.write` を囲む
+    `except OSError: break` だけを守っているケースを、main() の
+    preflight を経由せず直接見る。
 
     preflight（main() 側、段2）と run_render の except OSError（段1）は、
     どちらも「字幕・添付のコーデックがコンテナ非対応で writer が死ぬ」
@@ -531,6 +531,13 @@ def test_run_render_wraps_writer_oserror_without_preflight():
     「本当の理由（subrip 非対応）」つきの RuntimeError になり、
     生の BrokenPipeError/OSError が外に漏れないこと、0バイトの出力が
     残らないことを見る。
+
+    ffmpeg（writer）の起動タイミング次第で、10フレームの書き込みが
+    1回も OSError を起こさず通り切ることがある。その場合 write_failed は
+    立たず、直後の writer.returncode 判定（「エンコードに失敗しました」）
+    が本当の理由を出す。どちらの経路も段1（except OSError）が握りつぶさず
+    尻切れ出力を残さないという保証範囲の内側なので、メッセージは両方
+    受け付ける。
     """
     if not _have_ffmpeg():
         print("  段1単独: writer 途中死亡の握りつぶし SKIP (ffmpeg 無し)")
@@ -550,14 +557,14 @@ def test_run_render_wraps_writer_oserror_without_preflight():
                                28, "ultrafast", None, quiet=True)
             except RuntimeError as e:
                 msg = str(e)
-                assert "エンコードへの書き込みに失敗しました" in msg, (
-                    f"想定と違う RuntimeError: {msg!r}"
-                )
+                assert (
+                    "エンコードへの書き込みに失敗しました" in msg
+                    or "エンコードに失敗しました" in msg
+                ), f"想定と違う RuntimeError: {msg!r}"
                 assert "subrip" in msg, f"本当の理由が出ていない: {msg!r}"
             else:
                 raise AssertionError(
                     "字幕コーデック非対応で writer が落ちるはずなのに例外にならなかった"
-                    "（環境依存の可能性があるので疑わしければ再実行して確かめること）"
                 )
         finally:
             sys.stderr = real_stderr
@@ -566,7 +573,7 @@ def test_run_render_wraps_writer_oserror_without_preflight():
 
 
 def test_preflight_blocks_before_pass1_detection():
-    """issue #59 検証の条件1（段2単独）: main() の preflight 呼び出し
+    """段2単独: main() の preflight 呼び出し
     だけを守っているケースを、パス1（検出）が呼ばれたかどうかで見分ける。
 
     段1（run_render 内の except OSError）は生きたままにする。段2

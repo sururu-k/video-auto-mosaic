@@ -350,7 +350,7 @@ def _preflight_advice(err: str) -> str:
     issue #3 は「本当の理由が隠れる」ことそのものが問題だった。preflight の
     どんな失敗にも同じ「字幕・添付フォントを疑え」という文言を無条件に付けると、
     別の理由（権限・ディスク・解像度など）まで字幕のせいに見せてしまい、
-    同じ問題を別の形で繰り返す（issue #59 検証で指摘）。
+    同じ問題を別の形で繰り返す。
     ffmpeg 自身が「コーデックがコンテナに非対応」と言っている場合だけ助言を出す。
     """
     if (
@@ -480,7 +480,7 @@ def run_render(
         # はず（stderr は _drain が拾い続けている）。reader/idx の食い違いチェックより
         # 先に、こちらを本当の理由として出す。
         # writer が returncode=0 のまま stdin だけ閉じて途中で終わることがあり、
-        # そのときは werr が空でコロンの後に何も出ない（issue #59 検証で実測）。
+        # そのときは werr が空でコロンの後に何も出ない。
         # returncode と、何フレーム目まで書けていたかを添えて診断可能にする。
         _quarantine_incomplete_output(dst)
         detail = "\n".join(werr[-15:])
@@ -872,7 +872,7 @@ def main(argv: list[str] | None = None) -> int:
     #
     # --detect-only は動画を1バイトも書かない（パス2に入らない）ので、
     # 出力コンテナの都合で足止めする理由が無い。奇数解像度 + --detect-only
-    # を通す issue #2 の受け入れ条件と衝突するため、必ず飛ばす（#59 検証で指摘）。
+    # を通す issue #2 の受け入れ条件と衝突するため、必ず飛ばす。
     if not args.detect_only:
         pix_fmt = vid.detect_pix_fmt(info)
         dst_ext = os.path.splitext(dst)[1] or ".mp4"
@@ -887,7 +887,7 @@ def main(argv: list[str] | None = None) -> int:
         # 既存の完成品があった場合、preflight が -y で先に潰してしまうのを避ける
         # ため（この後の検出が失敗しても、既存の dst は preflight の時点では
         # 触られない）。固定名（stem+".preflight"+ext）だと、同名の既存ファイルを
-        # 黙って消したり、同一出力先への並行実行が競合したりする（#59 検証で実測）
+        # 黙って消したり、同一出力先への並行実行が競合したりする
         # ので tempfile.mkstemp で一意な名前を取る。
         try:
             fd, preflight_dst = tempfile.mkstemp(
@@ -917,7 +917,7 @@ def main(argv: list[str] | None = None) -> int:
         if not preflight_ok:
             # ffmpeg 自身の stderr には scratch パス（preflight_dst）がそのまま
             # 出てくることがある。利用者が指定した dst に置き換えてから見せる
-            # （内部の scratch 名を漏らさない。#59 検証で指摘）。
+            # （内部の scratch 名を漏らさない）。
             shown_err = preflight_err.strip().replace(preflight_dst, dst)
             print(
                 f"出力 {dst} を書き出せません（検出・描画に入る前の事前確認で判明しました）:\n"
