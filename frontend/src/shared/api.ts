@@ -23,7 +23,13 @@ export type Verdict = "ok" | "fixed" | "unsure" | "toobig" | "false_positive";
 export type SourceCode = "d" | "i" | "m" | "b" | "x";
 
 /** 検査キューに載せた理由。review.py の QUEUE_REASONS のキー */
-export type QueueReason = "estimated" | "uncovered" | "area_jump" | "low_conf" | "sampled";
+export type QueueReason =
+  | "despiked"
+  | "estimated"
+  | "uncovered"
+  | "area_jump"
+  | "low_conf"
+  | "sampled";
 
 /** 手修正の種類。add=漏れを埋める remove=過剰なモザイクを打ち消す */
 export type CorrectionKind = "add" | "remove";
@@ -52,9 +58,16 @@ export interface FrameRange {
   frames: number;
 }
 
+/** despike が捨てた帯。区間 + どのクラスをどのスコアで捨てたか */
+export interface DespikedRange extends FrameRange {
+  class: string;
+  max_score: number;
+}
+
 export interface RangesPayload {
   estimated_only_ranges: FrameRange[];
   uncovered_ranges: FrameRange[];
+  despiked_ranges: DespikedRange[];
 }
 
 /** state_payload(light=True) の中身。重い配列を落としたもの */

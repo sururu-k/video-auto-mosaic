@@ -147,6 +147,7 @@ input[type=range] { padding: 0; }
 .tag { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: #2b303a; }
 .tag.p1 { background: #5a2c2c; }
 .tag.p2 { background: #5a4520; }
+.tag.p3 { background: #3a2c5a; }
 
 .save.ok { color: #93e0ac; }
 .save.busy { color: var(--warn); }
