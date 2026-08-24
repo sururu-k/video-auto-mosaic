@@ -452,6 +452,12 @@ function App() {
         <button id="btn-menu" onClick={() => setSheetOpen(true)}>設定</button>
       </header>
 
+      {state?.effective_check.restored && (
+        <div id="effective-restored" class="restored-note">
+          設定を復元して表示中: {state.effective_check.note}
+        </div>
+      )}
+
       <div class="bar"><i id="progress-fill" style={{ width: pct.toFixed(1) + "%" }} /></div>
 
       <div id="stage">

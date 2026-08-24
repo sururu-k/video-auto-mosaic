@@ -28,6 +28,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
+from .. import cli
 from .. import review
 from . import handdraw
 from . import jobs as jobs_mod
@@ -410,6 +411,113 @@ def create_app(
     # ------------------------------------------------------------------
     # 3. 検査キュー
     # ------------------------------------------------------------------
+    # 復元は「今のコードの絞り込みが、焼いたときと同じ」という仮定の上に立つ。
+    # #14 と同種の食い違いを黙って通さないよう、復元した事実は必ず状態に出す
+    # （このメッセージ文言そのものを画面に出す。RULES.md 0）。
+    _RESTORED_NOTE = (
+        "report.json に実効設定の記録が無いため、meta.argv から復元して"
+        "突き合わせました。今のコードの絞り込みが、焼いたときと同じという"
+        "仮定に基づく復元で、確実な一致の保証ではありません。"
+    )
+
+    def _report_effective(job: Job) -> tuple[dict | None, bool]:
+        """report.json から実効設定のフィンガープリントを取り出す。
+
+        戻り値は (フィンガープリント or None, meta.argv から復元したか)。
+
+        report.json に `effective`/`effective_sha256` が無い（issue #16 より
+        前に焼かれた・壊れている・古い形式）場合、そのまま「無い」扱いには
+        せず、同じジョブの meta.argv から cli.py と同じ絞り込み関数
+        （resolve_classes -> narrow_estimate_gaps -> build_cfg -> effective_settings）
+        を通して実効設定を復元する。**この道具で唯一実在する完走ジョブが、
+        report.json の形式が変わっただけでレビュー不能になる事態を避けるため。**
+        復元もできなければ (None, False) を返す。呼び出し側はこれを
+        「一致」として扱わないこと。
+        """
+        eff = None
+        sha = None
+        if os.path.exists(job.report):
+            try:
+                with open(job.report, encoding="utf-8") as f:
+                    rep = json.load(f)
+            except (OSError, ValueError):
+                rep = {}
+            eff = rep.get("effective")
+            sha = rep.get("effective_sha256")
+        if eff and sha:
+            return {"effective": eff, "sha256": sha}, False
+
+        argv = job.meta.get("argv")
+        width = job.meta.get("width")
+        height = job.meta.get("height")
+        if not argv or not width or not height:
+            return None, False
+        try:
+            restored = cli.effective_settings_from_argv(
+                argv, max(int(width), int(height))
+            )
+        except Exception:  # noqa: BLE001 -- 壊れた記録で例外にせず、復元不可扱いにする
+            return None, False
+        if restored is None:
+            return None, False
+        return {
+            "effective": restored,
+            "sha256": cli.effective_settings_sha256(restored),
+        }, True
+
+    def _check_effective_settings(job: Job, s) -> dict:
+        """レビューの実効設定を、実際に焼いた report.json と突き合わせる。
+
+        issue #16: どちらも警告ゼロ・エラーゼロで食い違っていた（#14, #15）。
+        黙って通さず、食い違いを検出したら絵を返さずに 409 で止める
+        （RULES.md 0: 判断がつかないときは塞ぐ・止める）。
+
+        完成品（job.output）がまだ無いジョブは比較対象が無い。検出だけ済ませて
+        描画前にレビュー/手描きをする通常の使い方を塞がないよう、ここでは
+        何もしない。
+
+        戻り値は `/state` に載せる注記。`{"restored": bool, "note": str|None}`。
+        呼び出し側（get_session）がセッションに持たせ、api_state が状態に
+        載せる。フロント（review.tsx / draw.tsx）はこれを常時表示すること。
+        """
+        if not os.path.exists(job.output):
+            return {"restored": False, "note": None}
+        rep, restored = _report_effective(job)
+        session_eff = s.effective_settings()
+        session_sha = s.effective_sha256()
+        if rep is None:
+            tried = (
+                "meta.argv からの復元も試みましたが失敗しました。"
+                if job.meta.get("argv")
+                else "meta.argv の記録も無いため復元もできません。"
+            )
+            raise _err(
+                409,
+                "完成品はありますが report.json に実効設定の記録がありません"
+                "（古い形式か破損しています）。" + tried +
+                "レビューが焼き込みと同じ設定で絵を作っている保証がないため"
+                "表示できません。焼き直すと記録されます。"
+                f" レビュー側の実効設定: {session_eff}",
+            )
+        if rep["sha256"] != session_sha:
+            restored_note = (
+                "（report.json に記録が無く、meta.argv から復元した値で比較しています。"
+                "復元は今のコードの絞り込みが焼いたときと同じという仮定に基づくため、"
+                "この不一致自体が復元側のずれである可能性も残ります。） "
+                if restored
+                else ""
+            )
+            raise _err(
+                409,
+                "この動画は表示中の設定と違う設定で焼かれています。"
+                + restored_note +
+                "焼き直すか、レビューの設定を焼き込みに合わせてください。"
+                f" 焼き込み: {rep['effective']} / レビュー: {session_eff}",
+            )
+        if restored:
+            return {"restored": True, "note": _RESTORED_NOTE}
+        return {"restored": False, "note": None}
+
     def get_session(job: Job):
         # ジョブの settings（焼き込みに使った mode/block/classes/estimate_gaps
         # など）を、そのままレビューにも渡す。ここを空のまま呼ぶと、レビューは
@@ -422,13 +530,17 @@ def create_app(
             # 誤認させるので、レビューを止めて利用者に直させる
             raise _err(400, str(e))
         try:
-            return sessions.get(job, **overrides)
+            s = sessions.get(job, **overrides)
         except FileNotFoundError as e:
             raise _err(400, str(e))
         except SystemExit as e:  # session_from_args は SystemExit で止める
             raise _err(400, str(e))
         except RuntimeError as e:
             raise _err(400, str(e))
+        # api_state が読む。セッションはジョブIDでキャッシュされるが、
+        # このチェック自体は呼ぶたびに report.json を読み直して行うので古くならない。
+        s.effective_check = _check_effective_settings(job, s)
+        return s
 
     @app.get("/api/jobs/{job_id}/state")
     def api_state(job_id: str, light: int = 1):
@@ -437,6 +549,12 @@ def create_app(
         with s.lock:
             d = s.state_payload(bool(light))
         d["job"] = job.summary()
+        # issue #16: report.json に effective が無く meta.argv から復元した
+        # ときは、黙って通さず画面に出す（RULES.md 0）。get_session が
+        # このチェックを毎回やり直してセッションに乗せている
+        d["effective_check"] = getattr(
+            s, "effective_check", {"restored": False, "note": None}
+        )
         return d
 
     @app.get("/api/jobs/{job_id}/queue")

@@ -70,6 +70,19 @@ export interface RangesPayload {
   despiked_ranges: DespikedRange[];
 }
 
+/**
+ * issue #16: report.json の実効設定フィンガープリントとの突き合わせ結果。
+ * webapp/app.py の _check_effective_settings() が組む。突き合わせで
+ * 食い違えば /state 自体が 409 になるので、ここに乗るのは通った場合のみ。
+ * restored=true は「report.json に記録が無く meta.argv から復元した」印で、
+ * 復元は「今のコードの絞り込みが焼いたときと同じ」という仮定に基づく
+ * （確実な一致の保証ではない）。黙って通さず、画面に出し続けること。
+ */
+export interface EffectiveCheck {
+  restored: boolean;
+  note: string | null;
+}
+
 /** state_payload(light=True) の中身。重い配列を落としたもの */
 export interface StateLight {
   video: string;
@@ -88,6 +101,7 @@ export interface StateLight {
   version: number;
   queue_step: number;
   n_corrections: number;
+  effective_check: EffectiveCheck;
 }
 
 /**

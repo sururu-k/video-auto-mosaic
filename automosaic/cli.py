@@ -29,6 +29,8 @@ from . import corrections as corr
 from .render import FrameBuffer, apply_regions, default_block_size
 from .temporal import (
     TemporalConfig,
+    effective_settings,
+    effective_settings_sha256,
     estimated_only_ranges,
     frames_with_mosaic_count,
     narrow_without_estimate_gaps,
@@ -794,6 +796,80 @@ def explicit_options(argv: list[str] | None) -> set[str]:
     return {k for k, v in vars(parsed).items() if v is not None}
 
 
+def build_cfg(args) -> TemporalConfig:
+    """絞り込み済みの args から TemporalConfig を組む。
+
+    main() と effective_settings_from_argv() の両方がこれを呼ぶ。cfg の
+    組み立てを2箇所に書くと、フィールドを1個足したときに片方だけ更新し
+    忘れる経路ができる。
+    """
+    return TemporalConfig(
+        max_gap=args.max_gap,
+        memory=args.memory,
+        margin_scale=args.margin_scale,
+        max_area_ratio=args.max_area_ratio,
+        min_track_len=2 if args.despike else 0,
+        bridge_max=0 if args.no_bridge else args.bridge_max,
+        frame_step=max(1, args.frame_step),
+        track_min_peak=args.track_min_peak,
+        memory_before=args.memory_before,
+        stitch_max_gap=args.stitch_gap,
+        stitch_dist_ratio=args.stitch_dist,
+        margin_cap_px=args.margin_cap,
+        motion_weight=args.motion_weight,
+        hold_growth=args.hold_growth,
+        motion_cap=args.motion_cap,
+        estimated_factor=args.estimated_factor,
+    )
+
+
+def effective_settings_from_argv(
+    argv: list[str] | None, long_edge: int
+) -> dict | None:
+    """meta.argv から実効設定を復元する。
+
+    issue #16 より前に焼かれたジョブは report.json に `effective` を持たない。
+    この関数は main() が cfg を組み立てるのと同じ手順（temporal.resolve_classes ->
+    temporal.narrow_without_estimate_gaps -> build_cfg -> effective_settings）を、
+    焼いたときの argv に対してもう一度通す。resolve_classes /
+    narrow_without_estimate_gaps は review.py の session_from_args() とも共有する
+    唯一の実装（issue #33・#56）で、ここではそれをそのまま借りる。
+
+    **これは仮定の上に立つ。** 「今のコードの絞り込みが、焼いたときと
+    同じ」という前提が崩れていれば、ここで復元した値は実際に焼かれた絵と
+    食い違いうる（#14 と同じ種類の食い違い）。呼び出し側は、この関数が
+    値を返したことを「確実に正しい」と書いてはならず、復元したことと
+    その旨の留保を必ず状態に出すこと。
+
+    argv の形式に合わない・パースできない・矛盾した指定（--despike と
+    --no-despike の同時指定など）を含む場合は None を返す。「復元できない」
+    は失敗ではなく、呼び出し側が 409 で止める根拠になる。
+    """
+    if not argv or not isinstance(argv, (list, tuple)):
+        return None
+    # build_argv()（webapp/runner.py）が組む形式:
+    # [python実行体, "-m", "automosaic", 入力, ...]。build_parser() は
+    # sys.argv[1:] 相当（python実行体を含まない）を期待するので、そこだけ削る。
+    # 想定外の形（python -m 以外で起動した記録など）はここで弾かず、
+    # そのまま渡して parse_args に判断させる（余計な位置引数はエラーになる）。
+    tail = [str(a) for a in argv]
+    if len(tail) >= 3 and tail[1] == "-m" and tail[2] in ("automosaic", "automosaic.cli"):
+        tail = tail[3:]
+    try:
+        args = build_parser().parse_args(tail)
+    except SystemExit:
+        return None
+    if args.despike and args.no_despike:
+        return None
+    given = explicit_options(tail)
+    classes = resolve_classes(args.classes)
+    if not args.estimate_gaps:
+        narrow_without_estimate_gaps(args, given)
+    block = args.block or default_block_size(int(long_edge))
+    cfg = build_cfg(args)
+    return effective_settings(cfg, classes, block, args.mode)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     given = explicit_options(argv)
@@ -1117,28 +1193,19 @@ def main(argv: list[str] | None = None) -> int:
     # 絞り込みの式そのものは temporal.narrow_without_estimate_gaps() に一本化して
     # ある（review.py の session_from_args() と共有。issue #33）。ここで直接
     # 書き換えると、review.py 側だけ古い式のまま取り残され #14 と同型の食い違いが
-    # 再発する。
+    # 再発する。webapp が report.json の effective 欠落時に meta.argv から実効設定
+    # を復元する経路（effective_settings_from_argv、issue #16）も同じ関数を通る。
     if not args.estimate_gaps:
         narrow_without_estimate_gaps(args, given)
 
-    cfg = TemporalConfig(
-        max_gap=args.max_gap,
-        memory=args.memory,
-        margin_scale=args.margin_scale,
-        max_area_ratio=args.max_area_ratio,
-        min_track_len=2 if args.despike else 0,
-        bridge_max=0 if args.no_bridge else args.bridge_max,
-        frame_step=max(1, args.frame_step),
-        track_min_peak=args.track_min_peak,
-        memory_before=args.memory_before,
-        stitch_max_gap=args.stitch_gap,
-        stitch_dist_ratio=args.stitch_dist,
-        margin_cap_px=args.margin_cap,
-        motion_weight=args.motion_weight,
-        hold_growth=args.hold_growth,
-        motion_cap=args.motion_cap,
-        estimated_factor=args.estimated_factor,
-    )
+    # cfg の組み立ても build_cfg() に一本化してある。main() と
+    # effective_settings_from_argv() の両方がこれを呼ぶ（issue #16）。
+    cfg = build_cfg(args)
+    # issue #16: cfg が確定した直後、実際に領域計算へ渡る値そのものから
+    # フィンガープリントを作る。args から作り直すと、上の絞り込み（narrowed）
+    # で変わった値と食い違う経路が生まれる。cfg 自身から作ればそれは起きない。
+    effective = effective_settings(cfg, classes, block, args.mode)
+    effective_sha256 = effective_settings_sha256(effective)
     regions, stats = process(
         per_frame, n_frames, info.width, info.height, classes, cfg
     )
@@ -1306,6 +1373,8 @@ def main(argv: list[str] | None = None) -> int:
                         for s_, e_, cls, sc in despiked_ranges
                     ],
                     "review_frames": flags,
+                    "effective": effective,
+                    "effective_sha256": effective_sha256,
                 },
                 f,
                 ensure_ascii=False,

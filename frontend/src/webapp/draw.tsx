@@ -154,6 +154,12 @@ function App() {
         <span id="save" class={"save " + save.kind}>{save.text}</span>
       </header>
 
+      {state?.effective_check.restored && (
+        <div id="effective-restored" class="restored-note">
+          設定を復元して表示中: {state.effective_check.note}
+        </div>
+      )}
+
       <div id="stage">
         <div id="imgwrap">
           <img id="shot" alt="対象のフレーム" src={state ? frameUrl(frame) : undefined} />
