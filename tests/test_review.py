@@ -46,6 +46,7 @@ from automosaic.review import (  # noqa: E402
     lan_addresses,
     median_box_size,
     mosaic_bgr,
+    orphaned_remove_frames,
     parse_range,
     qr_matrix,
     runs_of,
@@ -288,6 +289,97 @@ def test_apply_removes_only_automatic_regions():
         out2 = apply_corrections(s.regions, cs2)
         assert len(out2[0]) == 1 and out2[0][0][1].source == "manual"
         print("  remove の適用範囲 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# -- サーバ側の不変条件（issue #6: set_corrections の無検証） ------------
+
+
+def test_orphaned_remove_frames_pure_function():
+    """組(remove+add)の add だけが消えたフレームを拾うこと。純関数の単体確認。"""
+    old = [
+        Correction(25, (0.0, 0.0, 10.0, 10.0), CLS, "remove"),
+        Correction(25, (0.0, 0.0, 5.0, 5.0), CLS, "add"),
+    ]
+    # add が消えて remove だけ残る -> 壊れた組
+    broken = [Correction(25, (0.0, 0.0, 10.0, 10.0), CLS, "remove")]
+    assert orphaned_remove_frames(old, broken) == [25]
+
+    # remove と add を両方落とす（組ごと取り消し）は正当
+    assert orphaned_remove_frames(old, []) == []
+
+    # 誤検知相当。最初から add を持たない remove 単体の一覧は正当
+    fp_only = [Correction(30, (0.0, 0.0, 10.0, 10.0), CLS, "remove")]
+    assert orphaned_remove_frames([], fp_only) == []
+
+    # add がそのまま残っているなら壊れていない
+    intact = [
+        Correction(25, (0.0, 0.0, 10.0, 10.0), CLS, "remove"),
+        Correction(25, (0.0, 0.0, 5.0, 5.0), CLS, "add"),
+    ]
+    assert orphaned_remove_frames(old, intact) == []
+    print("  組が壊れたフレームの検出 OK")
+
+
+def test_set_corrections_rejects_broken_toobig_pair():
+    """「でかすぎる」で積んだ remove+add の組を、add だけ落として送ると拒否されること（issue #6）。
+
+    curl や別実装のクライアント、古いキャッシュの timeline.js から
+    remove だけを残した一覧を直接 POST すれば、クライアント側の
+    correctionsAfterDrop を経由せずに素通しが作れてしまっていた。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        s.mark(25, "toobig", tap=(0.5, 0.5), size=(20, 20), span=0, cls=CLS)
+        assert s.coverage[25] == COV_REAL
+        broken = [c.as_dict() for c in s.corrections.items if c.kind == "remove"]
+        assert len(broken) == 1, broken
+
+        try:
+            s.set_corrections(broken)
+        except ValueError as e:
+            assert "25" in str(e), str(e)
+        else:
+            raise AssertionError("組を割った一覧が通ってしまった")
+
+        # 拒否したのに状態が書き換わっていないこと（部分適用も許さない）
+        assert len(s.corrections.items) == 2, "拒否したのに修正が変わっている"
+        assert s.coverage[25] == COV_REAL, "拒否したのに素通しになっている"
+        print("  組を割った一覧の拒否 OK（素通しにならない）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_set_corrections_allows_legitimate_remove_only():
+    """最初から add を持たない remove 単体（誤検知相当）は通ること。
+
+    ここまで塞ぐと「誤検知」機能そのものが使えなくなる。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        s.set_corrections(
+            [{"frame": 5, "box": [0, 0, 10, 10], "class": CLS, "kind": "remove"}]
+        )
+        assert len(s.corrections.items) == 1
+        assert s.corrections.items[0].kind == "remove"
+        print("  add を伴わない remove 単体の許可 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_set_corrections_allows_dropping_whole_pair():
+    """remove と add を両方まとめて落とす（組ごとの取り消し）は通ること。"""
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        s.mark(25, "toobig", tap=(0.5, 0.5), size=(20, 20), span=0, cls=CLS)
+        s.set_corrections([])
+        assert not s.corrections.items
+        assert s.coverage[25] == COV_ESTIMATED, "組ごと取り消したのに自動領域が戻っていない"
+        print("  組ごとの取り消しの許可 OK")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1460,6 +1552,58 @@ def test_corrections_payload_must_be_a_list():
         code, d = _post(f"{base}/api/corrections?t={tok}", {"corrections": []})
         assert code == 200 and d["n_corrections"] == 0, d
         print("  corrections キーの無い本文を拒否 OK（明示の空配列だけ通る）")
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_http_corrections_rejects_broken_pair():
+    """HTTP 越しに、組を割った一覧を POST すると 400 になること（issue #6）。
+
+    W-6 は「remove+add の組を割ると完全素通しになる」壊れ方で、クライアント
+    (correctionsAfterDrop) 側の防止策だけでは、古いキャッシュの timeline.js や
+    別実装のクライアント、curl から直接叩く経路を塞げない。サーバ側
+    (set_corrections) が同じ不変条件を持つことを、実際に HTTP 越しで確かめる。
+    """
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    try:
+        s = make_session(tmp)
+        tok = "testtoken1234"
+        httpd, base = _serve(s, tok)
+
+        code, d = _post(
+            f"{base}/api/mark?t={tok}",
+            {"frame": 25, "verdict": "toobig", "x": 0.5, "y": 0.5,
+             "w": 20, "h": 20, "span": 0, "class": CLS},
+        )
+        assert code == 200 and d["n_corrections"] == 2, d
+        assert [r[4] for r in d["regions"]] == ["x"], d["regions"]
+
+        code, body, _ = _get(f"{base}/api/corrections?t={tok}")
+        cur = json.loads(body)["corrections"]
+        removes_only = [c for c in cur if c["kind"] == "remove"]
+        assert len(removes_only) == 1, cur
+
+        # curl 相当。組の add を落とし、remove だけを直接 POST する
+        code, d = _post(f"{base}/api/corrections?t={tok}", {"corrections": removes_only})
+        assert code == 400, (code, d)
+        assert "frame 25" in d.get("error", ""), d
+
+        # 拒否したのにサーバの状態が壊れていないこと
+        code, body, _ = _get(f"{base}/api/corrections?t={tok}")
+        assert json.loads(body)["corrections"] == cur, "拒否したのに修正が変わっている"
+        code, body, _ = _get(f"{base}/api/state?t={tok}")
+        st = json.loads(body)
+        assert st["coverage"][25] == COV_REAL, "拒否したのに素通しになっている"
+        assert st["regions"]["25"][0][4] == "x", st["regions"]["25"]
+
+        # 組ごとの取り消し（remove も add も両方落とす）は通ること
+        code, d = _post(f"{base}/api/corrections?t={tok}", {"corrections": []})
+        assert code == 200 and d["n_corrections"] == 0, d
+        print("  HTTP 越しに組を割った一覧を 400 で拒否 OK")
     finally:
         if httpd:
             httpd.shutdown()

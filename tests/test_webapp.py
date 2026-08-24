@@ -875,7 +875,9 @@ def test_toobig_stacks_remove_and_add_as_pairs():
     積み方が変わればあちらが黙って壊れるので、ここで並びを固定しておく。
 
     末尾の add だけを落とすと remove が残り、そのフレームは自動領域も
-    手修正も無い完全な素通しになる。それも合わせて示す。
+    手修正も無い完全な素通しになる壊れ方だったが、issue #6 でサーバ側
+    （review.ReviewSession.set_corrections）に不変条件を足したので、
+    いまはクライアント経由（correctionsAfterDrop）でなくても 400 で拒否される。
     """
     lib = make_lib()
     srv = Server(lib)
@@ -897,20 +899,28 @@ def test_toobig_stacks_remove_and_add_as_pairs():
             want += [(n, "remove"), (n, "add")]
         assert [(c["frame"], c["kind"]) for c in items] == want, items
 
-        # 末尾1件だけ落とすと素通しになる（画面側が組で落とすべき理由）
-        post_json(
+        # 末尾1件（frame f+1 の add）だけを落として組を割ると 400 で拒否される
+        code, r = post_json(
             f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}", {"corrections": items[:-1]}
         )
+        assert code == 400, r
         st = get_json(f"{srv.base}/api/jobs/{jid}/state?light=0&t={TOKEN}")
-        assert not st["regions"].get(str(f + 1)), "remove だけ残っても素通しにならない?"
+        assert st["regions"].get(str(f + 1)), "拒否したのに素通しになっている"
+        # 拒否した一覧に書き換わっていないこと（部分適用していない）
+        still = get_json(f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}")["corrections"]
+        assert [(c["frame"], c["kind"]) for c in still] == want, still
 
-        # 組で落とせば自動領域が戻る
-        post_json(
+        # 組ごと（remove も add も両方）落とすのは正当な操作として通る
+        code, r = post_json(
             f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}", {"corrections": items[:-2]}
         )
+        assert code == 200, r
         st = get_json(f"{srv.base}/api/jobs/{jid}/state?light=0&t={TOKEN}")
         assert st["regions"].get(str(f + 1)), "組で落としたのに素通しのまま"
-        print("  でかすぎる が remove+add を組で積むこと OK（組を割ると素通し）")
+        print(
+            "  でかすぎる が remove+add を組で積むこと OK"
+            "（組を割ると 400 で拒否・組ごとの取り消しは通る）"
+        )
     finally:
         srv.close()
 

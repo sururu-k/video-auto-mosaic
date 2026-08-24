@@ -810,6 +810,36 @@ def cover_box(
     return (x0, y0, x1 - x0, y1 - y0)
 
 
+def _frames_with_kind(items, kind: str) -> set[int]:
+    return {c.frame for c in items if c.kind == kind}
+
+
+def orphaned_remove_frames(old_items, new_items) -> list[int]:
+    """組（remove+add）が壊れて remove だけ残ったフレームを列挙する。
+
+    「でかすぎる」(toobig) は自動領域を打ち消す remove と、代わりに残す範囲の
+    add を必ず組で積む（ReviewSession.mark() 参照）。組の add だけを落として
+    remove を残すと、そのフレームは自動領域も打ち消され、代わりに塗るものも
+    無い状態になる。**完全な素通し。**
+
+    「誤検知」(false_positive) は最初から remove だけを置く正当な操作
+    （局部ではなかった場所には、代わりに塗るものが無い）。これと区別できる
+    のは「差し替え前は add があったフレームで、差し替え後にそれが消えた」
+    ときだけ。誤検知は最初から add を持たないので、この判定には引っかからない。
+
+    差し替え前に add が無かったフレームは対象にしない。remove だけの一覧は
+    誤検知の正当な結果でもあるので、そこまで塞ぐと機能そのものが壊れる。
+    サーバ側は自前で「これは意図的な誤検知か、壊れた組か」を判別できない
+    （kind に verdict の由来を残していない）ので、判別できるところだけを
+    塞ぐ。RULES.md 0章のとおり、判断がつかない側は塞がず通すのではなく、
+    判断がつくところは確実に塞ぐ。
+    """
+    had_add = _frames_with_kind(old_items, "add")
+    has_add = _frames_with_kind(new_items, "add")
+    has_remove = _frames_with_kind(new_items, "remove")
+    return sorted((had_add - has_add) & has_remove)
+
+
 def _thin(frames: list[int], step: int) -> list[int]:
     """近すぎるフレームを間引く。同じ現象で連続して足踏みさせないため。"""
     out: list[int] = []
@@ -1194,11 +1224,27 @@ class ReviewSession:
 
     # -- 修正の受け取り --------------------------------------------------
     def set_corrections(self, items: list[dict]) -> None:
+        """一覧を丸ごと差し替える。/api/corrections から届く一覧はクライアント
+        限定で作られている（古いキャッシュの timeline.js、別実装のクライアント、
+        curl から直接叩く経路もある）ので、ここで無検証に受けると
+        remove+add の組を割った一覧をそのまま通してしまい、素通しが作れる
+        （issue #6）。サーバ側で判定できる範囲の不変条件はここで確かめる。
+        """
+        new_items = [Correction.from_dict(c) for c in items]
+        broken = orphaned_remove_frames(self.corrections.items, new_items)
+        if broken:
+            shown = ", ".join(str(f) for f in broken[:10])
+            if len(broken) > 10:
+                shown += f", 他 {len(broken) - 10} フレーム"
+            raise ValueError(
+                "remove+add の組が壊れています（add が消えて remove だけ残る"
+                f"フレームがあります。適用すると素通しになります）: frame {shown}"
+            )
         self.corrections = CorrectionSet(
             video=os.path.basename(self.video),
             width=self.width,
             height=self.height,
-            items=[Correction.from_dict(c) for c in items],
+            items=new_items,
         )
         self.corrections.save(self.corrections_path)
         # 履歴を捨てる。undo は「末尾から件数ぶん落とす」実装なので、一覧を丸ごと
