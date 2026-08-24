@@ -124,6 +124,25 @@ def _make_rotated_video(path: str, base_w: int, base_h: int, frames: int,
         os.remove(tmp)
 
 
+def _make_odd_video(path: str, w: int, h: int, frames: int, fps: int = 5) -> None:
+    """奇数解像度の合成動画を作る（issue #2 の再現手順）。
+
+    `testsrc2` は奇数サイズ指定を黙って偶数に丸めるので使えない
+    （RULES.md 2章）。`color=` は丸めない。VP9(4:2:0) は奇数解像度のまま
+    持てるので、H.264 では作れない「奇数のまま probe される」入力を作れる。
+    """
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", f"color=c=red:size={w}x{h}:rate={fps}:duration=10",
+            "-frames:v", str(frames),
+            "-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p", "-b:v", "500k",
+            path,
+        ],
+        check=True,
+    )
+
+
 def _decode_frame_rgb(path: str):
     """ffmpeg 自身に先頭フレームを PNG で吐かせて cv2 で読む。
 
@@ -1122,6 +1141,98 @@ def test_stats_match_uncovered_ranges_after_corrections():
                 f"手修正なし={rep_base['stats'][k]} 手修正あり={stats[k]}"
             )
     print("  stats と素通し件数の整合（frames_with_mosaic / uncovered_gaps） OK")
+
+
+def test_check_render_geometry_flags_odd_dimensions():
+    """issue #2: 奇数解像度（幅・高さ・両方のどれでも）を検査で検知すること。
+
+    偶数解像度は None（通せる）を返し、誤検知しないことも確認する。
+    """
+    def _info(w, h):
+        return vid.VideoInfo(w, h, 30, 1, 10, 1.0, "yuv420p",
+                             None, None, None, None, False)
+
+    for w, h in [(641, 480), (640, 481), (641, 481)]:
+        msg = vid.check_render_geometry(_info(w, h))
+        assert msg is not None, f"{w}x{h} が奇数なのに検査を素通りした"
+        assert str(w) in msg and str(h) in msg, f"メッセージに解像度が含まれない: {msg!r}"
+
+    assert vid.check_render_geometry(_info(640, 480)) is None, (
+        "偶数解像度なのに検査に引っかかった"
+    )
+    print("  check_render_geometry の奇数検知 OK")
+
+
+def test_odd_resolution_stops_before_wasting_pass1():
+    """issue #2: 奇数解像度は、パス1（検出）を待たせずに probe 直後で止まること。
+
+    直す前は --detect-only を付けずに焼こうとすると、パス1を最後まで走らせた
+    あと、パス2の FrameBuffer guard で初めて ValueError が飛んでいた
+    （検出に数時間かけたあとに落ちる、が issue の再現手順そのもの）。
+    ここでは Detector の構築自体を壊し、そこに到達したら即座にわかるように
+    してから確認する。
+    """
+    if not _have_ffmpeg():
+        print("  奇数解像度の早期停止 SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "odd.webm")
+        dst = os.path.join(d, "out.mp4")
+        _make_odd_video(src, 641, 481, 5)
+
+        info = vid.probe(src)
+        assert (info.width, info.height) == (641, 481), (
+            f"合成素材が奇数のまま probe されていない: {info.width}x{info.height}"
+            "（テストの前提が崩れている）"
+        )
+
+        def _boom(**kw):
+            raise AssertionError(
+                "パス1（Detector構築）まで到達した。検出前に止まっていない"
+            )
+
+        real_detector, cli.Detector = cli.Detector, _boom
+        try:
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli.main([src, "-o", dst])
+        finally:
+            cli.Detector = real_detector
+
+        assert rc == 1, f"奇数解像度なのに rc={rc}"
+        assert not os.path.exists(dst), "止まったはずなのに出力ファイルができている"
+        assert "奇数" in err.getvalue(), f"奇数を理由にした停止メッセージが無い: {err.getvalue()!r}"
+    print("  奇数解像度の早期停止（パス1を待たせない） OK")
+
+
+def test_odd_resolution_detect_only_warns_but_completes():
+    """issue #2: --detect-only は奇数解像度でも警告のみで完走すること。
+
+    パス1（検出）は奇数解像度でも正しく動く（scale フィルタが
+    force_divisible_by で偶数に丸めてから読むだけ）ため、詳細検出用途では
+    止める必要が無い。警告なしに黙って通すのも禁止（RULES.md「黙って
+    素通しを作らない」）なので、警告が出ることも確認する。
+    """
+    if not _have_ffmpeg():
+        print("  奇数解像度 --detect-only の完走 SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "odd.webm")
+        _make_odd_video(src, 641, 481, 5)
+
+        real_detector, cli.Detector = cli.Detector, lambda **kw: _NullDetector()
+        try:
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli.main([src, "--detect-only", "--quiet"])
+        finally:
+            cli.Detector = real_detector
+
+        assert rc == 0, f"--detect-only なのに rc={rc}: {err.getvalue()}"
+        msg = err.getvalue()
+        assert "奇数" in msg, f"奇数の警告が出ていない: {msg!r}"
+        assert "続行します" in msg, f"続行の告知が出ていない: {msg!r}"
+    print("  奇数解像度 --detect-only の完走（警告のみ） OK")
 
 
 if __name__ == "__main__":
