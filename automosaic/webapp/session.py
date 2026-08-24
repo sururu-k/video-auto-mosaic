@@ -15,6 +15,7 @@ import os
 import threading
 
 from .. import review
+from . import runner
 from .jobs import Job, count_corrections
 
 # 同時に開いておくセッション数。1人で使う道具なので数本で足りる。
@@ -30,6 +31,93 @@ from .jobs import Job, count_corrections
 # 以前より薄くなっている）と見られる。VideoCapture 側を測っていないので、
 # この数字だけでは MAX_OPEN を変える根拠にならない。変えるなら測ってから。
 MAX_OPEN = 3
+
+
+def _review_flag_names() -> set[str]:
+    """review.py の argparse が実際に受け付けるオプション名。
+
+    「job.meta の settings のうち、どのキーがレビューの絵に効くか」を
+    ここから決める。review.py 側にも許可リストを持つと、review.py が
+    オプションを増減したときに session.py が追随せず食い違う。
+    """
+    p = review.build_parser()
+    return {opt for a in p._actions for opt in a.option_strings}
+
+
+def _as_bool(v) -> bool | None:
+    """settings の値を真偽に直す。判定できなければ None（呼び出し側で弾く）。"""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off", ""):
+            return False
+    return None
+
+
+def session_overrides(settings: dict) -> dict:
+    """ジョブの meta.settings から、レビューの絵（領域計算・描画）に効く
+    項目だけを session_for_job() の overrides として取り出す。
+
+    キー・CLI 引数名・cast は `runner.SETTINGS_OPTS` / `runner.SETTINGS_FLAGS`
+    （`build_argv()` と同じ場所）を見る。2箇所に書き写さない（#15）。
+
+    `infer_size` / `conf` / `crf` / `provider` / `tta` / `detect_only` /
+    `limit_frames` は検出や最終エンコードにしか効かず、レビューは既存の
+    `detections.json` を読むだけなので関係ない。review.py の argparse が
+    そもそもこれらの名前を知らないので、`_review_flag_names()` との
+    突き合わせで自然に外れる。
+
+    値は画面から自由に打ち込める文字列（またはブラウザ側の不具合で
+    型が違うもの）なので、壊れた値・型違いが入りうる。黙って無視すると
+    「設定したのに反映されない」がまた起きるだけで、そのまま渡すと
+    原因の分からない例外になる。ここで cast し、失敗したキーは理由付きで
+    ValueError にする（呼び出し側が 400 として利用者に見せる。素通しの絵を
+    「合ってる」と誤認させるより、レビューを止めるほうが安全 -- RULES.md 0）。
+    """
+    if not isinstance(settings, dict):
+        # meta.json 自体が壊れているケース。個別キーの話ではないので、
+        # 「設定なし」として扱う（review.py の既定値に落ちる）
+        return {}
+
+    flags = _review_flag_names()
+    out: dict[str, object] = {}
+    bad: list[str] = []
+
+    for key, flag, cast in runner.SETTINGS_OPTS:
+        if flag not in flags:
+            continue
+        v = settings.get(key)
+        if v is None or v == "":
+            continue
+        try:
+            out[key] = cast(v)
+        except (TypeError, ValueError):
+            bad.append(f"{key}={v!r}")
+
+    for key in runner.SETTINGS_FLAGS:
+        flag = "--" + key.replace("_", "-")
+        if flag not in flags:
+            continue
+        v = settings.get(key)
+        if v is None or v == "":
+            continue
+        b = _as_bool(v)
+        if b is None:
+            bad.append(f"{key}={v!r}")
+        else:
+            out[key] = b
+
+    if bad:
+        raise ValueError(
+            "ジョブの設定に壊れた値があります（レビューを開けません）: "
+            + ", ".join(bad)
+        )
+    return out
 
 
 def session_for_job(job: Job, **overrides) -> review.ReviewSession:
@@ -67,6 +155,13 @@ class SessionCache:
 
     def __init__(self, limit: int = MAX_OPEN) -> None:
         self._items: dict[str, review.ReviewSession] = {}
+        # そのセッションを組んだときの overrides。ジョブに settings が
+        # 入っている限り、毎回の /state /queue /mark 呼び出しで overrides が
+        # 空でなくなる（#15）。「overrides が空か」だけで判定すると、
+        # 呼ぶたびに同じ設定で作り直すことになり、det.json の再パースと
+        # temporal.process() の全フレーム再計算（実測 5.2秒/32,000フレーム）
+        # を1リクエストごとに払うことになる。前回と同じ overrides なら使い回す
+        self._overrides: dict[str, dict] = {}
         self._order: list[str] = []
         self._lock = threading.Lock()
         # 構築中のジョブID -> 完了通知。get() の中で組む
@@ -83,7 +178,11 @@ class SessionCache:
         while True:
             with self._lock:
                 s = self._items.get(job.id)
-                if s is not None and not overrides:
+                # overrides が前回と同じ（空も含む）なら使い回す。#15 で
+                # ジョブに settings が入ると overrides が常に非空になったので、
+                # 「overrides が空か」だけの判定では毎回作り直しになってしまう。
+                # 前回の overrides と比べて、同じなら使い回す
+                if s is not None and self._overrides.get(job.id) == overrides:
                     self._touch(job.id)
                     return s
                 ev = self._building.get(job.id)
@@ -116,7 +215,7 @@ class SessionCache:
         with self._lock:
             # 設定違いで作り直された場合、古い方の動画ハンドルは必ず閉じる。
             # 構築が終わるまで古いセッションを差し替えないので、構築中も
-            # 他の要求は（overrides が空である限り）引き続き古い方を使える。
+            # 他の要求は（overrides が前回と同じである限り）引き続き古い方を使える。
             #
             # self._items への反映と _building の解除・ev.set() を同じロック
             # 保持区間でやる。分けると、解除後・反映前の隙間で目覚めた待機
@@ -125,6 +224,7 @@ class SessionCache:
             # 1e-6 下で500試行中320件、最大6重）。
             old = self._items.get(job.id)
             self._items[job.id] = new_s
+            self._overrides[job.id] = overrides
             self._touch(job.id)
             while len(self._order) > self.limit:
                 self._close(self._order[0])
@@ -154,6 +254,7 @@ class SessionCache:
 
     def _close(self, job_id: str) -> None:
         s = self._items.pop(job_id, None)
+        self._overrides.pop(job_id, None)
         if job_id in self._order:
             self._order.remove(job_id)
         if s is not None:
