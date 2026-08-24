@@ -452,6 +452,14 @@ def create_app(
             size = None
             if payload.get("w") and payload.get("h"):
                 size = (float(payload["w"]), float(payload["h"]))
+            # 「誤検知」で消す自動領域。画面が見て選んだ矩形をそのまま送る。
+            # 番号ではなく座標で送らせるのは、送っている間にキューが
+            # 組み直されても指すものが変わらないようにするため（review.py と同じ）。
+            # これが無いと false_positive は常に「消す領域が指定されていません」で
+            # 400 になり、旧レビュー UI にしか誤検知を通す経路が無いことになる。
+            pick = None
+            if payload.get("pick"):
+                pick = [[float(v) for v in b[:4]] for b in payload["pick"]]
             with s.lock:
                 added = s.mark(
                     frame,
@@ -460,6 +468,7 @@ def create_app(
                     size=size,
                     span=int(payload.get("span", 0)),
                     cls=payload.get("class"),
+                    pick=pick,
                 )
                 out = {
                     "ok": True,

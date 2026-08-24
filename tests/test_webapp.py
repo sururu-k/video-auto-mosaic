@@ -915,6 +915,101 @@ def test_toobig_stacks_remove_and_add_as_pairs():
         srv.close()
 
 
+def test_false_positive_via_webapp_mark_matches_review_session():
+    """「誤検知」（false_positive + pick）が webapp の /mark からも通ること。
+
+    直す前は api_mark() が payload["pick"] を読み捨てていたので、webapp からは
+    常に「消す領域が指定されていません」で 400 になっていた（issue #28）。
+    「狭める」（toobig）は x/y/w/h だけで通っていたので気づかれずに残っていた。
+
+    review.ReviewSession.mark() を同じ pick で直接呼んだ結果とも突き合わせ、
+    webapp 経由でも旧レビュー UI（python -m automosaic.review）と同じ
+    corrections.json になることを確かめる。両者は同じ ReviewSession クラスを
+    呼んでいるので、ここで見ているのは pick の受け渡しがずれていないかだけだが、
+    その受け渡し自体が直す前は欠けていた。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    ref_dir = None
+    try:
+        d = prepared_job(lib, srv)
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+
+        # progress の done/counts はキューに載った項目でしか進まないので、
+        # 実在のキュー項目から選ぶ（f=5 決め打ちだと間引きで落ちることがある）
+        q = get_json(f"{srv.base}/api/jobs/{jid}/queue?t={TOKEN}")
+        item = next((it for it in q["items"] if it["boxes"]), None)
+        assert item, "自動領域のあるキュー項目が無い"
+        f = item["frame"]
+        pick = [item["boxes"][0][:4]]
+
+        # 直す前はここが 400（「消す領域が指定されていません」）だった
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/mark?t={TOKEN}",
+            {"frame": f, "verdict": "false_positive", "pick": pick, "span": 0},
+        )
+        assert code == 200, r
+        assert r["added"] == 1, r
+        assert r["progress"]["counts"]["false_positive"] == 1, r["progress"]
+        assert not r["regions"], "誤検知で消したはずの領域が残っている"
+
+        web_items = CorrectionSet.load(job.corrections).items
+        assert len(web_items) == 1, [c.as_dict() for c in web_items]
+
+        # 同じ pick を review.ReviewSession に直接与える。review.py の
+        # do_POST("/api/mark") がやっているのと同じ呼び方
+        from automosaic import review as review_mod
+
+        ref_dir = tempfile.mkdtemp(prefix="automosaic_ref_")
+        ref_corrections = os.path.join(ref_dir, "corrections.json")
+        argv = [job.source, "--detections", job.detections, "--corrections", ref_corrections]
+        args = review_mod.build_parser().parse_args(argv)
+        ref_session = review_mod.session_from_args(args, argv)
+        try:
+            ref_session.mark(f, "false_positive", pick=pick, span=0, cls=None)
+        finally:
+            ref_session.reader.close()
+
+        ref_items = CorrectionSet.load(ref_corrections).items
+        assert len(ref_items) == 1, [c.as_dict() for c in ref_items]
+        assert (web_items[0].frame, web_items[0].box, web_items[0].kind) == (
+            ref_items[0].frame,
+            ref_items[0].box,
+            ref_items[0].kind,
+        ), (web_items[0].as_dict(), ref_items[0].as_dict())
+
+        # corrections.progress.json も同じ内容になること（issue #28 の完了条件）。
+        # video は両方とも同じ job.source から作っているので一致するはず
+        web_progress_path = os.path.splitext(job.corrections)[0] + ".progress.json"
+        ref_progress_path = os.path.splitext(ref_corrections)[0] + ".progress.json"
+        with open(web_progress_path, encoding="utf-8") as fh:
+            web_progress = json.load(fh)
+        with open(ref_progress_path, encoding="utf-8") as fh:
+            ref_progress = json.load(fh)
+        assert web_progress["video"] == ref_progress["video"], (
+            web_progress["video"], ref_progress["video"],
+        )
+        assert web_progress["verdicts"] == ref_progress["verdicts"] == {str(f): "false_positive"}, (
+            web_progress["verdicts"], ref_progress["verdicts"],
+        )
+        assert web_progress["false_positives"] == ref_progress["false_positives"], (
+            web_progress["false_positives"], ref_progress["false_positives"],
+        )
+        # history は「直前の判定」も持つので、同じ手順で作れば同じ形になる
+        assert [h["added"] for h in web_progress["history"]] == [h["added"] for h in ref_progress["history"]]
+        assert [h["fp"] for h in web_progress["history"]] == [h["fp"] for h in ref_progress["history"]]
+        print(
+            "  webapp /mark と review.ReviewSession 直呼びで corrections.json / "
+            f"corrections.progress.json が一致 OK: {web_items[0].as_dict()} / "
+            f"verdicts={web_progress['verdicts']}"
+        )
+    finally:
+        srv.close()
+        if ref_dir:
+            shutil.rmtree(ref_dir, ignore_errors=True)
+
+
 def test_mark_rejects_out_of_range_frame():
     """範囲外のフレームは弾くこと。端へ寄せない。
 

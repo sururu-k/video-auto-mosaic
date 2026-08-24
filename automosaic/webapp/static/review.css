@@ -1,0 +1,25 @@
+/* 検査キュー画面だけの追加スタイル。style.css の上に読ませる。
+   「でかすぎる」「狭める」「誤検知」で使うボタン色・位置指定モードの
+   見出し・適用範囲ボタンの選択状態は、既存 style.css のどの規則にも
+   無かった（この画面が3判定しか出していなかったため）。 */
+
+/* 「でかすぎる」。漏れ（赤）と取り違えると逆の修正をしてしまうので、
+   赤とも緑とも離れた琥珀にする */
+button.big.warn { background: #8a5d1f; border-color: #a8752c; color: #fff8ec; }
+/* 「誤検知」。モザイクを消す方向の操作なので、色で誘わない。
+   他の判定より一段沈めて、指が流れて当たっても気づける見た目にする */
+button.big.dim { background: #23272e; border-color: #3a414c; color: #aeb6c1; }
+
+/* 位置指定モードの見出し。いま何を指定させられているのかを言葉でも出す */
+.mark-title {
+  font-size: 13px;
+  color: var(--warn);
+  text-align: center;
+  min-height: 18px;
+  margin: 4px 0;
+}
+/* 消す操作の見出しだけ赤にする。文言を読み飛ばしても色で気づけるように */
+.mark-title.danger { color: #ff9b95; }
+
+/* 適用範囲の選択。押されているものだけ色を変える */
+.span-btn.on { background: #3b4b63; border-color: #5a7096; color: #eaf1ff; }
