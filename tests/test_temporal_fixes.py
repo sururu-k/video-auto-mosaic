@@ -8,7 +8,8 @@ H（--frame-step > 1 の素材で推定のみ区間の報告が間引き由来�
 issue #10（bridge_uncovered / estimated_only_ranges がフレーム単位で「矩形が
 1個でもあれば覆われている」と判定していたため、同じフレームに複数対象が
 映る場面で片方の対象の穴がもう片方の矩形に隠れて報告からも橋渡しからも
-消えていた件）。
+消えていた件）、
+issue #11（推定区間のマージンが速度の外挿だけで、往復運動で対象を完全に外す）。
 """
 
 import math
@@ -525,6 +526,128 @@ def test_lineage_groups_does_not_transitively_merge_via_shared_candidate():
         f"潰れている（claimed 除外が効いていない）: ids={ids}"
     )
     print(f"  共通候補の取り合いで系統が潰れない OK (ids={ids})")
+
+
+def _overlap_area(a, b) -> float:
+    ax0, ay0, aw, ah = a
+    bx0, by0, bw, bh = b
+    ax1, ay1 = ax0 + aw, ay0 + ah
+    bx1, by1 = bx0 + bw, by0 + bh
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    return max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+
+
+def _sine_box(t: float, cx0: float, cy0: float, amplitude: float, period: float, side: float):
+    cx = cx0 + amplitude * math.sin(2 * math.pi * t / period)
+    return (cx - side / 2, cy0 - side / 2, side, side)
+
+
+def test_memory_envelope_does_not_miss_reversing_motion():
+    """issue #11: memory 外挿区間は往復運動（正弦運動）の対象を完全には外さないこと。
+
+    直す前は端点速度で矩形そのものを直進外挿しており、往復運動では速度の符号が
+    反転するため外挿が誤った方向へ伸び続けた。実測（振幅250px/周期20f、W=1920,
+    H=1080、対象サイズ191px、memory=20、観測は半周期ぶんの t=0..10 で
+    ゼロ交差=最大速度点の t=10 で打ち切り）で 12/19 フレームが対象を完全に外した。
+    """
+    W_, H_ = 1920, 1080
+    S = 191.0
+    A, T = 250.0, 20.0
+    CX, CY = 960.0, 540.0
+    n_frames = 40
+    obs_end = 10
+
+    dets: dict[int, list[Detection]] = {f: [] for f in range(n_frames)}
+    for f in range(0, obs_end + 1):
+        dets[f] = [Detection(CLS, 0.9, _sine_box(float(f), CX, CY, A, T, S))]
+
+    cfg = TemporalConfig(memory=20, memory_before=0, min_track_len=0, bridge_max=0, stitch_max_gap=0)
+    regions, _ = process(dets, n_frames, W_, H_, {CLS}, cfg)
+
+    miss = 0
+    for f in range(obs_end + 1, min(n_frames, obs_end + 20)):
+        gt = _sine_box(float(f), CX, CY, A, T, S)
+        drawn = regions.get(f, [])
+        covered = sum(_overlap_area(gt, box) for box, _ in drawn)
+        if covered <= 0.0:
+            miss += 1
+    assert miss == 0, f"往復運動の memory 外挿区間で {miss} フレームが対象を完全に外した"
+    print("  memory 包絡は往復運動を完全には外さない OK")
+
+
+def test_memory_envelope_still_tracks_straight_moving_target():
+    """issue #11 の修正が直進する対象への追従を退行させないこと。
+
+    外挿をやめて直前の観測位置に固定するだけの実装だと、速度 20px/frame の
+    直進で 0/19 -> 3/19 に悪化する（実測）。「止まった」仮説と「その速度で
+    進み続けた」仮説の両方を外接矩形の和で覆うことで両立させている。
+    """
+    W_, H_ = 1920, 1080
+    S = 191.0
+    speed = 20.0
+    n_frames = 40
+    obs_end = 10
+
+    def box_at(t: float):
+        cx = 500.0 + speed * t
+        return (cx - S / 2, 540.0 - S / 2, S, S)
+
+    dets: dict[int, list[Detection]] = {f: [] for f in range(n_frames)}
+    for f in range(0, obs_end + 1):
+        dets[f] = [Detection(CLS, 0.9, box_at(float(f)))]
+
+    cfg = TemporalConfig(memory=20, memory_before=0, min_track_len=0, bridge_max=0, stitch_max_gap=0)
+    regions, _ = process(dets, n_frames, W_, H_, {CLS}, cfg)
+
+    miss = 0
+    for f in range(obs_end + 1, min(n_frames, obs_end + 20)):
+        gt = box_at(float(f))
+        drawn = regions.get(f, [])
+        covered = sum(_overlap_area(gt, box) for box, _ in drawn)
+        if covered <= 0.0:
+            miss += 1
+    assert miss == 0, f"直進する対象で memory 区間が {miss} フレーム外れた（regression）"
+    print("  memory 包絡は直進する対象への追従を退行させない OK")
+
+
+def test_interpolation_envelope_does_not_miss_reversal_inside_gap():
+    """issue #11: 補間区間の中に往復の折り返し（トラフ）が丸ごと入る場合でも
+    完全に対象を外さないこと。
+
+    直す前は2点を結ぶ直線上の1点を矩形にしていたため、折り返しが区間の
+    中間に収まっていると直線から大きく外れる（実測: 8/17 -> 修正後 0/17）。
+    観測は gap の両端で3フレームずつ連続させ、実際のトラックと同じく
+    局所速度を持たせている。
+    """
+    W_, H_ = 1920, 1080
+    S = 191.0
+    A, T = 250.0, 20.0
+    CX, CY = 960.0, 540.0
+    n_frames = 40
+    gap_start, gap_len, context = 8, 17, 3
+    b_frame = gap_start + gap_len + 1
+
+    dets: dict[int, list[Detection]] = {f: [] for f in range(n_frames)}
+    for f in range(gap_start - context + 1, gap_start + 1):
+        dets[f] = [Detection(CLS, 0.9, _sine_box(float(f), CX, CY, A, T, S))]
+    for f in range(b_frame, b_frame + context):
+        dets[f] = [Detection(CLS, 0.9, _sine_box(float(f), CX, CY, A, T, S))]
+
+    cfg = TemporalConfig(
+        memory=0, min_track_len=0, bridge_max=0, stitch_max_gap=0, max_gap=gap_len + 1
+    )
+    regions, _ = process(dets, n_frames, W_, H_, {CLS}, cfg)
+
+    miss = 0
+    for f in range(gap_start + 1, b_frame):
+        gt = _sine_box(float(f), CX, CY, A, T, S)
+        drawn = regions.get(f, [])
+        covered = sum(_overlap_area(gt, box) for box, _ in drawn)
+        if covered <= 0.0:
+            miss += 1
+    assert miss == 0, f"補間区間内の折り返しで {miss} フレームが対象を完全に外した"
+    print("  補間の包絡は区間内の折り返しを完全には外さない OK")
 
 
 def test_module_docstring_matches_implementation():
