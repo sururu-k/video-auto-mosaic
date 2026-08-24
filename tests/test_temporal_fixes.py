@@ -4,7 +4,11 @@
 推定のみ区間の報告漏れ、冒頭 docstring の処理順、および再監査での積み残し
 A（視面積比ちょうど1.0の全面検出が既定で drop される）、
 I（min_area_ratio が可視面積で判定され画面端の検出を誤って落とす）、
-H（--frame-step > 1 の素材で推定のみ区間の報告が間引き由来のノイズで水増しされる）。
+H（--frame-step > 1 の素材で推定のみ区間の報告が間引き由来のノイズで水増しされる）、
+issue #10（bridge_uncovered / estimated_only_ranges がフレーム単位で「矩形が
+1個でもあれば覆われている」と判定していたため、同じフレームに複数対象が
+映る場面で片方の対象の穴がもう片方の矩形に隠れて報告からも橋渡しからも
+消えていた件）。
 """
 
 import math
@@ -311,6 +315,216 @@ def test_frame_step_sampling_noise_is_suppressed_but_real_gaps_survive():
     est1 = estimated_only_ranges(regions1, 40)
     assert len(est1) == 1 and est1[0][1] - est1[0][0] + 1 == 2
     print(f"  間引き由来ノイズの抑制 OK（4フレーム区間は消え、本物の14フレーム漏れは残る）")
+
+
+def test_bridge_is_not_masked_by_other_object():
+    """issue #10: 対象Aの穴が、同じフレームに映る対象Bの矩形に隠れて
+    bridge が起動しない不具合の回帰テスト。
+
+    修正前は `covered = [bool(per_frame.get(f)) for f in range(n_frames)]` が
+    フレーム単位だったため、対象Bが常に映っていると、対象Aのトラックが
+    max_gap を超えて分断されても bridge が一切起動しなかった
+    （実測: regions_bridged が 0 のまま、50フレーム丸ごと対象Aが素通しになる）。
+
+    対象Aは同じ位置に静止（gap前後で位置・大きさが同一）なので、stitch と
+    同じ判定基準を使う系統判定なら同一対象と分かる。ただし stitch_max_gap は
+    意図的に対象Aの穴(50フレーム)より短く設定し、stitch_tracks 自体では
+    繋がらないようにしてある（純粋に bridge 側の系統判定を検証するため）。
+    """
+    N = 150
+    dets: dict[int, list[Detection]] = {f: [] for f in range(N)}
+    # 対象A: 同じ位置に静止。フレーム50-99が検出漏れ
+    for f in list(range(0, 50)) + list(range(100, 150)):
+        dets[f].append(Detection(CLS, 0.8, (50, 50, 40, 40)))
+    # 対象B: 別の位置に、全フレームで途切れず映り続ける
+    for f in range(N):
+        dets[f].append(Detection(CLS, 0.8, (400, 400, 40, 40)))
+
+    cfg = TemporalConfig(
+        max_gap=12, memory=0, stitch_max_gap=40, bridge_max=150, min_track_len=0
+    )
+    regions, stats = process(dets, N, W, H, {CLS}, cfg)
+
+    assert stats["tracks_stitched"] == 0, "対象Aの前後トラックが stitch で繋がってしまっている（前提が崩れている）"
+    assert stats["regions_bridged"] > 0, "対象Aの穴が一切橋渡しされていない"
+
+    for f in range(50, 100):
+        assert len(regions[f]) == 2, (
+            f"フレーム{f}: 対象Bの矩形に隠れて対象Aの穴が橋渡しされていない "
+            f"(regions={[r[0] for r in regions[f]]})"
+        )
+        xs = sorted(b[0] for b, _ in regions[f])
+        assert xs[0] < 100, f"フレーム{f}: 対象A側の矩形が見当たらない ({xs})"
+    print(f"  他対象に隠れた穴の橋渡し OK (regions_bridged={stats['regions_bridged']})")
+
+
+def test_bridge_globally_runs_before_bridge_by_lineage():
+    """issue #10 の再検証（PR #66）で見つかった退行の回帰テスト。
+
+    `bridge_uncovered()` は `_bridge_globally`（フレーム丸ごと未処理の区間を
+    対象の同定をせず時間的な近さだけで埋める最終防波堤）を先に、
+    `_bridge_by_lineage`（系統単位の橋渡し）を後に呼ぶ必要がある。
+    順序を逆にすると、系統単位の橋渡しが先に region を足してしまい、続く
+    `_bridge_globally` の「フレームが覆われているか」判定が誤って True になって
+    最終防波堤が一切起動しなくなる。系統として復活しない対象（トラックが
+    そこで終わって二度と戻ってこない）は、系統単位の橋渡し候補が無いまま
+    素通しになる（実測: bench3 で 130 矩形・736,126 セルが失われた退行と
+    同じ機構）。
+
+    対象A: frame 0-49 のみ観測され、以後二度と現れない。
+    対象B: frame 0-49 と 60-149 に同じ位置で観測される（間の 50-59 は欠損）。
+    50-59 は A・B どちらの観測も無い、フレーム丸ごと空の区間にしてある。
+
+    「対象Aの位置が覆われているか」を直接 assert すると、正しい実装でも
+    落ちる（防波堤矩形は前後の外接矩形を lerp するので、区間の終盤に近づく
+    ほど対象Bの位置へ寄っていき、対象Aの位置からは離れる）。ここでは代わりに
+    「_bridge_globally が足す lineage=-1 の防波堤矩形が区間の全フレームに
+    存在すること」を見る。順序を逆にした版では、対象Bの系統単位の橋渡し
+    だけでフレームが「覆われた」ことになり、_bridge_globally が一切起動しなく
+    なるため、lineage=-1 の矩形が区間全体から消える
+    （実測: `automosaic/temporal.py` の `bridge_uncovered()` 内で
+    `_bridge_by_lineage` を `_bridge_globally` より先に呼ぶよう入れ替えると、
+    frame 50-59 の矩形数が 2 から 1 に減り、lineage=-1 の矩形が全フレームで
+    消えることを確認済み）。
+    """
+    N = 150
+    dets: dict[int, list[Detection]] = {f: [] for f in range(N)}
+    for f in range(0, 50):
+        dets[f].append(Detection(CLS, 0.8, (0, 0, 80, 80)))       # 対象A（以後復活しない）
+        dets[f].append(Detection(CLS, 0.8, (400, 400, 40, 40)))   # 対象B
+    for f in range(60, N):
+        dets[f].append(Detection(CLS, 0.8, (400, 400, 40, 40)))   # 対象Bのみ復活
+
+    cfg = TemporalConfig(
+        max_gap=5, memory=0, stitch_max_gap=0, bridge_max=150, min_track_len=0
+    )
+    regions, stats = process(dets, N, W, H, {CLS}, cfg)
+
+    assert stats["tracks_stitched"] == 0, "対象A・Bが stitch で繋がってしまっている（前提が崩れている）"
+    assert stats["regions_bridged"] > 0, "橋渡しが一切起動していない"
+
+    for f in range(50, 60):
+        lineages = sorted(r.lineage for _, r in regions[f])
+        assert -1 in lineages, (
+            f"フレーム{f}: 系統をまたぐ最終防波堤(lineage=-1)の矩形が消えている "
+            f"(regions={[(b, r.source, r.lineage) for b, r in regions[f]]})"
+        )
+    print(
+        "  系統として復活しない対象がいても最終防波堤(lineage=-1)が全区間に残る OK "
+        f"(regions_bridged={stats['regions_bridged']})"
+    )
+
+
+def test_estimated_only_is_not_masked_by_other_object():
+    """issue #10: 対象Aの「推定のみ」区間が、同じフレームの対象Bの実観測に
+    隠れて estimated_only_ranges から消える不具合の回帰テスト。
+
+    修正前は `has_real = any(...)` がフレーム内の全領域を対象にしていたため、
+    対象Aが補間だけで対象Bが毎フレーム実観測なら、対象Aの補間区間が
+    一件も報告されなかった。
+    """
+    N = 20
+    dets: dict[int, list[Detection]] = {f: [] for f in range(N)}
+    # 対象A: フレーム0と10だけ実観測、1-9は補間のみ
+    dets[0].append(Detection(CLS, 0.8, (50, 50, 40, 40)))
+    dets[10].append(Detection(CLS, 0.8, (50, 50, 40, 40)))
+    # 対象B: 毎フレーム実観測
+    for f in range(N):
+        dets[f].append(Detection(CLS, 0.8, (400, 400, 40, 40)))
+
+    cfg = TemporalConfig(max_gap=12, memory=0, min_track_len=0, bridge_max=0)
+    regions, _ = process(dets, N, W, H, {CLS}, cfg)
+    est = estimated_only_ranges(regions, N)
+
+    assert est, "対象Aの推定のみ区間(1-9)が対象Bの実観測に隠れて報告から消えている"
+    assert any(s == 1 and e == 9 for s, e, _ in est), est
+    print(f"  他対象の実観測に隠れた推定のみ区間の報告 OK ({est})")
+
+
+def test_estimated_only_range_split_across_lineages_is_not_dropped():
+    """系統ごとの判定に切り替えた副作用で、フレーム単位なら effective_min_len
+    以上あった推定のみ区間が、系統の境目で分断されて両方とも
+    effective_min_len 未満に落ち、報告からまるごと消える回帰テスト。
+
+    対象A（frame0のみ実観測、その後 memory で3フレーム推定=1-3）と
+    対象B（frame7のみ実観測、その手前に memory_before で3フレーム推定=4-6）
+    は別の場所にいる別対象で、系統としては繋がらない
+    （中心距離が stitch_dist_ratio の許容範囲を大きく超える）。
+
+    フレーム単位で見れば 1-6 の6フレームが連続して「どの対象も実観測が無い」
+    区間だが、系統ごとに見ると A は 1-3（3フレーム）、B は 4-6（3フレーム）
+    に分断され、どちらも min_len=5 未満で個別には報告されない。
+    系統ごとの判定とフレーム単位の判定の**両方**を計算して和を取らないと、
+    この6フレームは報告から丸ごと消える（人手レビューの導線が消える＝
+    漏れる方向）。
+    """
+    N = 20
+    dets: dict[int, list[Detection]] = {f: [] for f in range(N)}
+    dets[0].append(Detection(CLS, 0.9, (50, 50, 40, 40)))   # 対象A
+    dets[7].append(Detection(CLS, 0.9, (500, 400, 40, 40)))  # 対象B（遠い別対象）
+
+    cfg = TemporalConfig(
+        max_gap=12, memory=3, memory_before=3, min_track_len=0,
+        bridge_max=0, stitch_max_gap=0,
+    )
+    regions, stats = process(dets, N, W, H, {CLS}, cfg)
+    assert stats["tracks_stitched"] == 0, "対象Aと対象Bが stitch で繋がってしまっている（前提が崩れている）"
+
+    est = estimated_only_ranges(regions, N, min_len=5)
+    covered = set()
+    for s, e, _ in est:
+        covered.update(range(s, e + 1))
+    missing = [f for f in range(1, 7) if f not in covered]
+    assert not missing, (
+        f"系統の境目で分断され、フレーム単位なら6フレーム連続だった推定のみ"
+        f"区間が報告から消えている（消えたフレーム: {missing}, 報告: {est}）"
+    )
+    print(f"  系統の境目で分断される推定のみ区間の報告 OK ({est})")
+
+
+def test_lineage_groups_never_merges_temporally_overlapping_tracks():
+    """_lineage_groups() の gap<=0 除外を検証する回帰テスト。
+
+    docstring は「同時に映る別対象2体が1系統に潰れると issue #10 の欠陥を
+    そのまま再現する」と明記している。ここでは、位置が完全に同一で
+    （素性判定だけなら確実にマッチする）、かつ時間的に重なる2トラックが、
+    重なっている一点をもって絶対に同じ系統にならないことを直接確認する。
+    """
+    tracks = [
+        temporal.Track(cls=CLS, obs={0: ((100.0, 100.0, 40.0, 40.0), 0.9)}),
+        temporal.Track(cls=CLS, obs={0: ((100.0, 100.0, 40.0, 40.0), 0.9)}),
+    ]
+    cfg = TemporalConfig()
+    ids = temporal._lineage_groups(tracks, W, H, cfg)
+    assert ids[0] != ids[1], (
+        f"完全に同時刻・同位置の別トラックが同じ系統に潰れている（gap<=0 除外が"
+        f"効いていない）: ids={ids}"
+    )
+    print(f"  同時に映るトラックは系統を分ける OK (ids={ids})")
+
+
+def test_lineage_groups_does_not_transitively_merge_via_shared_candidate():
+    """_lineage_groups() の claimed 除外を検証する回帰テスト。
+
+    docstring は「1つの後続トラックを複数の先行トラックが取り合うと、
+    無関係な同時対象2体が共通の後続候補を介して間接的に同じ系統へ潰れる」と
+    明記している。同時刻に映る2トラック A・B が、どちらも同じ後続トラック C
+    と（時間的にも空間的にも）良くマッチする場面を作り、A が先に C を
+    掴んだあとは B が C 経由で A と同じ系統へ潰れないことを確認する。
+    """
+    box = (100.0, 100.0, 40.0, 40.0)
+    a = temporal.Track(cls=CLS, obs={0: (box, 0.9)})
+    b = temporal.Track(cls=CLS, obs={0: (box, 0.9)})
+    c = temporal.Track(cls=CLS, obs={10: (box, 0.9)})
+    tracks = [a, b, c]
+    cfg = TemporalConfig()
+    ids = temporal._lineage_groups(tracks, W, H, cfg)
+
+    assert ids[0] != ids[1], (
+        f"同時に映る A・B が、共通の後続候補 C を介して間接的に同じ系統へ"
+        f"潰れている（claimed 除外が効いていない）: ids={ids}"
+    )
+    print(f"  共通候補の取り合いで系統が潰れない OK (ids={ids})")
 
 
 def test_module_docstring_matches_implementation():

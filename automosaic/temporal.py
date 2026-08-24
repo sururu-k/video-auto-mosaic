@@ -85,6 +85,12 @@ class Region:
     source: str  # "detected" | "interpolated" | "memory" | "bridged" | "manual"
     speed: float = 0.0  # このフレーム付近での移動量 px/frame
     hold: int = 0       # 直近の実観測から何フレーム離れた推定か
+    # 系統ID（同一対象らしいトラック群のグループ）。_lineage_groups() が振る。
+    # 手修正（corrections.py の "manual"）は既定の -1 のまま=系統に属さない。
+    # bridge_uncovered / estimated_only_ranges はこれを見て対象ごとに判定する
+    # （issue #10: フレームに矩形が1個でもあれば「覆われている」としていたため、
+    # 対象Aが塗られていると対象Bのトラックが死んでいても bridge が起動しなかった）。
+    lineage: int = -1
 
 
 @dataclass
@@ -426,24 +432,120 @@ def stitch_tracks(
     return list(alive.values()), merged
 
 
+def _lineage_groups(
+    tracks: list[Track], frame_w: int, frame_h: int, cfg: TemporalConfig
+) -> list[int]:
+    """トラックを「同一対象らしい系統」にグループ化する（issue #10）。
+
+    stitch_tracks と同じ判定基準（IoU / 中心距離 / サイズ比）を使うが、
+    stitch_max_gap の上限は外して両側マッチングを試みる。実際にどこまで埋める
+    かは bridge_uncovered 側の bridge_max が別途上限を持つので、ここで隔たりを
+    緩めても塗り過ぎの上限は変わらない（漏れる方向には外れない。矩形の位置が
+    別対象と誤結合する誤差は塗り過ぎ側の問題になる）。
+
+    stitch_tracks が実際に矩形を1本のトラックへ統合するのに対し、こちらは
+    Track.obs を一切書き換えない。bridge_uncovered / estimated_only_ranges が
+    「対象ごとの被覆」を判定するための ID を割り振るだけ。
+
+    時間的に重なる（同時に映っている）トラック同士は同じ系統にしない
+    （gap = b.first - a.last が正であることを要求）。ここを崩すと、同じ画面に
+    同時に映る別対象2体が1系統に潰れてしまい、issue #10 が直そうとしている
+    欠陥をそのまま再現することになる。
+
+    stitch と同じく「隔たりが小さい候補から1本だけ選んで消費する」貪欲法。
+    1つの後続トラックを複数の先行トラックが取り合うと、無関係な同時対象2体が
+    共通の後続候補を介して間接的に同じ系統へ潰れてしまうため、後続候補は
+    一度選ばれたら他の候補から選べないようにする（`claimed`）。
+
+    誤結合（別対象を同じ系統として繋いでしまう）を実データで測る作業は
+    issue #10 の懸念事項にある通り未実施。ここでは stitch_tracks が既定で
+    使っている閾値をそのまま流用し、新しい緩さは導入していない。
+    """
+    n = len(tracks)
+    if n == 0:
+        return list(range(n))
+
+    diag = math.hypot(frame_w, frame_h)
+    max_dist = diag * cfg.stitch_dist_ratio
+
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    order = sorted(range(n), key=lambda i: tracks[i].first)
+    claimed: set[int] = set()
+
+    for i in order:
+        a = tracks[i]
+        best = None
+        for j in order:
+            if j == i or j in claimed:
+                continue
+            b = tracks[j]
+            if b.cls != a.cls:
+                continue
+            gap = b.first - a.last
+            if gap <= 0:
+                continue
+
+            box_a = a.obs[a.last][0]
+            box_b = b.obs[b.first][0]
+            area_a = max(1.0, box_a[2] * box_a[3])
+            area_b = max(1.0, box_b[2] * box_b[3])
+            ratio = max(area_a, area_b) / min(area_a, area_b)
+            if ratio > cfg.stitch_size_ratio:
+                continue
+
+            ca, cb = _center(box_a), _center(box_b)
+            dist = math.hypot(cb[0] - ca[0], cb[1] - ca[1])
+            if _iou(box_a, box_b) < cfg.stitch_iou and dist > max_dist:
+                continue
+
+            if best is None or gap < best[0]:
+                best = (gap, j)
+
+        if best is not None:
+            _, j = best
+            parent[find(j)] = find(i)
+            claimed.add(j)
+
+    return [find(i) for i in range(n)]
+
+
 def _lerp_box(a: Box, b: Box, w: float) -> Box:
     return tuple(a[i] + (b[i] - a[i]) * w for i in range(4))  # type: ignore[return-value]
 
 
 def densify(
-    tracks: list[Track], n_frames: int, cfg: TemporalConfig
+    tracks: list[Track],
+    n_frames: int,
+    cfg: TemporalConfig,
+    lineage_ids: list[int] | None = None,
 ) -> dict[int, list[Region]]:
-    """補間と frame memory でトラックを連続化し、フレームごとの領域に落とす。"""
+    """補間と frame memory でトラックを連続化し、フレームごとの領域に落とす。
+
+    lineage_ids は tracks と同じ長さの系統ID配列（_lineage_groups() 参照）。
+    省略時はトラックごとに別系統として扱う（従来どおり）。ここで各 Region に
+    埋め込んだ ID を bridge_uncovered / estimated_only_ranges が対象単位の
+    判定に使う。
+    """
     per_frame: dict[int, list[Region]] = {i: [] for i in range(n_frames)}
 
-    for t in tracks:
+    for idx, t in enumerate(tracks):
+        lineage = lineage_ids[idx] if lineage_ids is not None else idx
         frames = sorted(t.obs)
         local = _local_speeds(t, frames)
 
         # 観測フレームをそのまま置く
         for f in frames:
             box, score = t.obs[f]
-            per_frame[f].append(Region(box, t.cls, score, "detected", local[f]))
+            per_frame[f].append(
+                Region(box, t.cls, score, "detected", local[f], lineage=lineage)
+            )
 
         # 観測と観測のあいだを線形補間で埋める。バッチなので未来を使える。
         for a, b in zip(frames, frames[1:]):
@@ -462,6 +564,7 @@ def densify(
                         "interpolated",
                         max(local[a], local[b]),
                         min(f - a, b - f),
+                        lineage,
                     )
                 )
 
@@ -486,6 +589,7 @@ def densify(
                         "memory",
                         local[frames[0]],
                         d,
+                        lineage,
                     )
                 )
         if mem_after > 0:
@@ -501,6 +605,7 @@ def densify(
                         "memory",
                         local[frames[-1]],
                         d,
+                        lineage,
                     )
                 )
 
@@ -562,20 +667,86 @@ def _union_box(boxes: list[Box]) -> Box:
     return (x0, y0, x1 - x0, y1 - y0)
 
 
-def bridge_uncovered(
+def _bridge_by_lineage(per_frame: dict[int, list[Region]], n_frames: int, cfg: TemporalConfig) -> int:
+    """系統（対象）ごとの被覆を見て、他対象の矩形に隠れて見落とされる穴を埋める。
+
+    issue #10: 以前はフレーム単位で「矩形が1個でもあれば覆われている」と
+    判定していた。対象Aが塗られていれば、対象Bのトラックが死んでいても
+    bridge は起動しなかった（実測: 41,331フレームがどの系統からも見て未処理な
+    のに、そのうち25,995フレーム(62.9%)は他対象の矩形があるため bridge が
+    起動しなかった）。ここでは Region.lineage（densify() が
+    _lineage_groups() の結果を埋め込んだもの）ごとに被覆を判定し、系統ごとに
+    別々に橋渡しする。前後の代表矩形もその系統自身の Region だけから作る
+    （他対象の矩形を混ぜて位置がずれると、そちらは漏れる方向の外れ方になる）。
+
+    系統の存在範囲（その系統の最初の観測〜最後の観測）の外側は対象がまだ
+    映っていない/映り終わった後なので区間として扱わない。埋められなかった
+    系統内の穴は、このあとの _bridge_globally（従来のフレーム単位の橋渡し）
+    に判断を渡す。ここでは埋めた件数だけを返す。
+    """
+    by_lineage: dict[int, dict[int, list[Region]]] = {}
+    for f in range(n_frames):
+        for r in per_frame.get(f, []):
+            by_lineage.setdefault(r.lineage, {}).setdefault(f, []).append(r)
+
+    filled = 0
+    for lineage_id, frames_map in by_lineage.items():
+        if not frames_map:
+            continue
+        frame_set = set(frames_map)
+        lo, hi = min(frame_set), max(frame_set)
+
+        f = lo
+        while f <= hi:
+            if f in frame_set:
+                f += 1
+                continue
+            start = f
+            while f <= hi and f not in frame_set:
+                f += 1
+            end = f  # [start, end) がこの系統だけの未処理区間
+
+            if cfg.bridge_max <= 0 or (end - start) > cfg.bridge_max:
+                continue
+
+            before = frames_map.get(start - 1, [])
+            after = frames_map.get(end, [])
+            if not before or not after:
+                # lo/hi の作り方から本来ここには来ないはずだが、念のため
+                continue
+
+            score = min(min(r.score for r in before), min(r.score for r in after))
+            cls = before[0].cls
+            box_a = _union_box([r.box for r in before])
+            box_b = _union_box([r.box for r in after])
+            span = end - start + 1
+
+            for i in range(start, end):
+                w = (i - start + 1) / span
+                box = _lerp_box(box_a, box_b, w)
+                speed = max((r.speed for r in before), default=0.0)
+                speed = max(speed, max((r.speed for r in after), default=0.0))
+                per_frame[i].append(
+                    Region(
+                        box, cls, score, "bridged", speed,
+                        min(i - start + 1, end - i), lineage_id,
+                    )
+                )
+                filled += 1
+
+    return filled
+
+
+def _bridge_globally(
     per_frame: dict[int, list[Region]], n_frames: int, cfg: TemporalConfig
 ) -> tuple[int, list[tuple[int, int]]]:
-    """前後が覆われている未処理区間を、両側の領域の外接矩形で埋める。
+    """フレーム単位で「何かしら覆われているか」だけを見て埋める最終防波堤。
 
-    トラックが max_gap を超えて分断されると、frame memory で伸ばしても届かない
-    フレームが素通しで残る。素通しは法的に致命的なので、「判断できない = 潰す」
-    に従って両側を包む矩形で塞ぐ。
-
-    区間が bridge_max より長い場合は埋めない。長い未処理区間は本当に対象が
-    映っていない可能性が高く、そこまで潰すと過剰になるため。ただし埋めなかった
-    区間は呼び出し側に返し、レビュー対象として必ず記録する。
-
-    戻り値: (埋めたフレーム数, 埋めなかった未処理区間のリスト)
+    _bridge_by_lineage は同一対象と判定できたトラック同士しか繋がない
+    （stitch と同じ IoU/距離/サイズ比の条件を使う）。位置が大きく離れていて
+    対象の同定ができない場合でも、時間的に前後さえあれば繋いでよいという
+    従来の判断（RULES 0: 判断がつかないときは塞ぐ。塗り過ぎ側は許容できる）は
+    引き続き有効なので、系統をまたいだ最終防波堤としてここで担う。
     """
     covered = [bool(per_frame.get(f)) for f in range(n_frames)]
     filled = 0
@@ -624,9 +795,7 @@ def bridge_uncovered(
                 box = _lerp_box(box_a, box_b, w)
             else:
                 box = box_a or box_b
-            speed = max(
-                (r.speed for r in before), default=0.0
-            )
+            speed = max((r.speed for r in before), default=0.0)
             speed = max(speed, max((r.speed for r in after), default=0.0))
             per_frame[i].append(
                 Region(box, cls, score, "bridged", speed, min(i - start + 1, end - i))
@@ -634,6 +803,39 @@ def bridge_uncovered(
             filled += 1
 
     return filled, left_open
+
+
+def bridge_uncovered(
+    per_frame: dict[int, list[Region]], n_frames: int, cfg: TemporalConfig
+) -> tuple[int, list[tuple[int, int]]]:
+    """前後が覆われている未処理区間を、両側の領域の外接矩形で埋める。
+
+    トラックが max_gap を超えて分断されると、frame memory で伸ばしても届かない
+    フレームが素通しで残る。素通しは法的に致命的なので、「判断できない = 潰す」
+    に従って両側を包む矩形で塞ぐ。
+
+    2段構成（issue #10）。
+      1. _bridge_globally: フレーム丸ごと未処理の区間を、対象の同定をせず
+         時間的な近さだけで埋める（従来の最終防波堤。両端の全 region の
+         外接矩形で塞ぐ）。
+      2. _bridge_by_lineage: 1 で埋まらなかった、同一対象と判定できる
+         トラック同士の穴を、他対象の矩形に隠れていても系統単位で埋める。
+    順序が重要。_bridge_by_lineage を先に呼ぶと、その系統の region が
+    先に足された状態で _bridge_globally の「覆われているか」判定が
+    行われてしまい、フレーム丸ごと空だった区間が「覆われている」と
+    誤認されて最終防波堤が起動しなくなる。その結果、後続トラックを持たない
+    （そこでトラックが終わって二度と復活しない）対象は、系統としての
+    橋渡し候補がないまま素通しになる（漏れる方向。実測で bench3
+    123フレーム・736126セルが master 比で失われることを確認した）。
+    _bridge_globally を先に呼べば、フレーム丸ごと空の区間は従来どおり
+    確実に塞がれたうえで、系統単位の橋渡しがさらに隙間を埋める。
+
+    戻り値: (埋めたフレーム数の合計, 1 でも埋められなかった未処理区間)。
+    左側は従来どおり「フレーム丸ごと空」の区間のみを指す。
+    """
+    filled_globally, left_open = _bridge_globally(per_frame, n_frames, cfg)
+    filled_by_lineage = _bridge_by_lineage(per_frame, n_frames, cfg)
+    return filled_globally + filled_by_lineage, left_open
 
 
 def _track_speed(tracks: list[Track]) -> dict[int, float]:
@@ -745,7 +947,8 @@ def process(
     tracks, n_despiked, despiked_ranges = despike(tracks, cfg)
 
     speeds = _track_speed(tracks)
-    dense = densify(tracks, n_frames, cfg)
+    lineage_ids = _lineage_groups(tracks, frame_w, frame_h, cfg)
+    dense = densify(tracks, n_frames, cfg, lineage_ids)
     n_bridged, left_open = bridge_uncovered(dense, n_frames, cfg)
 
     # トラックと速度の対応をつけ直す（densify で Region に落ちると track が消えるため、
@@ -917,12 +1120,63 @@ def estimated_only_ranges(
 
     実効的な最小長は max(min_len, 推定frame_step)。間引きなし（frame_step=1）の
     素材では従来どおり min_len=1 のまま全区間が報告される。
+
+    issue #10: 以前は has_real がフレーム内の全領域を対象に any() を取っていた
+    ため、対象Aが推定のみでも同じフレームに対象Bの実観測があると、その
+    フレームは「推定のみ」から外れて報告そのものから消えていた（実測: bridge
+    と同根の欠陥で 14,382フレームが人手確認済み区間の中でこれに該当）。
+    ここでは densify() が Region.lineage に埋め込んだ系統ID
+    （_lineage_groups() 参照）ごとに独立して判定する。同じフレームで複数の
+    系統がそれぞれ推定のみなら、その分だけ複数件として報告される
+    （フレーム数の単純合計は延べ数になる。1フレームに2対象の穴があれば
+    2件ぶんとして数える。これは「見えている問題の数」であって水増しではない）。
+
+    系統ごとの判定だけに切り替えると、別の消え方をする。effective_min_len は
+    系統ごとに独立して効くため、以前はフレーム単位で連結されて
+    effective_min_len 以上あった区間が、系統の切り替わり（トラックが
+    途中で終わって別トラックに繋ぎ直った境目など）で分断され、
+    それぞれ effective_min_len 未満に落ちて両方とも報告から消えることがある
+    （実測: bench3 で系統単位のみだと86-89等の4フレーム区間が複数、
+    フレーム単位では報告されていたのに消える）。人手レビューの導線が消える
+    のは漏れる方向なので、系統ごとの判定（対象Bに隠れる穴を拾う）と
+    従来のフレーム単位の判定（系統の切れ目をまたいだ連結を拾う）の
+    **両方を計算し、区間の和集合**として報告する。片方にしか出ない区間も
+    両方に出る区間も、最終的に消えることはない。
     """
     if frame_step <= 0:
         frame_step = _infer_frame_step(regions_per_frame, n_frames)
     effective_min_len = max(min_len, frame_step)
 
-    out: list[tuple[int, int, float]] = []
+    by_lineage: dict[int, dict[int, list[tuple[Box, Region]]]] = {}
+    for f in range(n_frames):
+        for item in regions_per_frame.get(f, []):
+            by_lineage.setdefault(item[1].lineage, {}).setdefault(f, []).append(item)
+
+    lineage_out: list[tuple[int, int, float]] = []
+    for frames_map in by_lineage.values():
+        if not frames_map:
+            continue
+        lo, hi = min(frames_map), max(frames_map)
+        start = None
+        peak = 0
+        for f in range(lo, hi + 1):
+            regs = frames_map.get(f, [])
+            has_real = any(r.source == "detected" or r.source == "manual" for _, r in regs)
+            if regs and not has_real:
+                if start is None:
+                    start, peak = f, 0
+                peak = max(peak, max((r.hold for _, r in regs), default=0))
+            else:
+                if start is not None and f - start >= effective_min_len:
+                    lineage_out.append((start, f - 1, peak))
+                start = None
+        if start is not None and hi + 1 - start >= effective_min_len:
+            lineage_out.append((start, hi, peak))
+
+    # フレーム単位（従来どおり、対象を区別しない any() 判定）の区間。
+    # 系統の切れ目で分断されて effective_min_len 未満に落ちる区間を、
+    # フレーム全体で見れば繋がっていた分として拾い直すために計算する。
+    global_out: list[tuple[int, int, float]] = []
     start = None
     peak = 0
     for f in range(n_frames):
@@ -934,10 +1188,33 @@ def estimated_only_ranges(
             peak = max(peak, max((r.hold for _, r in regs), default=0))
         else:
             if start is not None and f - start >= effective_min_len:
-                out.append((start, f - 1, peak))
+                global_out.append((start, f - 1, peak))
             start = None
     if start is not None and n_frames - start >= effective_min_len:
-        out.append((start, n_frames - 1, peak))
+        global_out.append((start, n_frames - 1, peak))
+
+    return _merge_ranges(lineage_out + global_out)
+
+
+def _merge_ranges(
+    ranges: list[tuple[int, int, float]],
+) -> list[tuple[int, int, float]]:
+    """(開始, 終了, peak) の区間リストを、重なる/接する区間ごとに1本へまとめる。
+
+    2つの判定基準（系統ごと・フレーム単位）の出力をそのまま連結すると、同じ
+    区間や重なる区間が重複して報告されうる。ここでまとめて、見た目の水増しを
+    防ぎつつ、どちらか一方にしか出ない区間は取りこぼさない。
+    """
+    if not ranges:
+        return []
+    ranges = sorted(ranges, key=lambda t: (t[0], t[1]))
+    out: list[tuple[int, int, float]] = [ranges[0]]
+    for start, end, peak in ranges[1:]:
+        last_start, last_end, last_peak = out[-1]
+        if start <= last_end + 1:
+            out[-1] = (last_start, max(last_end, end), max(last_peak, peak))
+        else:
+            out.append((start, end, peak))
     return out
 
 
