@@ -23,9 +23,10 @@ docs/01-technical-design.md の設計は「幾何フィルタ -> トラッキン
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass, field
 
-from .detector import Detection
+from .detector import CONSERVATIVE_CLASSES, DEFAULT_CLASSES, Detection
 
 try:  # scipy があれば最適割当を使う。無くても動くようにしておく
     from scipy.optimize import linear_sum_assignment as _lsa
@@ -148,6 +149,70 @@ class TemporalConfig:
         トラックが毎回切れてしまう。
         """
         return max(self.max_gap, self.frame_step * 4)
+
+
+def narrow_without_estimate_gaps(args, given: set[str]) -> None:
+    """--estimate-gaps 無しのときの時間方向設定の絞り込み。
+
+    既定は「実際に検出できた箇所だけ」を塗る方針（塗り過ぎを避ける）。
+    memory・memory_before・bridge_max・hold_growth・motion_weight を、
+    推定で広げない値まで狭める。ただし明示指定された値（given）は上書きしない。
+    黙って別の設定で走らせないよう、絞り込んだ内容を stderr に出す
+    （C-6: 実効設定が明示指定と違う状態で走ることがあるので、--quiet でも出す）。
+
+    `args` は argparse.Namespace（か同等の属性を持つオブジェクト）。
+    memory / memory_before / bridge_max / hold_growth / motion_weight の
+    5属性を直接書き換える（in-place）。
+
+    cli.py の main() と review.py の session_from_args() の両方から呼ばれる
+    唯一の実装（issue #33）。#14 で見つかった「既定値がハードコードされて
+    食い違う」のと同型の構造的リスクが、この絞り込み式にも残っていた
+    （2箇所に別々に書かれていたため、片方だけ変えると再発する）ので統合した。
+    """
+    narrowed = [
+        ("memory", "--memory", args.memory, min(args.memory, 2)),
+        ("memory_before", "--memory-before",
+         args.memory_before, min(args.memory_before or 2, 2)),
+        ("bridge_max", "--bridge-max", args.bridge_max, 0),
+        ("hold_growth", "--hold-growth", args.hold_growth, 0.0),
+        ("motion_weight", "--motion-weight",
+         args.motion_weight, min(args.motion_weight, 1.0)),
+    ]
+    applied: list[str] = []
+    kept: list[str] = []
+    for name, flag, old, new in narrowed:
+        if name in given:
+            if old != new:
+                kept.append(f"{flag} {old}")
+            continue
+        if old != new:
+            setattr(args, name, new)
+            applied.append(f"{flag} {old} -> {new}")
+
+    if applied:
+        print(
+            "--estimate-gaps 無しのため推定で広げる設定を絞りました: "
+            + ", ".join(applied),
+            file=sys.stderr,
+        )
+    if kept:
+        print("明示指定を優先: " + ", ".join(kept), file=sys.stderr)
+
+
+def resolve_classes(spec: str) -> set[str]:
+    """`--classes` の文字列（"default" / "conservative" / カンマ区切り）を
+    実際のクラス名集合に解決する。
+
+    cli.py の main() と review.py の session_from_args() の両方から呼ばれる
+    唯一の実装（issue #33・#56）。narrow_without_estimate_gaps() と同じ理由で
+    統合した: 2箇所に別々に書かれていると、片方だけ書き換えても壊れ方が
+    検出できない（#14 と同型の構造的リスク）。
+    """
+    if spec == "default":
+        return set(DEFAULT_CLASSES)
+    if spec == "conservative":
+        return set(CONSERVATIVE_CLASSES)
+    return {c.strip() for c in spec.split(",") if c.strip()}
 
 
 def filter_classes(

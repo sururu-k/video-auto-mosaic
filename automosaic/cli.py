@@ -20,8 +20,6 @@ import numpy as np
 
 from . import __version__
 from .detector import (
-    CONSERVATIVE_CLASSES,
-    DEFAULT_CLASSES,
     Detection,
     Detector,
     available_providers,
@@ -33,7 +31,9 @@ from .temporal import (
     TemporalConfig,
     estimated_only_ranges,
     frames_with_mosaic_count,
+    narrow_without_estimate_gaps,
     process,
+    resolve_classes,
     review_flags,
     uncovered_ranges,
 )
@@ -826,12 +826,7 @@ def main(argv: list[str] | None = None) -> int:
         print("出力が入力と同じパスです。上書きは行いません。", file=sys.stderr)
         return 1
 
-    if args.classes == "default":
-        classes = set(DEFAULT_CLASSES)
-    elif args.classes == "conservative":
-        classes = set(CONSERVATIVE_CLASSES)
-    else:
-        classes = {c.strip() for c in args.classes.split(",") if c.strip()}
+    classes = resolve_classes(args.classes)
 
     info = vid.probe(src)
 
@@ -1119,39 +1114,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # ---- 時間方向の安定化 ----
+    # 絞り込みの式そのものは temporal.narrow_without_estimate_gaps() に一本化して
+    # ある（review.py の session_from_args() と共有。issue #33）。ここで直接
+    # 書き換えると、review.py 側だけ古い式のまま取り残され #14 と同型の食い違いが
+    # 再発する。
     if not args.estimate_gaps:
-        # 既定は「実際に検出できた箇所だけ」。推定で広げる要素を落とし、
-        # 検出と検出のあいだの補間だけ残す。塗り過ぎを避けるための方針。
-        # ただし明示指定された値は上書きしない。黙って別の設定で走らせない。
-        narrowed = [
-            ("memory", "--memory", args.memory, min(args.memory, 2)),
-            ("memory_before", "--memory-before",
-             args.memory_before, min(args.memory_before or 2, 2)),
-            ("bridge_max", "--bridge-max", args.bridge_max, 0),
-            ("hold_growth", "--hold-growth", args.hold_growth, 0.0),
-            ("motion_weight", "--motion-weight",
-             args.motion_weight, min(args.motion_weight, 1.0)),
-        ]
-        applied: list[str] = []
-        kept: list[str] = []
-        for name, flag, old, new in narrowed:
-            if name in given:
-                if old != new:
-                    kept.append(f"{flag} {old}")
-                continue
-            if old != new:
-                setattr(args, name, new)
-                applied.append(f"{flag} {old} -> {new}")
-
-        # C-6: 実効設定が明示指定と違う状態で走ることがあるので、--quiet でも出す。
-        if applied:
-            print(
-                "--estimate-gaps 無しのため推定で広げる設定を絞りました: "
-                + ", ".join(applied),
-                file=sys.stderr,
-            )
-        if kept:
-            print("明示指定を優先: " + ", ".join(kept), file=sys.stderr)
+        narrow_without_estimate_gaps(args, given)
 
     cfg = TemporalConfig(
         max_gap=args.max_gap,

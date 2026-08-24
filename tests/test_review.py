@@ -55,7 +55,9 @@ from automosaic.review import (  # noqa: E402
     to_yolo,
     token_matches,
 )
+from automosaic.detector import CONSERVATIVE_CLASSES, DEFAULT_CLASSES  # noqa: E402
 from automosaic.temporal import TemporalConfig  # noqa: E402
+from automosaic.temporal import resolve_classes  # noqa: E402
 
 CLS = "MALE_GENITALIA_EXPOSED"
 
@@ -2024,6 +2026,178 @@ def test_review_cfg_matches_cli_cfg_for_default_job():
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# -- review.py と cli.py の block/mode/classes 既定値一致（issue #33） -----
+
+
+def test_review_block_mode_classes_defaults_match_cli():
+    """review.py の --block / --mode / --classes の既定値が cli.py と一致すること。
+
+    この3つは TemporalConfig のフィールドではないため、
+    test_review_cfg_matches_cli_cfg_for_default_job（#14）の比較対象に
+    含まれない。実際、review.py の --block と --mode は cli.py と同じ値を
+    ここに直書きしているだけで、cli.py の build_parser() から借りていなかった
+    （--classes は #14 で既に借りる形になっていた）。
+
+    このテストを追加する前に、review.py の --block の既定値だけを 0 -> 40 に、
+    --mode を "pixelize" -> "black" に書き換えて
+    tests/test_review.py tests/test_render.py tests/test_webapp.py を
+    フルスイート実行し、**1件も失敗しないこと**を確認した（issue #33 記載の
+    変異D/Eの再現）。焼き込みと違うブロックサイズ・モードでレビュー画面を
+    見せても、既存のどのテストも検出しない構造的な穴だった。
+    """
+    cli_defaults = review._cli_defaults()
+    rev_args = review.build_parser().parse_args([])
+
+    mismatches = []
+    if rev_args.block != cli_defaults["--block"]:
+        mismatches.append(("block", cli_defaults["--block"], rev_args.block))
+    if rev_args.mode != cli_defaults["--mode"]:
+        mismatches.append(("mode", cli_defaults["--mode"], rev_args.mode))
+    if rev_args.classes != cli_defaults["--classes"]:
+        mismatches.append(("classes", cli_defaults["--classes"], rev_args.classes))
+
+    assert not mismatches, (
+        f"review.py の既定値が cli.py と食い違う（フィールド, cli値, review値）: "
+        f"{mismatches}"
+    )
+    print(
+        "  review --block/--mode/--classes 既定値 == cli 既定値 "
+        f"(block={rev_args.block}, mode={rev_args.mode}) OK"
+    )
+
+
+# -- resolve_classes() の解決先そのものの検証（issue #33 / #56） ----------
+
+
+def test_resolve_classes_resolves_to_known_class_sets():
+    """resolve_classes() が spec 文字列をどの class 集合に解決するかを直接見る。
+
+    test_review_block_mode_classes_defaults_match_cli は args.classes という
+    文字列（"default"）の一致しか見ておらず、その文字列が実際にどの class
+    集合に解決されるかを検証していなかった（#56 の却下理由）。ここでは
+    resolve_classes() の "default" 分岐を CONSERVATIVE_CLASSES に差し替える
+    ような変異（DEFAULT_CLASSES と CONSERVATIVE_CLASSES は要素が異なる）を
+    直接検出できるよう、既知の集合と突き合わせる。
+    """
+    assert resolve_classes("default") == set(DEFAULT_CLASSES)
+    assert resolve_classes("conservative") == set(CONSERVATIVE_CLASSES)
+    assert resolve_classes("default") != set(CONSERVATIVE_CLASSES), (
+        "DEFAULT_CLASSES と CONSERVATIVE_CLASSES が区別できない前提が壊れている"
+    )
+    assert resolve_classes("FEMALE_GENITALIA_EXPOSED, ANUS_EXPOSED") == {
+        "FEMALE_GENITALIA_EXPOSED",
+        "ANUS_EXPOSED",
+    }
+    assert resolve_classes("") == set()
+    print("  resolve_classes() の解決先 (default/conservative/明示指定) OK")
+
+
+def test_review_resolved_classes_match_cli_and_known_default():
+    """cli.main() と review.session_from_args() が実際に process() へ渡す
+    classes 集合が、(1) 既知の正解（DEFAULT_CLASSES / CONSERVATIVE_CLASSES）
+    と一致し、(2) 互いにも一致すること。
+
+    文字列 "default" の一致だけを見るテストでは、resolve_classes() の中身が
+    どちらの側でも同じように壊れていると検出できない（1か所化した後は
+    cli.py と review.py が同じ関数を呼ぶため、cli 側と review 側の比較だけ
+    では共有関数そのものの壊れを検出できない）。そのため、既知の正解集合
+    との比較を必須にしている。process() は positional で
+    (per_frame, n_frames, w, h, classes, cfg) を受け取るので、その呼び出しを
+    monkeypatch で捕まえて実際に渡った classes 集合そのものを見る。
+    """
+    if not _have_ffmpeg():
+        print("  review classes == cli classes (既定ジョブ) SKIP (ffmpeg 無し)")
+        return
+
+    def _capture_classes(argv_extra: list[str]) -> tuple[set[str], set[str]]:
+        tmp = tempfile.mkdtemp()
+        try:
+            src = os.path.join(tmp, "in.mp4")
+            det = os.path.join(tmp, "det.json")
+            n = 10
+            _make_tiny_video(src, 64, 64, n)
+            with open(det, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"n_frames": n, "width": 64, "height": 64,
+                     "complete": True, "detections": {}},
+                    f,
+                )
+
+            captured_cli = {}
+            orig_cli_process = cli.process
+
+            def fake_cli_process(*a, **kw):
+                captured_cli["classes"] = (
+                    kw["classes"] if "classes" in kw else a[4]
+                )
+                return orig_cli_process(*a, **kw)
+
+            cli.process = fake_cli_process
+            try:
+                rc = cli.main(
+                    [src, "--detections", det, "--reuse-detections",
+                     "--detect-only", "--quiet", *argv_extra]
+                )
+            finally:
+                cli.process = orig_cli_process
+            assert rc == 0, "cli.main が失敗した"
+            assert "classes" in captured_cli, "cli.py 側の classes を捕まえられなかった"
+
+            captured_rev = {}
+            orig_rev_process = review.process
+
+            def fake_rev_process(*a, **kw):
+                captured_rev["classes"] = (
+                    kw["classes"] if "classes" in kw else a[4]
+                )
+                return orig_rev_process(*a, **kw)
+
+            review.process = fake_rev_process
+            try:
+                argv = [src, "--detections", det, *argv_extra]
+                args = review.build_parser().parse_args(argv)
+                session = review.session_from_args(args, argv)
+            finally:
+                review.process = orig_rev_process
+            assert "classes" in captured_rev, (
+                "review.py 側の classes を捕まえられなかった"
+            )
+            session.reader.close()
+
+            return captured_cli["classes"], captured_rev["classes"]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    cases = [
+        ([], set(DEFAULT_CLASSES)),
+        (["--classes", "default"], set(DEFAULT_CLASSES)),
+        (["--classes", "conservative"], set(CONSERVATIVE_CLASSES)),
+        (
+            ["--classes", "FEMALE_GENITALIA_EXPOSED,MALE_GENITALIA_EXPOSED"],
+            {"FEMALE_GENITALIA_EXPOSED", "MALE_GENITALIA_EXPOSED"},
+        ),
+    ]
+    for argv_extra, expected in cases:
+        cli_classes, rev_classes = _capture_classes(argv_extra)
+        assert cli_classes == expected, (
+            f"cli.py が process() に渡した classes が既知の正解と食い違う "
+            f"(argv={argv_extra}): 実際={sorted(cli_classes)} 正解={sorted(expected)}"
+        )
+        assert rev_classes == expected, (
+            f"review.py が process() に渡した classes が既知の正解と食い違う "
+            f"(argv={argv_extra}): 実際={sorted(rev_classes)} 正解={sorted(expected)}"
+        )
+        assert cli_classes == rev_classes, (
+            f"process() へ渡る classes 集合が cli.py と review.py で食い違う "
+            f"(argv={argv_extra}): cli={sorted(cli_classes)} "
+            f"review={sorted(rev_classes)}"
+        )
+    print(
+        f"  review classes == cli classes == 既知の正解 "
+        f"({len(cases)} 通りの --classes 指定) OK"
+    )
 
 
 if __name__ == "__main__":
