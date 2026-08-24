@@ -10,6 +10,14 @@
 // 画面部品は Preact、画像に重ねる枠は canvas 直描き。canvas は仮想 DOM の
 // 恩恵が無いので、描画そのものは shared/canvas-draw.ts の純粋な関数に置いて
 // useEffect から呼ぶだけにしてある。
+//
+// issue #79: ← / → は旧「検査キューの次の項目へ」から「1フレームだけ
+// プレビュー」へ変わった（全画面で ← / → の意味を統一するため）。プレビューは
+// 表示だけを動かし、判定の対象（cur.frame。サーバへ送る frame）は動かさない。
+// プレビュー中は判定キー・判定ボタンを止める（RULES 0: 判定の誤発火防止）。
+// 検査キューの項目送り（旧 ← / →）は PageUp / PageDown に移した。
+// この画面には frontend/src/webapp/review.tsx にある区間追従（issue #46。
+// I / O キー）がまだ無い。移植するかは別途 issue の判断に委ねる（issue #79）。
 
 import { render } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
@@ -18,6 +26,8 @@ import type { Progress, QueuePayload, QueueItem, StateLight, MarkRequest, MarkRe
 import { drawReviewOverlay } from "../shared/canvas-draw.js";
 import { normFromClient, scaledSize, tapToBox } from "../shared/geom.js";
 import type { NormPoint } from "../shared/geom.js";
+import { dispatchKey, helpRows, REVIEW_KEYS } from "../shared/keymap.js";
+import type { KeyLike } from "../shared/keymap.js";
 import {
   MARK_MODES,
   VERDICT_LABEL,
@@ -32,6 +42,9 @@ import {
 } from "../shared/review-logic.js";
 import type { MarkMode } from "../shared/review-logic.js";
 import { errText, get, post, url } from "../shared/review-net.js";
+
+// Shift+← / Shift+→（大きく飛ぶ）のプレビュー移動幅。固定値（timeline と揃えた）
+const JUMP_STEP = 10;
 
 interface SaveState {
   kind: "ok" | "busy" | "err";
@@ -68,6 +81,11 @@ function App() {
   const [tap, setTap] = useState<NormPoint | null>(null);
   // 「誤検知」で選んだ自動領域の番号（autoBoxes() の添字）
   const [picked, setPicked] = useState<number[]>([]);
+  // 1フレームだけのプレビュー（issue #79）。null なら判定対象のフレーム
+  // （cur.frame）をそのまま見ている。判定は常に cur.frame に対して行うので、
+  // これが cur.frame と食い違っている間は判定を止める（誤って違うフレームを
+  // 判定してしまう事故を防ぐ。RULES 0）
+  const [previewFrame, setPreviewFrame] = useState<number | null>(null);
 
   const [busy, setBusy] = useState(false);
   const [imgWidth, setImgWidth] = useState(720);
@@ -79,6 +97,8 @@ function App() {
   const ovRef = useRef<HTMLCanvasElement>(null);
 
   const cur = items[idx] ?? null;
+  const displayFrame = previewFrame ?? cur?.frame ?? 0;
+  const previewing = previewFrame !== null && !!cur && previewFrame !== cur.frame;
   const autos = useMemo(() => autoBoxes(cur?.boxes), [cur]);
   const boxSize = state ? scaledSize(state.default_size, sizePct) : ([64, 64] as [number, number]);
   const pending =
@@ -141,13 +161,15 @@ function App() {
     drawReviewOverlay(ctx, {
       width: state.width,
       height: state.height,
-      boxes: cur?.boxes ?? [],
+      // プレビュー中は検出枠を出さない。cur.boxes は cur.frame の検出結果で、
+      // いま見ている絵（displayFrame）のものではないため
+      boxes: previewing ? [] : (cur?.boxes ?? []),
       showBoxes: optBoxes,
       markMode,
       picked,
       pending,
     });
-  }, [state, cur, optBoxes, markMode, picked, pending]);
+  }, [state, cur, previewing, optBoxes, markMode, picked, pending]);
 
   // 位置指定モードは CSS 側でもカーソルとボタンの見た目を変える。
   // どのつもりの操作かが画面全体で分かるようにしておく
@@ -170,13 +192,46 @@ function App() {
 
   function goto(i: number, list: QueueItem[] = items) {
     cancelMark();
+    setPreviewFrame(null); // 新しい項目に来たら、プレビューはその項目の frame に戻す
     setIdx(Math.max(0, Math.min(list.length, i)));
     setNotice("");
+  }
+
+  /** 1フレームのプレビュー移動（issue #79）。cur（判定対象）は動かさない */
+  function stepPreview(delta: number) {
+    if (!state || !cur) return;
+    cancelMark();
+    const base = previewFrame ?? cur.frame;
+    setPreviewFrame(Math.max(0, Math.min(state.n_frames - 1, base + delta)));
+    setNotice("");
+  }
+
+  function jumpPreviewTo(frame: number) {
+    if (!state || !cur) return;
+    cancelMark();
+    setPreviewFrame(Math.max(0, Math.min(state.n_frames - 1, frame)));
+    setNotice("");
+  }
+
+  /** プレビュー中は判定を止める。見えている絵と違う frame を判定する事故を防ぐ（RULES 0） */
+  function requireOnItem(): boolean {
+    if (previewing) {
+      setNotice(
+        `プレビュー中です（frame ${displayFrame}）。判定するには ← / → で frame ${cur?.frame} まで戻ってください`,
+      );
+      return false;
+    }
+    return true;
+  }
+
+  function noPlayback() {
+    setNotice("この画面に連続再生はありません（1枚ずつ判定する画面です）");
   }
 
   async function judge(verdict: MarkRequest["verdict"], extra?: Partial<MarkRequest>) {
     const it = cur;
     if (!it || busy) return;
+    if (!requireOnItem()) return;
     setBusy(true);
     setSave({ kind: "busy", text: "保存中" });
     try {
@@ -232,6 +287,7 @@ function App() {
   // ----------------------------------------------------------------
   function startMark(mode: MarkMode) {
     if (!cur) return;
+    if (!requireOnItem()) return;
     if ((mode === "shrink" || mode === "erase") && !autos.length) {
       // 消す相手がいないのに範囲だけ置かせると、ただ塗る範囲が増える。
       // どちらも自動領域が前提の操作なので、無いなら入らせない
@@ -318,24 +374,46 @@ function App() {
   // ----------------------------------------------------------------
   // キー
   // ----------------------------------------------------------------
+  // キーは shared/keymap.ts の REVIEW_KEYS が唯一の割り当て表。
+  // ここでは「アクション名 -> 何をするか」だけを持つ（issue #79）。
+  // webapp/review.tsx と同じ表を使うが、この画面には区間追従（I/O）が
+  // まだ無いので REVIEW_KEYS だけを使う（REVIEW_INTERVAL_KEYS は使わない）
   useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
-      const t = ev.target as HTMLElement;
-      if (t.tagName === "INPUT" || t.tagName === "SELECT") return;
-      switch (ev.key) {
-        case "1": void judge("ok"); break;
-        case "2": startMark("add"); break;
-        case "3": void judge("unsure"); break;
-        case "4": startMark("shrink"); break;
-        case "5": startMark("erase"); break;
-        case "u":
-        case "U": void undo(); break;
-        case "ArrowLeft": goto(idx - 1); break;
-        case "ArrowRight": goto(idx + 1); break;
-        case "Escape": cancelMark(); break;
-        default: return;
-      }
-      ev.preventDefault();
+      const t = ev.target as HTMLElement | null;
+      const like: KeyLike = {
+        key: ev.key,
+        shiftKey: ev.shiftKey,
+        targetTag: t?.tagName ?? null,
+        targetEditable: !!t?.isContentEditable,
+      };
+      const handled = dispatchKey(REVIEW_KEYS, like, {
+        // 判定（1〜5）は動かしていない（RULES 0）
+        judgeOk: () => void judge("ok"),
+        judgeAdd: () => startMark("add"),
+        judgeUnsure: () => void judge("unsure"),
+        judgeShrink: () => startMark("shrink"),
+        judgeErase: () => startMark("erase"),
+        undo: () => void undo(),
+        cancel: () => { cancelMark(); setPreviewFrame(null); setNotice(""); },
+        // ← / → はキュー送りから1フレームのプレビューへ変わった（issue #79）。
+        // キュー送りは PageUp / PageDown に移した
+        stepBack: () => stepPreview(-1),
+        stepForward: () => stepPreview(1),
+        jumpBack: () => stepPreview(-JUMP_STEP),
+        jumpForward: () => stepPreview(JUMP_STEP),
+        goHome: () => jumpPreviewTo(0),
+        goEnd: () => jumpPreviewTo((state?.n_frames ?? 1) - 1),
+        queuePrev: () => goto(idx - 1),
+        queueNext: () => goto(idx + 1),
+        // この画面に連続再生は無い（1枚ずつ判定する画面）
+        playToggle: noPlayback,
+        shuttleReverse: noPlayback,
+        shuttleStop: noPlayback,
+        shuttleForward: noPlayback,
+        help: () => setSheetOpen(true),
+      });
+      if (handled) ev.preventDefault();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
@@ -353,13 +431,18 @@ function App() {
         : spec.wait
       : "";
   const confirmDisabled = erase ? erase.confirmDisabled : !tap;
+  // プレビュー中（issue #79）は、判定の案内より先に「今は判定対象を見ていない」
+  // ことを出す。それが分からないまま判定キーを押すと、なぜ止まったのか分からない
+  const previewBanner = previewing
+    ? `プレビュー中: frame ${displayFrame}（判定対象は frame ${cur?.frame}。← / → で戻れます）`
+    : "";
   const bannerText = spec
     ? erase
       ? erase.banner
       : tap
         ? "大きさは下のスライダで調整できます"
         : spec.hint
-    : notice || bannerFor(items, idx);
+    : notice || previewBanner || bannerFor(items, idx);
   const posText = cur
     ? `${idx + 1} / ${items.length}`
     : items.length
@@ -393,8 +476,8 @@ function App() {
 
       <main id="stage">
         <div id="imgwrap">
-          <img id="shot" alt="判定対象のフレーム"
-               src={cur ? frameUrl(cur.frame, imgWidth) : undefined} />
+          <img id="shot" alt={previewing ? "プレビュー中のフレーム" : "判定対象のフレーム"}
+               src={cur ? frameUrl(displayFrame, imgWidth) : undefined} />
           <canvas id="ov" ref={ovRef}
                   width={state?.width ?? 0} height={state?.height ?? 0}
                   onPointerDown={onCanvasPointerDown} />
@@ -405,16 +488,17 @@ function App() {
       <footer id="pad">
         {/* 判定モード。ここだけで1枚が終わるのが普通の流れ */}
         <div id="judge" class={markMode ? "hidden" : ""}>
-          <button id="btn-ok" class="big ok" onClick={() => void judge("ok")}>問題なし</button>
+          {/* プレビュー中は判定ボタンを止める（issue #79。RULES 0: 誤発火防止） */}
+          <button id="btn-ok" class="big ok" disabled={previewing} onClick={() => void judge("ok")}>問題なし</button>
           {/* 範囲を直す2つ。縦に4つ積むと縦持ちで画像面が潰れるので横に並べる */}
           <div class="row">
-            <button id="btn-ng" class="big ng" onClick={() => startMark("add")}>漏れている</button>
-            <button id="btn-big" class="big warn" onClick={() => startMark("shrink")}>でかすぎる</button>
+            <button id="btn-ng" class="big ng" disabled={previewing} onClick={() => startMark("add")}>漏れている</button>
+            <button id="btn-big" class="big warn" disabled={previewing} onClick={() => startMark("shrink")}>でかすぎる</button>
           </div>
           {/* 誤検知はモザイクを消す方向なので、色を灰にして目立たせない */}
           <div class="row">
-            <button id="btn-fp" class="mid dim" onClick={() => startMark("erase")}>誤検知</button>
-            <button id="btn-unsure" class="mid" onClick={() => void judge("unsure")}>判断できない</button>
+            <button id="btn-fp" class="mid dim" disabled={previewing} onClick={() => startMark("erase")}>誤検知</button>
+            <button id="btn-unsure" class="mid" disabled={previewing} onClick={() => void judge("unsure")}>判断できない</button>
           </div>
         </div>
 
@@ -518,9 +602,16 @@ function App() {
           <p class="info">
             <a id="link-timeline" href={url("/timeline")}>タイムライン画面（PC 向け）</a>
           </p>
+          {/* 割り当て表（shared/keymap.ts の REVIEW_KEYS）から自動で作る。
+              手で書き写すと割り当てを直したときにここだけ古いまま腐る（issue #79）。
+              ? キーでここ（設定シート）を開く */}
           <p class="info">
-            キー: 1 問題なし / 2 漏れている / 3 判断できない / 4 でかすぎる /
-            5 誤検知 / U ひとつ戻す / ← → 前後の1枚 / Esc やめる
+            キー:
+            {helpRows(REVIEW_KEYS).map((r) => ` ${r.label} ${r.desc} /`).join("")}
+          </p>
+          <p class="info">
+            キュー送り（前後の項目へ）は PageUp / PageDown。
+            ← / → はこの画面では1フレームのプレビューで、判定対象は動かさない
           </p>
 
           <button id="btn-close-sheet" class="big" onClick={() => setSheetOpen(false)}>閉じる</button>

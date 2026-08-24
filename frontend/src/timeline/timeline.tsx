@@ -23,8 +23,18 @@ import type {
 import { drawRegionOverlay, drawTimelineBand } from "../shared/canvas-draw.js";
 import { frameFromClient } from "../shared/geom.js";
 import type { FramePoint } from "../shared/geom.js";
+import { dispatchKey, helpRows, TIMELINE_KEYS } from "../shared/keymap.js";
+import type { KeyLike } from "../shared/keymap.js";
 import { correctionsAfterDrop } from "../shared/review-logic.js";
 import { errText, url as u } from "../shared/review-net.js";
+import { nextShuttleSpeed } from "../shared/shuttle.js";
+
+// Shift+← / Shift+→（大きく飛ぶ）のジャンプ幅。draw.tsx の strideN のような
+// 画面上の設定は無いので固定値にする（issue #79）
+const JUMP_STEP = 10;
+// シャトル（J/K/L）のティック間隔。速度（signed 倍率）ぶんのフレームを
+// このたびに動かす。短すぎると /frame の要求が追いつかない
+const SHUTTLE_TICK_MS = 120;
 
 interface SaveStatus {
   kind: "saved" | "dirty" | "error";
@@ -32,7 +42,7 @@ interface SaveStatus {
 }
 
 const HINT_DEFAULT =
-  "M で追加モード → 動画上をクリックして矩形を置く → 1 でこのフレームだけ / 2 で以降に適用";
+  "M で追加モード → 動画上をクリックして矩形を置く → Enter でこのフレームだけ / Shift+Enter で以降に適用";
 
 function App() {
   const [state, setState] = useState<StateFull | null>(null);
@@ -183,7 +193,14 @@ function App() {
   }, [playing, state]);
 
   function play() {
-    if (!state?.has_video) return;
+    if (!state?.has_video) {
+      // 再生できないことを黙って無視しない（issue #79）。無反応だと
+      // 「押したのに何も起きない」壊れ方に見える
+      setHint("この素材には再生できる動画がありません（コマ送りで確認してください）");
+      setHintActive(true);
+      return;
+    }
+    stopShuttle();
     playingRef.current = true;
     setPlaying(true);
     hideStill();
@@ -206,8 +223,47 @@ function App() {
   /** 再生中に押されたら止めてから動く。原稿の各所にあった前置き */
   function pausedThen(fn: () => void) {
     if (playingRef.current) pause();
+    stopShuttle();
     fn();
   }
+
+  // ----------------------------------------------------------------
+  // シャトル（J/K/L）。issue #79: 「連打で速くなる、標準的なシャトル」。
+  //
+  // <video> の playbackRate は負の値を無視するブラウザが多く、逆再生に
+  // 使えない。ここでは既存のコマ送り（setFrame）を一定間隔で繰り返す方式に
+  // 統一し、逆再生も同じ仕組みで実現する。速度の遷移そのもの（加速・逆転・
+  // 頭打ち）は shared/shuttle.ts の純粋な判断を使う。
+  // ----------------------------------------------------------------
+  const shuttleSpeed = useRef(0);
+  const shuttleTimer = useRef<number | null>(null);
+
+  function stopShuttle() {
+    shuttleSpeed.current = 0;
+    if (shuttleTimer.current !== null) {
+      window.clearInterval(shuttleTimer.current);
+      shuttleTimer.current = null;
+    }
+  }
+
+  function shuttle(dir: -1 | 0 | 1) {
+    if (!state) return;
+    if (playingRef.current) pause(); // ネイティブ再生とシャトルを同時に走らせない
+    const next = nextShuttleSpeed(shuttleSpeed.current, dir);
+    shuttleSpeed.current = next;
+    if (next === 0) {
+      stopShuttle();
+      return;
+    }
+    if (shuttleTimer.current !== null) return; // 既に回っている。速度だけ変わる
+    shuttleTimer.current = window.setInterval(() => {
+      const before = curRef.current;
+      setFrame(before + shuttleSpeed.current, true);
+      if (curRef.current === before) stopShuttle(); // 端まで来た
+    }, SHUTTLE_TICK_MS);
+  }
+
+  useEffect(() => () => stopShuttle(), []);
 
   // ----------------------------------------------------------------
   // 重ね描きと帯
@@ -306,7 +362,7 @@ function App() {
     const [w, h] = size;
     setPending([Math.round(p[0] - w / 2), Math.round(p[1] - h / 2), w, h]);
     setHintActive(false);
-    setHint("矩形を置きました。1 でこのフレームだけ / 2 でここから N フレームに適用");
+    setHint("矩形を置きました。Enter でこのフレームだけ / Shift+Enter でここから N フレームに適用");
     setAddMode(false);
   }
 
@@ -397,31 +453,47 @@ function App() {
     return frameFromClient(cv.getBoundingClientRect(), ev.clientX, ev.clientY, state.width, state.height);
   }
 
+  // キーは shared/keymap.ts の TIMELINE_KEYS が唯一の割り当て表。
+  // ここでは「アクション名 -> 何をするか」だけを持つ（issue #79）
   useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
-      const t = ev.target as HTMLElement;
-      if (t.tagName === "INPUT" || t.tagName === "SELECT") return;
-      const k = ev.key;
-      if (k === " ") { ev.preventDefault(); togglePlay(); return; }
-      if (k === ",") { pausedThen(() => setFrame(curRef.current - 1, true)); return; }
-      if (k === ".") { pausedThen(() => setFrame(curRef.current + 1, true)); return; }
-      if (k === "[") { scaleSize(1 / 1.15); return; }
-      if (k === "]") { scaleSize(1.15); return; }
-      if (k === "m" || k === "M") {
-        pausedThen(() => {
+      const t = ev.target as HTMLElement | null;
+      const like: KeyLike = {
+        key: ev.key,
+        shiftKey: ev.shiftKey,
+        targetTag: t?.tagName ?? null,
+        targetEditable: !!t?.isContentEditable,
+      };
+      const handled = dispatchKey(TIMELINE_KEYS, like, {
+        stepBack: () => pausedThen(() => setFrame(curRef.current - 1, true)),
+        stepForward: () => pausedThen(() => setFrame(curRef.current + 1, true)),
+        jumpBack: () => pausedThen(() => setFrame(curRef.current - JUMP_STEP, true)),
+        jumpForward: () => pausedThen(() => setFrame(curRef.current + JUMP_STEP, true)),
+        playToggle: () => {
+          if (shuttleSpeed.current !== 0) { stopShuttle(); return; }
+          togglePlay();
+        },
+        goHome: () => pausedThen(() => setFrame(0, true)),
+        goEnd: () => pausedThen(() => setFrame((state?.n_frames ?? 1) - 1, true)),
+        shuttleReverse: () => shuttle(-1),
+        shuttleStop: () => shuttle(0),
+        shuttleForward: () => shuttle(1),
+        help: () => {
+          document.getElementById("keys-panel")?.scrollIntoView({ behavior: "smooth", block: "center" });
+        },
+        addMode: () => pausedThen(() => {
           setAddMode(true);
           setHintActive(true);
           setHint("追加モード: 動画上をクリックして矩形を置いてください");
-        });
-        return;
-      }
-      if (k === "1") { pausedThen(() => applyPending(1)); return; }
-      if (k === "2") {
-        pausedThen(() => applyPending(Math.max(1, parseInt(spanInput, 10) || 30)));
-        return;
-      }
-      if (k === "d" || k === "D") { deleteUnderCursor(); return; }
-      if (k === "g" || k === "G") { pausedThen(nextEstimatedRange); return; }
+        }),
+        applyFrame: () => pausedThen(() => applyPending(1)),
+        applySpan: () => pausedThen(() => applyPending(Math.max(1, parseInt(spanInput, 10) || 30))),
+        deleteHere: deleteUnderCursor,
+        nextEstimated: () => pausedThen(nextEstimatedRange),
+        sizeSmaller: () => scaleSize(1 / 1.15),
+        sizeBigger: () => scaleSize(1.15),
+      });
+      if (handled) ev.preventDefault();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
@@ -609,11 +681,12 @@ function App() {
           </div>
         </section>
 
-        <section class="keys">
+        {/* 割り当て表（shared/keymap.ts の TIMELINE_KEYS）から自動で作る。
+            手で書き写すと、割り当てを直したときにここだけ古いまま腐る（issue #79）。
+            ? キーでここへスクロールする */}
+        <section class="keys" id="keys-panel">
           <b>キー</b>
-          {" Space 再生/停止 ・ , . コマ移動 ・ [ ] 矩形サイズ ・ " +
-           "M 追加モード ・ 1 このフレームだけ ・ 2 ここから N フレーム ・ " +
-           "D 削除 ・ G 次の推定のみ区間"}
+          {" " + helpRows(TIMELINE_KEYS).map((r) => `${r.label} ${r.desc}`).join(" ・ ")}
         </section>
       </main>
     </>

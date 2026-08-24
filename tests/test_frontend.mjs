@@ -392,5 +392,192 @@ section("プロキシ動画の状態表示（issue #18 / job.tsx）");
   ok(set.size === 4, "4状態がすべて異なる文字列になる（同じ表示にしない）");
 }
 
+// --------------------------------------------------------------------
+section("キーマップ（issue #79）: 入力欄の除外");
+// --------------------------------------------------------------------
+{
+  ok(L.isTypingTarget({ key: "a", targetTag: "INPUT" }), "INPUT は入力欄扱い");
+  ok(L.isTypingTarget({ key: "a", targetTag: "SELECT" }), "SELECT は入力欄扱い");
+  ok(L.isTypingTarget({ key: "a", targetTag: "TEXTAREA" }), "TEXTAREA は入力欄扱い（元は抜けていた）");
+  ok(L.isTypingTarget({ key: "a", targetEditable: true }), "contenteditable は入力欄扱い（元は抜けていた）");
+  ok(!L.isTypingTarget({ key: "a", targetTag: "DIV" }), "普通の要素は入力欄ではない");
+  ok(!L.isTypingTarget({ key: "a" }), "target 情報が無ければ入力欄ではないとみなす");
+}
+
+// --------------------------------------------------------------------
+section("キーマップ（issue #79）: キー -> アクションの解決");
+// --------------------------------------------------------------------
+{
+  // ← / → / , / . はどれも「1フレーム移動」の同じアクションを指す。
+  // ここが画面ごとに割れていたのが issue #79 の本体
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "ArrowLeft" }) === "stepBack", "← は stepBack");
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "," }) === "stepBack", ", も stepBack（同じアクション）");
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "ArrowRight" }) === "stepForward", "→ は stepForward");
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "." }) === "stepForward", ". も stepForward（同じアクション）");
+
+  // Shift 併用は別アクション（大きく飛ぶ）。Shift の有無で別物になることを見る
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "ArrowLeft", shiftKey: true }) === "jumpBack",
+     "Shift+← は jumpBack（stepBack ではない）");
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "ArrowRight", shiftKey: true }) === "jumpForward",
+     "Shift+→ は jumpForward");
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "ArrowLeft" }) !== "jumpBack",
+     "Shift 無しでは jumpBack にならない");
+
+  // 入力欄にフォーカスがあれば、キーが一致していても何も返さない
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "ArrowLeft", targetTag: "INPUT" }) === null,
+     "INPUT にフォーカス中はキーを拾わない");
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "ArrowLeft", targetEditable: true }) === null,
+     "contenteditable にフォーカス中はキーを拾わない");
+
+  // 割り当てにないキーは null
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "Q" }) === null, "割り当てのないキーは null");
+}
+
+// --------------------------------------------------------------------
+section("キーマップ（issue #79）: dispatchKey はハンドラを1回だけ呼ぶ");
+// --------------------------------------------------------------------
+{
+  let calls = 0;
+  const handled = L.dispatchKey(L.TIMELINE_KEYS, { key: "ArrowLeft" }, {
+    stepBack: () => { calls++; },
+  });
+  ok(handled === true, "対応するハンドラがあれば true を返す");
+  ok(calls === 1, "ハンドラは1回だけ呼ばれる");
+
+  const notHandled = L.dispatchKey(L.TIMELINE_KEYS, { key: "ArrowLeft" }, {
+    stepForward: () => { calls++; },
+  });
+  ok(notHandled === false, "アクションは解決してもハンドラが無ければ false");
+  ok(calls === 1, "ハンドラが無ければ何も呼ばれない（calls は増えない）");
+
+  const filtered = L.dispatchKey(L.TIMELINE_KEYS, { key: "ArrowLeft", targetTag: "INPUT" }, {
+    stepBack: () => { calls++; },
+  });
+  ok(filtered === false, "入力欄フォーカス中は割り当てがあっても発火しない");
+  ok(calls === 1, "入力欄フォーカス中はハンドラを呼ばない");
+}
+
+// --------------------------------------------------------------------
+section("キーマップ（issue #79）: 割り当てを1つ変えると全画面が変わる");
+// --------------------------------------------------------------------
+{
+  // timeline / framestep / draw / review の4画面が、同じ束（CORE_TRANSPORT）
+  // を「参照として」共有していることを見る。コピーではなく同じオブジェクトで
+  // あることまで確かめるのは、画面側が別々にキーを定義し直す退行
+  // （書いたつもりが実は独自実装、という issue #79 の再発）を検出するため。
+  // このオブジェクトの中身（例えば STEP_BACK の keys）を直せば、
+  // 4画面すべての ← / → の意味が同時に変わる。
+  const screens = {
+    timeline: L.TIMELINE_KEYS,
+    framestep: L.FRAMESTEP_KEYS,
+    draw: L.DRAW_KEYS,
+    review: L.REVIEW_KEYS,
+  };
+  for (const [name, keys] of Object.entries(screens)) {
+    ok(keys.includes(L.STEP_BACK), `${name} は共有の STEP_BACK をそのまま使っている（コピーでない）`);
+    ok(keys.includes(L.STEP_FWD), `${name} は共有の STEP_FWD をそのまま使っている（コピーでない）`);
+    ok(keys.includes(L.PLAY_TOGGLE), `${name} は共有の PLAY_TOGGLE をそのまま使っている（コピーでない）`);
+    ok(keys.includes(L.GO_HOME), `${name} は共有の GO_HOME をそのまま使っている（コピーでない）`);
+    ok(keys.includes(L.GO_END), `${name} は共有の GO_END をそのまま使っている（コピーでない）`);
+    ok(keys.includes(L.SHUTTLE_REV), `${name} は共有の SHUTTLE_REV をそのまま使っている（コピーでない）`);
+    ok(keys.includes(L.SHUTTLE_FWD), `${name} は共有の SHUTTLE_FWD をそのまま使っている（コピーでない）`);
+    ok(keys.includes(L.HELP), `${name} は共有の HELP をそのまま使っている（コピーでない）`);
+  }
+
+  // 実際に「1つ直すと4画面とも変わる」ことを、直に動かして確かめる。
+  // STEP_BACK の束をコピーして keys を書き換え、resolveKey の結果が
+  // 4画面とも一致して変わることを見る（オブジェクトが共有されているので、
+  // 実運用ではこの書き換えは keymap.ts を直すのと同じ効果になる）
+  const savedKeys = L.STEP_BACK.keys;
+  try {
+    L.STEP_BACK.keys = ["Backspace"];
+    for (const [name, keys] of Object.entries(screens)) {
+      ok(L.resolveKey(keys, { key: "ArrowLeft" }) !== "stepBack",
+         `${name}: STEP_BACK の割り当てを変えると ← はもう stepBack を指さない`);
+      ok(L.resolveKey(keys, { key: "Backspace" }) === "stepBack",
+         `${name}: 新しく割り当てたキーがそのまま効く`);
+    }
+  } finally {
+    L.STEP_BACK.keys = savedKeys; // 他のテストへ影響しないよう必ず戻す
+  }
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "ArrowLeft" }) === "stepBack", "後始末: 元の割り当てに戻っている");
+}
+
+// --------------------------------------------------------------------
+section("キーマップ（issue #79）: review だけの判定キー・キュー送り");
+// --------------------------------------------------------------------
+{
+  // 1〜5（判定）は RULES 0 により動かしていない。ここが動くとどのキーで
+  // 何を判定したか作業者の手が覚えている操作を裏切ることになる
+  ok(L.resolveKey(L.REVIEW_KEYS, { key: "1" }) === "judgeOk", "1 は問題なし（変更していない）");
+  ok(L.resolveKey(L.REVIEW_KEYS, { key: "2" }) === "judgeAdd", "2 は漏れている（変更していない）");
+  ok(L.resolveKey(L.REVIEW_KEYS, { key: "3" }) === "judgeUnsure", "3 は判断できない（変更していない）");
+  ok(L.resolveKey(L.REVIEW_KEYS, { key: "4" }) === "judgeShrink", "4 はでかすぎる（変更していない）");
+  ok(L.resolveKey(L.REVIEW_KEYS, { key: "5" }) === "judgeErase", "5 は誤検知（変更していない）");
+
+  // キュー送りは ← / → から退避した。← / → は他画面と同じ1フレーム移動になる
+  ok(L.resolveKey(L.REVIEW_KEYS, { key: "ArrowLeft" }) === "stepBack",
+     "review の ← はもうキュー送りではなく1フレーム移動");
+  ok(L.resolveKey(L.REVIEW_KEYS, { key: "PageUp" }) === "queuePrev", "キュー送り（前）は PageUp");
+  ok(L.resolveKey(L.REVIEW_KEYS, { key: "PageDown" }) === "queueNext", "キュー送り（次）は PageDown");
+
+  // timeline の 1 / 2（pending 適用）は review の判定キーと衝突していたので
+  // timeline 側を動かした。timeline の 1 / 2 はもう何も指さない
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "1" }) === null, "timeline の 1 はもう何もしない（judgeOk と衝突していた）");
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "2" }) === null, "timeline の 2 はもう何もしない（judgeAdd と衝突していた）");
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "Enter" }) === "applyFrame", "timeline は Enter でこのフレームに適用");
+  ok(L.resolveKey(L.TIMELINE_KEYS, { key: "Enter", shiftKey: true }) === "applySpan",
+     "timeline は Shift+Enter で span 分に適用");
+
+  // 区間追従（I/O）は webapp/review.tsx にしかない機能。review/app.tsx 用の
+  // REVIEW_KEYS には含めない（両方に足すかは別途 issue の判断に委ねる）
+  ok(!L.REVIEW_KEYS.includes(L.RV_INTERVAL_START), "REVIEW_KEYS 本体には区間の始点キーを含めない");
+  ok(L.REVIEW_INTERVAL_KEYS.includes(L.RV_INTERVAL_START), "区間の始点は REVIEW_INTERVAL_KEYS 側にある");
+}
+
+// --------------------------------------------------------------------
+section("キーマップ（issue #79）: 自動生成されるキー一覧");
+// --------------------------------------------------------------------
+{
+  // 手で書き写すと腐るので、一覧は割り当てそのものから作る
+  const rows = L.helpRows(L.TIMELINE_KEYS);
+  ok(rows.some((r) => r.desc === "1フレーム戻る"), "一覧に1フレーム戻るの説明が出る");
+  const backRow = rows.find((r) => r.desc === "1フレーム戻る");
+  ok(backRow.label === "← / ,", "一覧のラベルは binding の label をそのまま使う: " + backRow.label);
+
+  // stepBack は "ArrowLeft" と "," の2キーだが、一覧では1行にまとめる
+  // （2行出ると「同じ意味の2キー」ではなく「別の意味」に見えてしまう）
+  const backRows = rows.filter((r) => r.desc === "1フレーム戻る");
+  ok(backRows.length === 1, "同じアクションは一覧で重複させない: " + backRows.length + "行");
+
+  const line = L.helpLine(L.REVIEW_KEYS);
+  ok(line.includes("1 問題なし"), "1行表示にも各キーの説明が出る: " + line);
+  ok(line.includes("・"), "複数の割り当てを ・ で区切る");
+}
+
+// --------------------------------------------------------------------
+section("シャトル速度（issue #79）: J/K/L の加減速");
+// --------------------------------------------------------------------
+{
+  ok(L.nextShuttleSpeed(0, 1) === 1, "止まっているところから L を押すと1倍で動き出す");
+  ok(L.nextShuttleSpeed(0, -1) === -1, "止まっているところから J を押すと逆1倍で動き出す");
+  ok(L.nextShuttleSpeed(0, 0) === 0, "止まっているところで K を押しても0のまま");
+
+  ok(L.nextShuttleSpeed(1, 1) === 2, "同じ向きの連打で倍になる: 1 -> 2");
+  ok(L.nextShuttleSpeed(2, 1) === 4, "2 -> 4");
+  ok(L.nextShuttleSpeed(4, 1) === 8, "4 -> 8");
+  ok(L.nextShuttleSpeed(8, 1) === 8, "8倍で頭打ち（青天井にしない）: " + L.nextShuttleSpeed(8, 1));
+
+  ok(L.nextShuttleSpeed(-2, -1) === -4, "逆向きも同様に加速する: -2 -> -4");
+
+  // K は常に停止。どれだけ速く動いていても、どちら向きでも止まる
+  ok(L.nextShuttleSpeed(8, 0) === 0, "全速力からでも K で即停止");
+  ok(L.nextShuttleSpeed(-8, 0) === 0, "逆向きの全速力からでも K で即停止");
+
+  // 動いている向きと逆を押すと、減速ではなく逆向きの1倍から入り直す
+  ok(L.nextShuttleSpeed(4, -1) === -1, "順再生中に J を押すと、減速ではなく逆1倍から入り直す");
+  ok(L.nextShuttleSpeed(-4, 1) === 1, "逆再生中に L を押すと、順1倍から入り直す");
+}
+
 console.log(fails ? `\n${count} 件中 ${fails} 件失敗` : `\n${count} 件すべて通過`);
 process.exit(fails ? 1 : 0);
