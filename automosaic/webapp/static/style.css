@@ -161,6 +161,18 @@ input[type=range] { padding: 0; }
   font-size: 13px;
 }
 
+/* issue #16: report.json に実効設定の記録が無く、meta.argv から復元して
+   突き合わせたときの常時表示。判定モードの banner とは違い、判定操作で
+   消えたり切り替わったりしない（RULES.md 0: 復元した事実を黙って通さない） */
+.restored-note {
+  padding: 8px 14px;
+  background: #3a2c12;
+  border-top: 1px solid var(--warn);
+  border-bottom: 1px solid var(--warn);
+  color: var(--warn);
+  font-size: 13px;
+}
+
 .drop {
   border: 2px dashed var(--line);
   border-radius: 10px;

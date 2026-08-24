@@ -2206,7 +2206,13 @@ def test_effective_settings_mismatch_returns_409_and_report_records_burn():
         )
 
         # report.json が effective / effective_sha256 を持たない
-        # （古い形式・破損）場合も「一致」とみなさず止めること
+        # （古い形式・破損）場合、そのまま「記録がありません」にはせず、
+        # 同じジョブの meta.argv から復元して比較する（マージ前指摘: 唯一
+        # 実在する完走ジョブが report.json の形式差だけでレビュー不能に
+        # なる事態を避けるため）。この job は margin_scale=0.4 で焼いており、
+        # レビュー側は #43 未マージのため常に既定(margin_scale=1.0)で組むので、
+        # 復元しても不一致のままで 409 になる。ただしメッセージは
+        # 「記録がありません」ではなく、復元した値で比較した不一致に変わる
         rep.pop("effective", None)
         rep.pop("effective_sha256", None)
         with open(job.report, "w", encoding="utf-8") as f:
@@ -2214,8 +2220,83 @@ def test_effective_settings_mismatch_returns_409_and_report_records_burn():
         code, body, _ = request(f"{srv.base}/api/jobs/{jid}/frame?n=0&t={TOKEN}")
         assert code == 409, (code, body[:300])
         detail2 = json.loads(body).get("detail", "")
-        assert "記録がありません" in detail2, detail2
-        print("  report.json が effective を持たない（古い形式）場合も 409 OK")
+        assert "margin_scale" in detail2, detail2
+        assert "復元した値" in detail2, detail2
+        print(
+            "  report.json が effective を持たない場合も meta.argv から復元して"
+            "比較し、不一致なら 409（復元した旨を明記）OK"
+        )
+
+        # meta.argv 自体が無ければ復元しようがなく、「記録がありません」で 409
+        job.meta["argv"] = []
+        job.save()
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/frame?n=0&t={TOKEN}")
+        assert code == 409, (code, body[:300])
+        detail3 = json.loads(body).get("detail", "")
+        assert "記録がありません" in detail3, detail3
+        assert "復元もできません" in detail3, detail3
+        print("  report.json も meta.argv も無ければ復元できず 409 OK")
+    finally:
+        srv.close()
+
+
+def test_effective_settings_missing_restores_from_argv_and_shows_in_state():
+    """マージ前指摘（issue #16 PR レビュー）: report.json に effective が
+    無くても、meta.argv から復元できて実際に一致するなら 409 にせず
+    表示できること。かつ「復元した」ことが /state に出ること
+    （RULES.md 0: 黙って通さない）。
+
+    レビュー側は #43 未マージのため常に既定値で cfg を組む。ここでは
+    焼き込み側も設定を明示指定せず既定値のまま焼き、両者を一致させる。
+    唯一実在する完走ジョブ（20260823-234604-9be9）でこの経路を実際に
+    通したログは PR に別途貼ってある（この場は read-only 素材に触れない
+    合成テスト）。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = upload(srv.base, sample_video())
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        write_fake_detections(job, d["n_frames"], d["width"], d["height"])
+
+        # 設定を明示指定せず既定値のまま焼く
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}",
+            {"reuse": True, "settings": {}},
+        )
+        assert code == 200, r
+        st = wait_finished(srv, jid)
+        assert st == "done", st
+
+        job = jobs_mod.Library(lib).get(jid)
+        with open(job.report, encoding="utf-8") as f:
+            rep = json.load(f)
+        assert rep.get("effective_sha256"), "前提: 通常は effective が書かれるはず"
+
+        # report.json から effective / effective_sha256 を消す
+        # （issue #16 マージ前に焼かれたジョブの形を再現）
+        rep.pop("effective", None)
+        rep.pop("effective_sha256", None)
+        with open(job.report, "w", encoding="utf-8") as f:
+            json.dump(rep, f)
+
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/state?t={TOKEN}")
+        assert code == 200, (code, body[:500])
+        st_json = json.loads(body)
+        chk = st_json.get("effective_check")
+        assert chk is not None, "effective_check が state に無い"
+        assert chk["restored"] is True, chk
+        assert chk["note"], "復元したことの注記が空"
+        assert "仮定" in chk["note"], chk["note"]
+
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/frame?n=0&t={TOKEN}")
+        assert code == 200, (code, body[:300])
+
+        print(
+            "  report.json に effective が無くても meta.argv から復元でき、"
+            "一致するなら 200 で、復元したことが /state に載る OK"
+        )
     finally:
         srv.close()
 
