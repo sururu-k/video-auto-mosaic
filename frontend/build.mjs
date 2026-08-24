@@ -13,7 +13,7 @@
 // 現地で追いたいときだけ --sourcemap を付ける（.map は .gitignore 済み）。
 
 import { build, context } from "esbuild";
-import { copyFile, mkdir, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,10 +32,6 @@ const ENTRIES = [
 // DOM に依存しない判断と描画だけを ESM で別に出す。
 // tests/test_frontend.mjs がこれを読んで直接動かす（npm 無しで検査が回る）。
 const LOGIC = { src: "src/shared/logic.ts", out: "frontend/build/logic.mjs" };
-
-// 実行時に <script> で読ませる外部ライブラリ。CDN は参照しない。
-// オフラインで動かないと、そもそも素材を外に出さないという前提が崩れる。
-const VENDOR = [{ from: "vendor/konva.min.js", to: "automosaic/web/vendor/konva.min.js" }];
 
 const COMMON = {
   bundle: true,
@@ -70,21 +66,9 @@ function logicOptions() {
   };
 }
 
-async function copyVendor() {
-  for (const v of VENDOR) {
-    const to = path.join(REPO, v.to);
-    await mkdir(path.dirname(to), { recursive: true });
-    await copyFile(path.join(HERE, v.from), to);
-    const s = await stat(to);
-    console.log(`  vendor  ${v.to}  ${s.size} B`);
-  }
-}
-
 const watch = process.argv.includes("--watch");
 const withMap = process.argv.includes("--sourcemap");
 const all = [...ENTRIES.map(pageOptions), logicOptions()];
-
-await copyVendor();
 
 if (watch) {
   const ctxs = await Promise.all(all.map((o) => context(o)));

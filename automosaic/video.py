@@ -9,6 +9,7 @@ Python 側でフレームを合成し rawvideo を ffmpeg に pipe する。中�
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -202,6 +203,34 @@ def detect_pix_fmt(info: VideoInfo) -> str:
     return "yuv420p"
 
 
+def check_render_geometry(info: VideoInfo) -> str | None:
+    """パス2（描画）まで通せる解像度かどうかを検査する。通せないなら理由の
+    メッセージを返す。通せるなら None を返す。
+
+    奇数解像度は2枚の壁で原理的に描画できない（issue #2 実測）。
+      1. ffmpeg の 4:2:0 彩度平面は ceil(w/2) x ceil(h/2) だが、
+         `render.FrameBuffer` は width//2（切り捨て）で組んでいるため、
+         guard を外してもバイト数がずれて全フレームが斜めに壊れる
+         （guard を外すという直し方は採らない）。
+      2. libx264 は 4:2:0 の奇数解像度を 8bit/10bit とも拒否するため、
+         奇数のまま焼く経路はそもそも存在しない。
+
+    一方でパス1（検出）は奇数解像度でも正しく動く（scale フィルタが
+    force_divisible_by で偶数に丸めてから読むだけ）。そのため検出だけに
+    数時間かけたあとパス2で初めて落ちる、という壊れ方をする
+    （--detect-only は通るのに描画で落ちる）。呼び出し側は probe 直後に
+    これを呼び、--detect-only のときは警告に留めてパス1へ進めてよい。
+    """
+    if info.width % 2 or info.height % 2:
+        return (
+            f"入力の解像度が奇数です（{info.width}x{info.height}）。"
+            "モザイクの描画（パス2）は 4:2:0 の偶数解像度が前提で、"
+            "この解像度のまま焼く経路は存在しません"
+            "（libx264 が 4:2:0 の奇数解像度を拒否するため）。"
+        )
+    return None
+
+
 #: scale の force_divisible_by。奇数サイズを出させないために明示する
 DETECTION_DIVISIBLE_BY = 2
 
@@ -323,6 +352,62 @@ def detection_frame_size(
     return measured
 
 
+def measure_full_frame_size(path: str) -> tuple[int, int]:
+    """パス2用。原寸デコードの実際のサイズを ffmpeg 自身に1フレーム出させて実測する。
+
+    open_full_reader と同じ入力・同じデフォルトの自動回転挙動で先頭フレームを
+    デコードし、PNG の IHDR からサイズを読む。probe() が申告する width/height
+    と一致するかどうかは verify_full_frame_size() で突き合わせる。
+    """
+    ffmpeg = _require("ffmpeg")
+    out = subprocess.run(
+        [
+            ffmpeg,
+            "-v", "error",
+            "-i", path,
+            "-frames:v", "1",
+            "-f", "image2",
+            "-c:v", "png",
+            "-",
+        ],
+        capture_output=True,
+    )
+    data = out.stdout
+    pos = data.find(b"IHDR")
+    if pos < 0 or len(data) < pos + 12:
+        err = out.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(
+            f"パス2のデコードサイズの実測に失敗しました（{path}）:\n{err}"
+        )
+    w, h = struct.unpack(">II", data[pos + 4 : pos + 12])
+    return int(w), int(h)
+
+
+def verify_full_frame_size(info: VideoInfo, path: str) -> None:
+    """パス2開始前に、probe() の申告サイズと ffmpeg の実デコード出力を突き合わせる。
+
+    issue #32: `FrameBuffer` の長さ検査（`y_size = width*height` ほか）は
+    width と height を入れ替えても値が変わらない対称式なので、probe() と
+    ffmpeg の実デコードが別経路でずれても検査を素通りし、reshape だけが
+    転置されて全フレームが斜めに裂けたスクランブル画像になる（issue #1 で
+    塞いだ回転メタデータの経路がまさにこれだった）。パス1の
+    detection_frame_size() は食い違いを警告して実測値へフォールバックするが、
+    パス2でここが食い違うのはフォールバックする根拠が無い
+    （FrameBuffer をどちらのサイズで作っても、以降の座標系のどこかがずれる）
+    ので、警告ではなく例外で止める。
+    """
+    measured = measure_full_frame_size(path)
+    if measured != (info.width, info.height):
+        raise RuntimeError(
+            f"パス2: probe の申告サイズ {info.width}x{info.height} が"
+            f" ffmpeg の実デコード出力 {measured[0]}x{measured[1]} と"
+            "一致しません（issue #32）。FrameBuffer の長さ検査は幅と高さの"
+            "入れ替えに対して不変なため、ここで止めないと例外もエラーも"
+            "出ないまま全フレームが斜めに裂けたスクランブル画像として"
+            "書き出されます。"
+        )
+
+
 def open_full_reader(
     path: str, pix_fmt: str, limit_frames: int | None = None
 ) -> subprocess.Popen:
@@ -394,3 +479,103 @@ def open_writer(
 
     cmd += [dst_path]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+# --------------------------------------------------------------------------
+# 確認用プロキシ動画（issue #18）
+# --------------------------------------------------------------------------
+
+#: 長辺のピクセル数。実測（30分・1920x1080素材、data/library の実ジョブ）:
+#: 640px 全Iフレームで 270MB（実測 2m15s）。現行の /frame（1枚JPEG）を
+#: 55,303枚集めると 7.2GB になるのに対し、この規模まで落ちる。
+PROXY_LONG_EDGE = 640
+PROXY_CRF = 26
+PROXY_PRESET = "veryfast"
+#: 全フレームをIフレームにする。シークのたびに直前のキーフレームまで
+#: 遡ってデコードする必要が無くなり、どのフレームへの移動も1枚のデコードで
+#: 済む（issue #18 の実測: 640px 全Iフレームの55,303フレームを 7.43秒で
+#: 全デコード = 約7,437fps）。GOPを開けるとサイズは1/3程度に縮むが、
+#: シークのたびにGOP先頭まで遡ってデコードする経路が発生する。#19
+#: （フレーム厳密なコマ送り）の土台にするため、既定は確実な全Iフレームにする。
+PROXY_GOP = 1
+
+
+def proxy_scale_filter(long_edge: int = PROXY_LONG_EDGE) -> str:
+    """プロキシ用の縮小フィルタ。縦横どちらが長辺でも long_edge に収める。
+
+    detection_scale_filter と同じ形（force_original_aspect_ratio=decrease +
+    force_divisible_by）にしてあるのは、libx264 が偶数サイズしか受けないため。
+    """
+    return (
+        f"scale=w={long_edge}:h={long_edge}"
+        ":force_original_aspect_ratio=decrease"
+        f":force_divisible_by={DETECTION_DIVISIBLE_BY}"
+        ":flags=bicubic"
+    )
+
+
+def generate_proxy(
+    src_path: str,
+    dst_path: str,
+    long_edge: int = PROXY_LONG_EDGE,
+    gop: int = PROXY_GOP,
+    crf: int = PROXY_CRF,
+    preset: str = PROXY_PRESET,
+) -> None:
+    """確認用プロキシ動画を作る。1本のffmpeg呼び出しで完結させる。
+
+    src_path には必ず焼き上がった output.mp4（モザイク済み）を渡すこと。
+    原画から作ると、モザイクをかける前のフレームがプロキシという形で
+    端末のディスクに残ってしまい、「原画を端末に残さない」という前提
+    （webapp/app.py の /frame が raw=1 のときキャッシュさせない理由と同じ）が崩れる。
+
+    h264_amf は -g 1 を受け付けない（実機で確認: Task finished with error
+    code: -22）ため、常に libx264 を使う。速度差は実測でほぼ無い。
+
+    失敗時は中間ファイル（.tmp）を残さない。中断された動画が「プロキシが
+    ある」ように見えると、シークしたときだけ壊れて気づく道具になる。
+    """
+    ffmpeg = _require("ffmpeg")
+    tmp = dst_path + ".tmp"
+    cmd = [
+        ffmpeg,
+        "-v", "error",
+        "-y",
+        "-i", src_path,
+        "-vf", proxy_scale_filter(long_edge),
+        "-an",
+        "-c:v", "libx264",
+        "-preset", preset,
+        "-crf", str(crf),
+        "-g", str(max(1, gop)),
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        # 出力先は "proxy.mp4.tmp"（拡張子が .tmp）。ffmpeg は出力形式を
+        # ファイル名の拡張子から推定するので、.tmp のままだと
+        # 「形式を選べない」で失敗する（実測）。-f で明示する
+        "-f", "mp4",
+        tmp,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True)
+    except OSError as e:
+        raise RuntimeError(f"プロキシ生成を起動できません: {e}")
+    if proc.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"プロキシ生成に失敗しました（ffmpeg 終了コード {proc.returncode}）:\n{err}")
+    os.replace(tmp, dst_path)
+
+
+def nb_frames(path: str) -> int | None:
+    """コンテナのヘッダから読めるフレーム数だけを返す（全デコードしない）。
+
+    mp4 の nb_frames はコンテナのヘッダ（stss/stsz）由来で、フルデコードせず
+    速く読める。実測（このリポジトリの実ジョブ、55,303フレーム）:
+    ヘッダ読み取りだけで 0.1秒、ffmpeg 側の全デコードで数えた値と完全一致した。
+    プロキシとoutput.mp4のフレーム数照合はこちらを使う。
+    """
+    return probe(path).nb_frames

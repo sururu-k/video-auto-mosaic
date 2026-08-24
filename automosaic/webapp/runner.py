@@ -24,6 +24,7 @@ import time
 from collections import deque
 
 from . import jobs as jobs_mod
+from . import proxy as proxy_mod
 
 # cli.Progress の出力そのもの:
 #   "\rパス1 検出 123/4560 ( 26.9%)   14.2 fps  残り 0:12:34   "
@@ -162,6 +163,10 @@ class JobRunner:
         self.job.update(
             status=jobs_mod.STATUS_RUNNING,
             pid=self.proc.pid,
+            # OS の起動時刻。pid が後で無関係な別プロセスへ再利用された
+            # ときに区別する材料（issue #44、jobs.running_pid を見よ）。
+            # 取れなければ None（従来どおり pid の生死だけで判断する）
+            pid_started_ticks=jobs_mod.process_creation_ticks(self.proc.pid),
             argv=self.argv,
             settings=self.settings,
             started_at=self.started_at,
@@ -339,6 +344,10 @@ class JobRunner:
         )
         self._merge_report()
         self.job.save()
+        if status == jobs_mod.STATUS_DONE:
+            # 完成品ができた直後に確認用プロキシの生成を始める。中断・失敗した
+            # ジョブでは呼ばない（output.mp4 が無い・完全でないので作りようが無い）
+            proxy_mod.ensure_started(self.job)
         if self._logfile:
             try:
                 self._logfile.close()

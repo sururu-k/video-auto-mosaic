@@ -124,6 +124,25 @@ def _make_rotated_video(path: str, base_w: int, base_h: int, frames: int,
         os.remove(tmp)
 
 
+def _make_odd_video(path: str, w: int, h: int, frames: int, fps: int = 5) -> None:
+    """奇数解像度の合成動画を作る（issue #2 の再現手順）。
+
+    `testsrc2` は奇数サイズ指定を黙って偶数に丸めるので使えない
+    （RULES.md 2章）。`color=` は丸めない。VP9(4:2:0) は奇数解像度のまま
+    持てるので、H.264 では作れない「奇数のまま probe される」入力を作れる。
+    """
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", f"color=c=red:size={w}x{h}:rate={fps}:duration=10",
+            "-frames:v", str(frames),
+            "-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p", "-b:v", "500k",
+            path,
+        ],
+        check=True,
+    )
+
+
 def _decode_frame_rgb(path: str):
     """ffmpeg 自身に先頭フレームを PNG で吐かせて cv2 で読む。
 
@@ -209,6 +228,74 @@ def test_measured_size_matches_pipe():
                 f"{dec_w}x{dec_h}x3 = {dec_w * dec_h * 3}"
             )
     print("  実測サイズとパイプ長の一致 OK")
+
+
+def test_detect_scale_capped_at_material_resolution():
+    """issue #37: --tiles のデコード長辺が素材の実解像度を超えて拡大されないこと。
+
+    旧式（max(net_w, net_h) * tiles）は 1080p 素材・tiles=2 で 2560px を要求し、
+    ffmpeg の force_original_aspect_ratio=decrease が箱に収めるために拡大までして
+    2560x1440（面積で素材の1.78倍）を作る。情報は増えず、デコードとタイル推論の
+    コストだけが増える。素材の長辺で頭打ちにすること。
+    """
+    from automosaic.detector import budget_net_size
+
+    mat_w, mat_h = 1920, 1080
+    net_w, net_h = budget_net_size(mat_w, mat_h, 960)
+    assert (net_w, net_h) == (1280, 736), f"想定外の net サイズ: {net_w}x{net_h}"
+
+    for tiles, expect in ((1, 1280), (2, 1920), (3, 1920)):
+        old = max(net_w, net_h) * max(1, tiles)
+        new = cli.compute_detect_scale(net_w, net_h, tiles, mat_w, mat_h)
+        assert new == expect, f"tiles={tiles}: {new} != {expect}"
+        assert new <= max(mat_w, mat_h), (
+            f"tiles={tiles}: 新方式 {new}px が素材の長辺 {max(mat_w, mat_h)}px を超えている"
+        )
+        if tiles >= 2:
+            # 旧式は実際に超過していたことも確認しておく（直す前に壊れていたことの根拠）
+            assert old > max(mat_w, mat_h), (
+                f"tiles={tiles}: 旧式 {old}px が素材の長辺を超えていない"
+                "（この前提が崩れたらこのテストの意味が無い）"
+            )
+
+    # --detect-scale で明示指定した場合は頭打ちを掛けない（利用者の意図的な指定）
+    explicit = cli.compute_detect_scale(net_w, net_h, 2, mat_w, mat_h, override=3000)
+    assert explicit == 3000, f"明示指定が上書きされた: {explicit}"
+    print("  --tiles のデコード長辺が素材解像度で頭打ちになる OK")
+
+
+def test_tiles_decode_not_upscaled_beyond_material_ffmpeg():
+    """上のテストの主張を実際の ffmpeg デコードでも確認する（合成1080p素材）。"""
+    if not _have_ffmpeg():
+        print("  tiles デコードの実測頭打ち SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.mp4")
+        _make_video(src, 1920, 1080, 1)
+        info = vid.probe(src)
+
+        old_scale = 2560  # 旧式 max(net_w,net_h)=1280 * tiles=2
+        new_scale = cli.compute_detect_scale(1280, 736, 2, info.width, info.height)
+        assert new_scale == 1920
+
+        old_w, old_h = vid.detection_frame_size(info, old_scale, path=src)
+        new_w, new_h = vid.detection_frame_size(info, new_scale, path=src)
+
+        old_area_ratio = (old_w * old_h) / (info.width * info.height)
+        new_area_ratio = (new_w * new_h) / (info.width * info.height)
+
+        assert old_w > info.width or old_h > info.height, (
+            f"旧式が実測で素材を超えていない: {old_w}x{old_h}"
+        )
+        assert new_w <= info.width and new_h <= info.height, (
+            f"新式が実測で素材を超えている: {new_w}x{new_h}"
+        )
+        assert old_area_ratio > 1.7, f"旧式の面積倍率が想定より小さい: {old_area_ratio:.3f}"
+        assert new_area_ratio == 1.0, f"新式の面積倍率が1.0でない: {new_area_ratio:.3f}"
+    print(
+        f"  実測: 旧式 {old_w}x{old_h}(面積x{old_area_ratio:.2f}) -> "
+        f"新式 {new_w}x{new_h}(面積x{new_area_ratio:.2f}) OK"
+    )
 
 
 class _NullDetector:
@@ -843,6 +930,55 @@ def test_rotated_video_pixels_not_scrambled():
             f"（平均差分 {mean_diff:.2f}）。転置スクランブルが再発している疑い"
         )
     print("  回転動画の画素破損チェック OK")
+
+
+def test_render_rejects_probe_ffmpeg_dimension_mismatch():
+    """issue #32: probe() の申告サイズと ffmpeg の実デコード出力が食い違ったとき、
+    パス2が黙って reshape を転置せず、reader/writer を開く前に例外で止まること。
+
+    #1 で塞いだのは回転メタデータという「既知の1経路」だけで、
+    probe と ffmpeg の解釈が別経路でずれる可能性そのものは残っている。
+    FrameBuffer の長さ検査（y_size = width*height、彩度平面も (w//2)*(h//2)）は
+    width と height を入れ替えても値が変わらない対称式なので、単純な長さ比較では
+    この種の食い違いを検出できない。ここでは info.width/height を実際の
+    デコードサイズと入れ替えて渡し、probe と ffmpeg が別経路でずれた状況を
+    直接模擬する（回転メタデータという特定経路に頼らず、この故障クラスそのものを
+    突く）。
+    """
+    if not _have_ffmpeg():
+        print("  probe/ffmpeg サイズ不一致の拒否 SKIP (ffmpeg 無し)")
+        return
+    import dataclasses
+
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.mp4")
+        dst = os.path.join(d, "out.mp4")
+        n_frames = 5
+        _make_video(src, 64, 48, n_frames, fps=15)
+        info = vid.probe(src)
+        assert (info.width, info.height) == (64, 48), "前提が崩れている"
+
+        # probe と ffmpeg が別経路でずれた状況を模擬: width/height を入れ替えて渡す。
+        # y_size=64*48==48*64 なので、この入れ替えは FrameBuffer の長さ検査だけでは
+        # 検出できない（この非対称性こそが issue #32 の核心）。
+        swapped = dataclasses.replace(info, width=48, height=64)
+        try:
+            cli.run_render(src, dst, swapped, {}, n_frames, 8, "black",
+                           18, "veryfast", None, True)
+        except RuntimeError as e:
+            assert "一致しません" in str(e), f"想定と違う例外: {e}"
+        else:
+            raise AssertionError(
+                "probe と ffmpeg のサイズが食い違ったのにパス2が正常終了した"
+                "（斜めに裂けたスクランブル画像が exit 0 で出ている疑い）"
+            )
+        assert not os.path.exists(dst), (
+            "サイズ不一致を検出したのに出力ファイルが残っている"
+            "（reader/writer を開く前に止めれば quarantine すら要らないはず）"
+        )
+    print("  probe/ffmpeg サイズ不一致の拒否 OK")
+
+
 def test_despike_off_by_default_and_reports_when_enabled():
     """issue #9: min_track_len の既定反転の回帰ガード。
 
@@ -1122,6 +1258,98 @@ def test_stats_match_uncovered_ranges_after_corrections():
                 f"手修正なし={rep_base['stats'][k]} 手修正あり={stats[k]}"
             )
     print("  stats と素通し件数の整合（frames_with_mosaic / uncovered_gaps） OK")
+
+
+def test_check_render_geometry_flags_odd_dimensions():
+    """issue #2: 奇数解像度（幅・高さ・両方のどれでも）を検査で検知すること。
+
+    偶数解像度は None（通せる）を返し、誤検知しないことも確認する。
+    """
+    def _info(w, h):
+        return vid.VideoInfo(w, h, 30, 1, 10, 1.0, "yuv420p",
+                             None, None, None, None, False)
+
+    for w, h in [(641, 480), (640, 481), (641, 481)]:
+        msg = vid.check_render_geometry(_info(w, h))
+        assert msg is not None, f"{w}x{h} が奇数なのに検査を素通りした"
+        assert str(w) in msg and str(h) in msg, f"メッセージに解像度が含まれない: {msg!r}"
+
+    assert vid.check_render_geometry(_info(640, 480)) is None, (
+        "偶数解像度なのに検査に引っかかった"
+    )
+    print("  check_render_geometry の奇数検知 OK")
+
+
+def test_odd_resolution_stops_before_wasting_pass1():
+    """issue #2: 奇数解像度は、パス1（検出）を待たせずに probe 直後で止まること。
+
+    直す前は --detect-only を付けずに焼こうとすると、パス1を最後まで走らせた
+    あと、パス2の FrameBuffer guard で初めて ValueError が飛んでいた
+    （検出に数時間かけたあとに落ちる、が issue の再現手順そのもの）。
+    ここでは Detector の構築自体を壊し、そこに到達したら即座にわかるように
+    してから確認する。
+    """
+    if not _have_ffmpeg():
+        print("  奇数解像度の早期停止 SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "odd.webm")
+        dst = os.path.join(d, "out.mp4")
+        _make_odd_video(src, 641, 481, 5)
+
+        info = vid.probe(src)
+        assert (info.width, info.height) == (641, 481), (
+            f"合成素材が奇数のまま probe されていない: {info.width}x{info.height}"
+            "（テストの前提が崩れている）"
+        )
+
+        def _boom(**kw):
+            raise AssertionError(
+                "パス1（Detector構築）まで到達した。検出前に止まっていない"
+            )
+
+        real_detector, cli.Detector = cli.Detector, _boom
+        try:
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli.main([src, "-o", dst])
+        finally:
+            cli.Detector = real_detector
+
+        assert rc == 1, f"奇数解像度なのに rc={rc}"
+        assert not os.path.exists(dst), "止まったはずなのに出力ファイルができている"
+        assert "奇数" in err.getvalue(), f"奇数を理由にした停止メッセージが無い: {err.getvalue()!r}"
+    print("  奇数解像度の早期停止（パス1を待たせない） OK")
+
+
+def test_odd_resolution_detect_only_warns_but_completes():
+    """issue #2: --detect-only は奇数解像度でも警告のみで完走すること。
+
+    パス1（検出）は奇数解像度でも正しく動く（scale フィルタが
+    force_divisible_by で偶数に丸めてから読むだけ）ため、詳細検出用途では
+    止める必要が無い。警告なしに黙って通すのも禁止（RULES.md「黙って
+    素通しを作らない」）なので、警告が出ることも確認する。
+    """
+    if not _have_ffmpeg():
+        print("  奇数解像度 --detect-only の完走 SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "odd.webm")
+        _make_odd_video(src, 641, 481, 5)
+
+        real_detector, cli.Detector = cli.Detector, lambda **kw: _NullDetector()
+        try:
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli.main([src, "--detect-only", "--quiet"])
+        finally:
+            cli.Detector = real_detector
+
+        assert rc == 0, f"--detect-only なのに rc={rc}: {err.getvalue()}"
+        msg = err.getvalue()
+        assert "奇数" in msg, f"奇数の警告が出ていない: {msg!r}"
+        assert "続行します" in msg, f"続行の告知が出ていない: {msg!r}"
+    print("  奇数解像度 --detect-only の完走（警告のみ） OK")
 
 
 if __name__ == "__main__":

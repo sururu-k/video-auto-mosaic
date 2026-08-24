@@ -31,6 +31,7 @@ from fastapi.responses import (
 from .. import review
 from . import handdraw
 from . import jobs as jobs_mod
+from . import proxy as proxy_mod
 from .jobs import Job, Library
 from .runner import RunnerRegistry
 from .session import SessionCache, sync_meta
@@ -121,6 +122,11 @@ def create_app(
         except KeyError:
             raise _err(404, f"ジョブがありません: {job_id}")
         _reconcile_one(job)
+        # 遅延生成。パス2完了直後（runner.py）に始め損ねたジョブ（この機能を
+        # 入れる前に完了していた・サーバ再起動をまたいで完了した）を、
+        # 開かれたタイミングで拾う。output.mp4 が無い・既に完了/生成中なら
+        # ensure_started 側が何もしないので、呼ぶこと自体は毎回のコストが低い
+        proxy_mod.ensure_started(job)
         return job
 
     def _reconcile_one(job: Job) -> None:
@@ -267,6 +273,10 @@ def create_app(
         job = get_job(job_id)
         if job.status == jobs_mod.STATUS_RUNNING:
             raise _err(409, "実行中のジョブは消せません。先に中断してください")
+        if proxy_mod.is_generating(job_id):
+            # 生成中の proxy.mp4 は ffmpeg が書き込み中。Windows では
+            # 開いたままのファイルを rmtree が消しきれず残骸が残りうる
+            raise _err(409, "プロキシ生成中のジョブは消せません。生成が終わるまで待ってください")
         sessions.drop(job_id)
         lib.delete(job_id)
         return {"ok": True, "id": job_id}
@@ -452,6 +462,14 @@ def create_app(
             size = None
             if payload.get("w") and payload.get("h"):
                 size = (float(payload["w"]), float(payload["h"]))
+            # 「誤検知」で消す自動領域。画面が見て選んだ矩形をそのまま送る。
+            # 番号ではなく座標で送らせるのは、送っている間にキューが
+            # 組み直されても指すものが変わらないようにするため（review.py と同じ）。
+            # これが無いと false_positive は常に「消す領域が指定されていません」で
+            # 400 になり、旧レビュー UI にしか誤検知を通す経路が無いことになる。
+            pick = None
+            if payload.get("pick"):
+                pick = [[float(v) for v in b[:4]] for b in payload["pick"]]
             with s.lock:
                 added = s.mark(
                     frame,
@@ -460,6 +478,7 @@ def create_app(
                     size=size,
                     span=int(payload.get("span", 0)),
                     cls=payload.get("class"),
+                    pick=pick,
                 )
                 out = {
                     "ok": True,
@@ -664,6 +683,35 @@ def create_app(
         if not os.path.exists(job.output):
             raise _err(404, "完成品がまだありません")
         return FileResponse(job.output, media_type="video/mp4")
+
+    @app.get("/api/jobs/{job_id}/proxy")
+    def api_proxy(job_id: str):
+        """確認用プロキシ動画（issue #18）。Range 付きで返す。
+
+        FileResponse が Range を扱うので /video と同じくシークが効く
+        （app.py の /video と同じ理由）。未生成・生成中・失敗のどれかは
+        JSON で返し、実際の動画データと区別する。「まだ無い」と
+        「作れなかった」を同じ見た目にしない。
+        """
+        job = get_job(job_id)
+        if not os.path.exists(job.output):
+            raise _err(404, "完成品がまだないので、プロキシも作れません")
+        p = job.meta.get("proxy") or {}
+        status = p.get("status")
+        if status == proxy_mod.STATUS_DONE and os.path.exists(job.proxy):
+            resp = FileResponse(job.proxy, media_type="video/mp4")
+            # モザイク済みの派生物なのでキャッシュしてよい（原画ではない）
+            resp.headers["Cache-Control"] = "private, max-age=3600"
+            return resp
+        if status == proxy_mod.STATUS_FAILED:
+            return JSONResponse(
+                {"status": "failed", "error": p.get("error")}, status_code=500
+            )
+        # 未生成・生成中はここに来る。get_job() が毎回 ensure_started を
+        # 呼んでいるので、ここで改めて呼ばなくても既に始まっているはずだが、
+        # 呼び直しても ensure_started 側が多重起動を弾くので安全側に倒す
+        proxy_mod.ensure_started(job)
+        return JSONResponse({"status": "generating"}, status_code=202)
 
     @app.get("/api/jobs/{job_id}/report")
     def api_report(job_id: str):

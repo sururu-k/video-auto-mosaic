@@ -7,9 +7,16 @@
 //
 // 操作は指だけで完結させる。キーボードの割り当ては残してあるが、
 // それが無いと出来ないことは1つも作らない。
+//
+// 判定は5つ（問題なし・漏れている・判断できない・でかすぎる・誤検知）。
+// 「でかすぎる」「誤検知」は自動領域を打ち消す remove を伴う（漏れる方向へ
+// 倒れうる操作）ので、position placement / pick の中身は
+// frontend/src/review/app.tsx（旧 UI）と同じ shared/review-logic.ts の
+// 判断をそのまま使う。別実装を書くと「見えている枠と実際に塞がれる場所が
+// ずれる」を作る（geom.ts 冒頭のコメント）。
 
 import { render } from "preact";
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 
 import type {
   MarkRequest,
@@ -19,27 +26,41 @@ import type {
   QueuePayload,
   StateLight,
   UndoResponse,
-  Verdict,
 } from "../shared/api.js";
 import { drawReviewOverlay } from "../shared/canvas-draw.js";
 import { normFromClient, scaledSize, tapToBox } from "../shared/geom.js";
 import type { NormPoint } from "../shared/geom.js";
-import { firstUnjudged, numOr, progressPercent, requestWidth, spanOptions } from "../shared/review-logic.js";
+import {
+  MARK_MODES,
+  VERDICT_LABEL,
+  autoBoxes,
+  eraseSummary,
+  firstUnjudged,
+  numOr,
+  pickIndexAt,
+  progressPercent,
+  requestWidth,
+  spanOptions,
+  togglePick,
+} from "../shared/review-logic.js";
+import type { MarkMode } from "../shared/review-logic.js";
 import { api, errText, link, url } from "../shared/webapp-net.js";
 
 const JOB = location.pathname.split("/").pop() ?? "";
 const API = "/api/jobs/" + JOB;
 
-/** この画面が出せる判定は3つだけ。狭める・誤検知は単体レビュー UI 側にある */
-const JUDGED_LABEL: Partial<Record<Verdict, string>> = {
-  ok: "判定済み: 問題なし",
-  fixed: "判定済み: 塞いだ",
-  unsure: "判定済み: 保留",
-};
-
 interface SaveState {
   kind: "ok" | "busy" | "err";
   text: string;
+}
+
+/** そのコマの既定の案内。判定済みならそれを出す */
+function bannerFor(items: readonly QueueItem[], idx: number): string {
+  const it = items[idx];
+  if (!it) {
+    return items.length ? "すべて判定済みです。設定から間隔や対象を変えられます" : "";
+  }
+  return it.verdict ? "判定済み: " + (VERDICT_LABEL[it.verdict] ?? it.verdict) : "";
 }
 
 function App() {
@@ -58,9 +79,11 @@ function App() {
 
   const [sizePct, setSizePct] = useState(100);
   const [span, setSpan] = useState(0);
-  const [marking, setMarking] = useState(false);
+  const [markMode, setMarkMode] = useState<MarkMode | null>(null);
   // 正規化タップ座標。サーバへはこちらを送る
   const [tap, setTap] = useState<NormPoint | null>(null);
+  // 「誤検知」で選んだ自動領域の番号（autoBoxes() の添字）
+  const [picked, setPicked] = useState<number[]>([]);
 
   const [busy, setBusy] = useState(false);
   const [imgWidth, setImgWidth] = useState(720);
@@ -71,8 +94,11 @@ function App() {
   const ovRef = useRef<HTMLCanvasElement>(null);
 
   const cur = items[idx] ?? null;
+  const autos = useMemo(() => autoBoxes(cur?.boxes), [cur]);
   const boxSize = state ? scaledSize(state.default_size, sizePct) : ([64, 64] as [number, number]);
-  const pending = tap && state ? tapToBox(tap, boxSize, state.width, state.height) : null;
+  const pending =
+    tap && state && markMode !== "erase" ? tapToBox(tap, boxSize, state.width, state.height) : null;
+  const erase = markMode === "erase" ? eraseSummary(autos, picked, span) : null;
 
   useEffect(() => {
     void (async () => {
@@ -125,15 +151,16 @@ function App() {
       height: state.height,
       boxes: cur?.boxes ?? [],
       showBoxes: optBoxes,
-      markMode: null,
-      picked: [],
+      markMode,
+      picked,
       pending,
     });
-  }, [state, cur, optBoxes, pending]);
+  }, [state, cur, optBoxes, markMode, picked, pending]);
 
   function cancelMark() {
-    setMarking(false);
+    setMarkMode(null);
     setTap(null);
+    setPicked([]);
   }
 
   function goto(i: number, list: QueueItem[] = items) {
@@ -142,7 +169,7 @@ function App() {
     setNotice("");
   }
 
-  async function judge(verdict: Verdict, extra?: Partial<MarkRequest>) {
+  async function judge(verdict: MarkRequest["verdict"], extra?: Partial<MarkRequest>) {
     const it = cur;
     if (!it || busy) return;
     setBusy(true);
@@ -195,11 +222,68 @@ function App() {
     }
   }
 
-  function startMark() {
+  function startMark(mode: MarkMode) {
     if (!cur) return;
-    setMarking(true);
+    if ((mode === "shrink" || mode === "erase") && !autos.length) {
+      // 消す相手がいないのに範囲だけ置かせると、ただ塗る範囲が増える。
+      // どちらも自動領域が前提の操作なので、無いなら入らせない
+      setNotice("このコマには自動で塗った領域がありません");
+      return;
+    }
+    setMarkMode(mode);
     setTap(null);
+    // 1つしかないなら選びようがない。それでも確定は押させる（消えるのが
+    // 見えてから確定する、という手順自体は省かない）
+    setPicked(mode === "erase" && autos.length === 1 ? [0] : []);
     setNotice("");
+  }
+
+  function onCanvasPointerDown(ev: PointerEvent) {
+    if (!markMode || !state) return;
+    ev.preventDefault();
+    const cv = ovRef.current;
+    if (!cv) return;
+    // タッチ経由で呼ばれても動くようにしてある
+    const touches = (ev as PointerEvent & { changedTouches?: TouchList }).changedTouches;
+    const t = touches ? touches[0]! : ev;
+    const p = normFromClient(cv.getBoundingClientRect(), t.clientX, t.clientY);
+    if (markMode === "erase") {
+      const i = pickIndexAt(autos, p[0] * state.width, p[1] * state.height);
+      if (i === null) {
+        // 枠の外。近い枠を勝手に選ぶと「押した覚えのないものが消える」ので、
+        // 何もせずに押す場所だけ教える
+        setNotice("消したい枠の中をタップしてください");
+        return;
+      }
+      setNotice("");
+      setPicked((prev) => togglePick(prev, i));
+    } else {
+      setTap(p);
+    }
+  }
+
+  function confirmMark() {
+    if (!markMode || !state) return;
+    const m = MARK_MODES[markMode];
+    const useClass = cls || state.default_class;
+    let payload: Partial<MarkRequest>;
+    if (m.pick) {
+      // 選ばれていなければ何もしない。誤検知は「選んだ枠だけ」を消す操作なので、
+      // 選択なしで通すと何が消えたのか誰にも分からない修正になる
+      if (!picked.length) return;
+      payload = {
+        pick: picked.map((i) => autos[i]!.slice(0, 4) as [number, number, number, number]),
+        span,
+        class: useClass,
+      };
+    } else {
+      // 範囲が置かれていなければ何もしない。「でかすぎる」で範囲なしを通すと、
+      // 自動領域を消すだけの修正になり、そのコマが素通しになる
+      if (!tap) return;
+      payload = { x: tap[0], y: tap[1], w: boxSize[0], h: boxSize[1], span, class: useClass };
+    }
+    cancelMark();
+    void judge(m.verdict, payload);
   }
 
   async function reloadQueue(params: Record<string, string | number>) {
@@ -230,8 +314,10 @@ function App() {
       if (t.tagName === "INPUT" || t.tagName === "SELECT") return;
       switch (ev.key) {
         case "1": void judge("ok"); break;
-        case "2": startMark(); break;
+        case "2": startMark("add"); break;
         case "3": void judge("unsure"); break;
+        case "4": startMark("shrink"); break;
+        case "5": startMark("erase"); break;
         case "u":
         case "U": void undo(); break;
         case "ArrowLeft": goto(idx - 1); break;
@@ -245,18 +331,22 @@ function App() {
     return () => document.removeEventListener("keydown", onKey);
   });
 
-  const bannerText = marking
-    ? tap
-      ? "大きさは下のスライダで調整できます"
-      : "漏れている場所を、画像の上で直接タップしてください"
-    : notice ||
-      (cur
-        ? cur.verdict
-          ? (JUDGED_LABEL[cur.verdict] ?? "")
-          : ""
-        : items.length
-          ? "すべて判定済みです。設定から間隔や対象を変えられます"
-          : "");
+  const spec = markMode ? MARK_MODES[markMode] : null;
+  const confirmLabel = erase
+    ? erase.confirmLabel
+    : spec
+      ? tap
+        ? spec.confirm
+        : spec.wait
+      : "";
+  const confirmDisabled = erase ? erase.confirmDisabled : !tap;
+  const bannerText = spec
+    ? erase
+      ? erase.banner
+      : tap
+        ? "大きさは下のスライダで調整できます"
+        : spec.hint
+    : notice || bannerFor(items, idx);
   const posText = cur
     ? `${idx + 1} / ${items.length}`
     : items.length
@@ -285,26 +375,22 @@ function App() {
                src={cur ? frameUrl(cur.frame, imgWidth) : undefined} />
           <canvas id="ov" ref={ovRef}
                   width={state?.width ?? 0} height={state?.height ?? 0}
-                  onPointerDown={(ev) => {
-                    if (!marking) return;
-                    ev.preventDefault();
-                    const cv = ovRef.current;
-                    if (!cv) return;
-                    // タッチ経由で呼ばれても動くようにしてある
-                    const touches = (ev as PointerEvent & { changedTouches?: TouchList }).changedTouches;
-                    const t = touches ? touches[0]! : ev;
-                    setTap(normFromClient(cv.getBoundingClientRect(), t.clientX, t.clientY));
-                  }} />
+                  onPointerDown={onCanvasPointerDown} />
         </div>
       </div>
       <div id="banner" class={bannerText ? "" : "hidden"}>{bannerText}</div>
 
       <div class="pad">
         {/* 判定モード。ここだけで1枚が終わるのが普通の流れ */}
-        <div id="judge" class={marking ? "hidden" : ""}>
+        <div id="judge" class={markMode ? "hidden" : ""}>
           <div class="row">
             <button id="btn-ok" class="big ok half" onClick={() => void judge("ok")}>問題なし</button>
-            <button id="btn-ng" class="big ng half" onClick={startMark}>漏れている</button>
+            <button id="btn-ng" class="big ng half" onClick={() => startMark("add")}>漏れている</button>
+          </div>
+          <div class="row" style={{ marginTop: "8px" }}>
+            <button id="btn-big" class="big warn half" onClick={() => startMark("shrink")}>でかすぎる</button>
+            {/* 誤検知はモザイクを消す方向なので、色を灰にして目立たせない */}
+            <button id="btn-fp" class="big dim half" onClick={() => startMark("erase")}>誤検知</button>
           </div>
           <div class="row" style={{ marginTop: "8px" }}>
             <button id="btn-unsure" class="half" onClick={() => void judge("unsure")}>判断できない</button>
@@ -313,34 +399,30 @@ function App() {
           </div>
         </div>
 
-        {/* 位置指定モード */}
-        <div id="mark" class={marking ? "" : "hidden"}>
-          <div class="row">
-            <button id="btn-minus" onClick={() => setSizePct((v) => Math.max(20, v - 15))}>−</button>
-            <input id="size" type="range" min="20" max="400" step="5" value={sizePct}
-                   aria-label="矩形の大きさ" style={{ flex: 1 }}
-                   onInput={(e) => setSizePct(Number(e.currentTarget.value))} />
-            <button id="btn-plus" onClick={() => setSizePct((v) => Math.min(400, v + 15))}>＋</button>
-            <span id="size-label" class="dim mono">{`${boxSize[0]}x${boxSize[1]}px`}</span>
+        {/* 位置指定モード。3つの判定（漏れている・でかすぎる・誤検知）で共用する */}
+        <div id="mark" class={markMode ? "" : "hidden"}>
+          <div id="mark-title" class={markMode === "erase" ? "mark-title danger" : "mark-title"}>
+            {spec?.title ?? ""}
           </div>
+          {markMode !== "erase" && (
+            <div class="row">
+              <button id="btn-minus" onClick={() => setSizePct((v) => Math.max(20, v - 15))}>−</button>
+              <input id="size" type="range" min="20" max="400" step="5" value={sizePct}
+                     aria-label="矩形の大きさ" style={{ flex: 1 }}
+                     onInput={(e) => setSizePct(Number(e.currentTarget.value))} />
+              <button id="btn-plus" onClick={() => setSizePct((v) => Math.min(400, v + 15))}>＋</button>
+              <span id="size-label" class="dim mono">{`${boxSize[0]}x${boxSize[1]}px`}</span>
+            </div>
+          )}
           <div class="row" id="span-row" style={{ marginTop: "8px" }}>
             {spanOptions(step).map((o) => (
               <button key={o.v} class={"span-btn" + (o.v === span ? " on" : "")}
                       onClick={() => setSpan(o.v)}>{o.label}</button>
             ))}
           </div>
-          <button id="btn-confirm" class="big ok" style={{ marginTop: "8px" }} disabled={!tap}
-                  onClick={() => {
-                    if (!tap || !state) return;
-                    const payload: Partial<MarkRequest> = {
-                      x: tap[0], y: tap[1], w: boxSize[0], h: boxSize[1],
-                      span,
-                      class: cls || state.default_class,
-                    };
-                    cancelMark();
-                    void judge("fixed", payload);
-                  }}>
-            {tap ? "この位置で確定" : "画像をタップしてください"}
+          <button id="btn-confirm" class={"big " + (markMode === "erase" ? "ng" : "ok")}
+                  style={{ marginTop: "8px" }} disabled={confirmDisabled} onClick={confirmMark}>
+            {confirmLabel}
           </button>
           <div class="row" style={{ marginTop: "8px" }}>
             <button id="btn-cancel" class="half" onClick={cancelMark}>やめる</button>
@@ -403,10 +485,15 @@ function App() {
         <p id="sheet-info" class="dim">
           {progress
             ? `${progress.total} 枚中 ${progress.done} 枚判定済み（残り ${progress.remaining}）` +
-              `  問題なし ${progress.counts.ok} / 塞いだ ${progress.counts.fixed} / 保留 ${progress.counts.unsure}`
+              `  問題なし ${progress.counts.ok} / 塞いだ ${progress.counts.fixed}` +
+              ` / 狭めた ${progress.counts.toobig} / 誤検知 ${progress.counts.false_positive}` +
+              ` / 保留 ${progress.counts.unsure}`
             : ""}
         </p>
-        <p class="dim">キー: 1 問題なし / 2 漏れている / 3 判断できない / U ひとつ戻す / ← → 前後の1枚</p>
+        <p class="dim">
+          キー: 1 問題なし / 2 漏れている / 3 判断できない / 4 でかすぎる /
+          5 誤検知 / U ひとつ戻す / ← → 前後の1枚 / Esc やめる
+        </p>
       </div>
     </>
   );

@@ -29,8 +29,10 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from automosaic import video as video_mod  # noqa: E402
 from automosaic.corrections import Correction, CorrectionSet  # noqa: E402
 from automosaic.webapp import jobs as jobs_mod  # noqa: E402
+from automosaic.webapp import proxy as proxy_mod  # noqa: E402
 from automosaic.webapp import runner as runner_mod  # noqa: E402
 from automosaic.webapp.app import create_app  # noqa: E402
 
@@ -599,6 +601,193 @@ def test_run_and_progress_stream():
         srv.close()
 
 
+def wait_proxy(srv, jid: str, timeout: float = 60.0) -> dict:
+    """プロキシの生成が終わる（done か failed になる）まで待つ。"""
+    end = time.time() + timeout
+    detail = {}
+    while time.time() < end:
+        detail = get_json(f"{srv.base}/api/jobs/{jid}?t={TOKEN}")
+        if detail.get("proxy_status") in ("done", "failed"):
+            return detail
+        time.sleep(0.1)
+    raise AssertionError(f"プロキシの生成が終わりません: {detail}")
+
+
+def test_proxy_generated_after_done_and_served_with_range():
+    """パス2完了後にプロキシが自動で作られ、Range 付きで配信されること。
+
+    issue #18 の核心である「プロキシのフレーム数が output.mp4 と一致する」を、
+    ここでは job.meta が言っている数字を信じず、ffprobe で両方を独立に数えて
+    突き合わせる。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = upload(srv.base, sample_video())
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        write_fake_detections(job, d["n_frames"], d["width"], d["height"])
+
+        # 未完了のあいだは「完成品が無い」で 404 になり、「作れなかった」と
+        # 同じ顔をしないこと
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/proxy?t={TOKEN}")
+        assert code == 404, (code, body[:200])
+
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}", {"reuse": True}
+        )
+        assert code == 200, r
+        status = wait_finished(srv, jid)
+        assert status == "done", status
+
+        detail = wait_proxy(srv, jid)
+        assert detail["proxy_status"] == "done", detail
+        assert detail["has_proxy"] is True
+        assert detail["proxy_size_bytes"] > 0
+        print(
+            f"  プロキシ生成 OK: {detail['proxy_size_bytes']} バイト"
+            f"（元 output.mp4 {detail['output_size_bytes']} バイト）"
+        )
+
+        # 実体を取得できること・mp4 として読めること
+        code, body, hdr = request(f"{srv.base}/api/jobs/{jid}/proxy?t={TOKEN}")
+        assert code == 200, code
+        assert body[4:8] == b"ftyp", "mp4 として読めない"
+        assert body == open(job.proxy, "rb").read(), "配信された中身がファイルと違う"
+
+        # Range が効くこと（/video と同じ FileResponse 経路）
+        code, partial, hdr = request(
+            f"{srv.base}/api/jobs/{jid}/proxy?t={TOKEN}",
+            headers={"Range": "bytes=0-99"},
+        )
+        assert code == 206, (code, hdr)
+        assert len(partial) == 100, len(partial)
+        assert partial == body[:100]
+
+        # フレーム数の一致を、job.meta を信じずに ffprobe で独立に検査する
+        n_output = video_mod.probe(job.output).nb_frames
+        n_proxy = video_mod.probe(job.proxy).nb_frames
+        assert n_output is not None and n_proxy is not None
+        assert n_output == n_proxy, (
+            f"output.mp4 と proxy.mp4 のフレーム数が違う: {n_output} != {n_proxy}"
+        )
+        # 全デコードでも一致することを二重に確かめる（ヘッダの nb_frames が
+        # 実体と食い違っていないか。issue #18 の完了条件そのもの）
+        def decode_count(path: str) -> int:
+            # video_mod._require と同じ解決を使う。winget 版 ffprobe は
+            # 素の PATH に無いことがあり、テストプロセス自身の PATH に
+            # 依存させると環境差で落ちる
+            ffprobe = video_mod._require("ffprobe")
+            return int(
+                subprocess.run(
+                    [
+                        ffprobe, "-v", "error", "-select_streams", "v:0",
+                        "-count_frames", "-show_entries", "stream=nb_read_frames",
+                        "-of", "default=nw=1:nk=1", path,
+                    ],
+                    capture_output=True, text=True, check=True,
+                ).stdout.strip()
+            )
+
+        assert decode_count(job.output) == decode_count(job.proxy) == n_output, (
+            "全デコードで数えたフレーム数が一致しない"
+        )
+        print(f"  フレーム数一致 OK（output={n_output} / proxy={n_proxy}、全デコードでも一致）")
+
+        # 原画からは作っていないこと（間接確認）: 解像度が長辺640に落ちている。
+        # 原画のプロキシが残っていたら「モザイク前を端末に残さない」前提が壊れる
+        proxy_info = video_mod.probe(job.proxy)
+        assert max(proxy_info.width, proxy_info.height) <= 640, proxy_info
+
+        # ジョブごと消せば一緒に消えること
+        code, _, _ = request(
+            f"{srv.base}/api/jobs/{jid}?t={TOKEN}", method="DELETE"
+        )
+        assert code == 200, code
+        assert not os.path.exists(job.proxy), "DELETE してもプロキシが残っている"
+        print("  DELETE でプロキシも一緒に消える OK")
+    finally:
+        srv.close()
+
+
+def test_proxy_frame_mismatch_is_rejected():
+    """フレーム数が1つでもずれたら「失敗」にすること（黙って公開しない）。
+
+    RULES.md 2 に従い、この検査を一時的に外すと実際に落ちることを
+    ここで確かめる: video.nb_frames を差し替えて output 側と proxy 側で
+    違う値を返させ、_run が status=failed にして proxy.mp4 を削除する
+    ことを見る。差し替えを戻せば同じジョブが今度は成功することも見て、
+    「失敗記録が残っているだけなら再試行する」ことも確かめる。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = upload(srv.base, sample_video())
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        write_fake_detections(job, d["n_frames"], d["width"], d["height"])
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}", {"reuse": True}
+        )
+        assert code == 200, r
+        assert wait_finished(srv, jid) == "done"
+        # 最初の自動生成が終わる（成功する）のを、サーバ越しに確認してから閉じる。
+        # ここを待たずに閉じると、「まだ始まってすらいない」瞬間に
+        # is_generating() を見て素通りするレースになる
+        detail = wait_proxy(srv, jid)
+        assert detail["proxy_status"] == "done", detail
+    finally:
+        srv.close()
+
+    L = jobs_mod.Library(lib)
+    job = L.get(jid)
+    assert job.meta.get("proxy", {}).get("status") == "done", job.meta.get("proxy")
+    assert os.path.exists(job.proxy)
+
+    real_nb_frames = video_mod.nb_frames
+
+    def lying_nb_frames(path: str):
+        n = real_nb_frames(path)
+        # output.mp4 に対しては本当の値、proxy.mp4 に対しては1ずらした値を返す。
+        # 「本当はズレていないのに検査が誤爆する」側を混ぜないよう、
+        # ずらすのは常にプロキシ側だけにする
+        if os.path.basename(path) == "proxy.mp4":
+            return (n or 0) + 1
+        return n
+
+    video_mod.nb_frames = lying_nb_frames
+    try:
+        # 生成し直す。既に status=done かつファイルがあるので、まず消して
+        # ensure_started が「未生成」経路を通るようにする
+        os.remove(job.proxy)
+        job.update(proxy=None)
+        proxy_mod.ensure_started(job)
+        end = time.time() + 30
+        while time.time() < end and proxy_mod.is_generating(jid):
+            time.sleep(0.1)
+        failed_job = L.get(jid)
+        p = failed_job.meta.get("proxy") or {}
+        assert p.get("status") == "failed", p
+        assert "フレーム数" in (p.get("error") or ""), p
+        assert not os.path.exists(failed_job.proxy), "失敗したのに proxy.mp4 が残っている"
+        print(f"  フレーム数不一致を検出して失敗にする OK: {p.get('error')}")
+    finally:
+        video_mod.nb_frames = real_nb_frames
+
+    # 差し替えを戻せば、同じジョブが再試行で成功すること
+    # （失敗記録が残っているだけなら ensure_started がもう一度試す）
+    retry_job = L.get(jid)
+    proxy_mod.ensure_started(retry_job)
+    end = time.time() + 30
+    while time.time() < end and proxy_mod.is_generating(jid):
+        time.sleep(0.1)
+    recovered = L.get(jid)
+    p = recovered.meta.get("proxy") or {}
+    assert p.get("status") == "done", p
+    assert os.path.exists(recovered.proxy)
+    print("  検査を元に戻すと同じジョブが再試行で成功する OK")
+
+
 def test_sse_stream_sends_snapshot():
     """SSE が現状を1件目として送ること。
 
@@ -726,6 +915,73 @@ def test_no_double_start_across_restart():
         print("  再起動をまたいだ二重起動を拒否・死んだ pid では起動できる OK")
     finally:
         srv.close()
+
+
+def test_pid_reuse_does_not_permanently_lock_job():
+    """meta.json の pid が無関係な生きたプロセスと一致しても、永久に固まらない。
+
+    OS が pid を再利用すると、meta.json に残った pid はそのジョブとは
+    無関係な、たまたま生きている別プロセスを指すようになる。pid の生死
+    だけで判定すると running_pid() が「まだ実行中」と答え続け、start も
+    cancel も拒否されたまま UI から解除する手段が無くなる（issue #44）。
+
+    起動時刻（pid_started_ticks、JobRunner.start が記録）が実際の起動時刻と
+    食い違う pid は「別プロセスに入れ替わった」とみなし、走っていない
+    扱いにする。ジョブ画面を開いた時点の settle() で自然に running から
+    抜け、起動もやり直せることを確かめる。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = upload(srv.base, sample_video())
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        write_fake_detections(job, d["n_frames"], d["width"], d["height"])
+    finally:
+        srv.close()
+
+    # このジョブとは無関係な、常に生きている「他人の」プロセスを用意する
+    impostor = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        real_ticks = jobs_mod.process_creation_ticks(impostor.pid)
+        assert real_ticks is not None, "起動時刻を取得できない環境（このテストは対象外）"
+
+        # 「昔このジョブを処理していたプロセスの起動時刻」として、いま
+        # impostor が実際に起動した時刻とは異なる値を記録する。OS が
+        # pid を再利用した状態を模す（本物の起動時刻とはまず一致しない）
+        jobs_mod.Library(lib).get(jid).update(
+            status="running",
+            pid=impostor.pid,
+            pid_started_ticks=real_ticks - 10_000_000_000,
+            detached=True,
+        )
+
+        srv = Server(lib)  # レジストリを持たない新しいサーバから見る
+        try:
+            st = get_json(f"{srv.base}/api/jobs/{jid}?t={TOKEN}")
+            assert st["status"] != "running", (
+                f"pid 再利用された無関係なプロセスを本人と誤認し、"
+                f"running のまま固まった: {st}"
+            )
+
+            code, r = post_json(
+                f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}", {"reuse": True}
+            )
+            assert code == 200, f"pid 再利用で起動不能のまま固まった: {code} {r}"
+            for _ in range(600):
+                s = get_json(f"{srv.base}/api/jobs/{jid}?t={TOKEN}")
+                if s["status"] in ("done", "failed", "canceled"):
+                    break
+                time.sleep(0.1)
+            print(
+                "  pid 再利用された無関係なプロセスを本人と誤認せず、"
+                "起動をやり直せる OK"
+            )
+        finally:
+            srv.close()
+    finally:
+        impostor.terminate()
+        impostor.wait()
 
 
 # --------------------------------------------------------------------------
@@ -913,6 +1169,101 @@ def test_toobig_stacks_remove_and_add_as_pairs():
         print("  でかすぎる が remove+add を組で積むこと OK（組を割ると素通し）")
     finally:
         srv.close()
+
+
+def test_false_positive_via_webapp_mark_matches_review_session():
+    """「誤検知」（false_positive + pick）が webapp の /mark からも通ること。
+
+    直す前は api_mark() が payload["pick"] を読み捨てていたので、webapp からは
+    常に「消す領域が指定されていません」で 400 になっていた（issue #28）。
+    「狭める」（toobig）は x/y/w/h だけで通っていたので気づかれずに残っていた。
+
+    review.ReviewSession.mark() を同じ pick で直接呼んだ結果とも突き合わせ、
+    webapp 経由でも旧レビュー UI（python -m automosaic.review）と同じ
+    corrections.json になることを確かめる。両者は同じ ReviewSession クラスを
+    呼んでいるので、ここで見ているのは pick の受け渡しがずれていないかだけだが、
+    その受け渡し自体が直す前は欠けていた。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    ref_dir = None
+    try:
+        d = prepared_job(lib, srv)
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+
+        # progress の done/counts はキューに載った項目でしか進まないので、
+        # 実在のキュー項目から選ぶ（f=5 決め打ちだと間引きで落ちることがある）
+        q = get_json(f"{srv.base}/api/jobs/{jid}/queue?t={TOKEN}")
+        item = next((it for it in q["items"] if it["boxes"]), None)
+        assert item, "自動領域のあるキュー項目が無い"
+        f = item["frame"]
+        pick = [item["boxes"][0][:4]]
+
+        # 直す前はここが 400（「消す領域が指定されていません」）だった
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/mark?t={TOKEN}",
+            {"frame": f, "verdict": "false_positive", "pick": pick, "span": 0},
+        )
+        assert code == 200, r
+        assert r["added"] == 1, r
+        assert r["progress"]["counts"]["false_positive"] == 1, r["progress"]
+        assert not r["regions"], "誤検知で消したはずの領域が残っている"
+
+        web_items = CorrectionSet.load(job.corrections).items
+        assert len(web_items) == 1, [c.as_dict() for c in web_items]
+
+        # 同じ pick を review.ReviewSession に直接与える。review.py の
+        # do_POST("/api/mark") がやっているのと同じ呼び方
+        from automosaic import review as review_mod
+
+        ref_dir = tempfile.mkdtemp(prefix="automosaic_ref_")
+        ref_corrections = os.path.join(ref_dir, "corrections.json")
+        argv = [job.source, "--detections", job.detections, "--corrections", ref_corrections]
+        args = review_mod.build_parser().parse_args(argv)
+        ref_session = review_mod.session_from_args(args, argv)
+        try:
+            ref_session.mark(f, "false_positive", pick=pick, span=0, cls=None)
+        finally:
+            ref_session.reader.close()
+
+        ref_items = CorrectionSet.load(ref_corrections).items
+        assert len(ref_items) == 1, [c.as_dict() for c in ref_items]
+        assert (web_items[0].frame, web_items[0].box, web_items[0].kind) == (
+            ref_items[0].frame,
+            ref_items[0].box,
+            ref_items[0].kind,
+        ), (web_items[0].as_dict(), ref_items[0].as_dict())
+
+        # corrections.progress.json も同じ内容になること（issue #28 の完了条件）。
+        # video は両方とも同じ job.source から作っているので一致するはず
+        web_progress_path = os.path.splitext(job.corrections)[0] + ".progress.json"
+        ref_progress_path = os.path.splitext(ref_corrections)[0] + ".progress.json"
+        with open(web_progress_path, encoding="utf-8") as fh:
+            web_progress = json.load(fh)
+        with open(ref_progress_path, encoding="utf-8") as fh:
+            ref_progress = json.load(fh)
+        assert web_progress["video"] == ref_progress["video"], (
+            web_progress["video"], ref_progress["video"],
+        )
+        assert web_progress["verdicts"] == ref_progress["verdicts"] == {str(f): "false_positive"}, (
+            web_progress["verdicts"], ref_progress["verdicts"],
+        )
+        assert web_progress["false_positives"] == ref_progress["false_positives"], (
+            web_progress["false_positives"], ref_progress["false_positives"],
+        )
+        # history は「直前の判定」も持つので、同じ手順で作れば同じ形になる
+        assert [h["added"] for h in web_progress["history"]] == [h["added"] for h in ref_progress["history"]]
+        assert [h["fp"] for h in web_progress["history"]] == [h["fp"] for h in ref_progress["history"]]
+        print(
+            "  webapp /mark と review.ReviewSession 直呼びで corrections.json / "
+            f"corrections.progress.json が一致 OK: {web_items[0].as_dict()} / "
+            f"verdicts={web_progress['verdicts']}"
+        )
+    finally:
+        srv.close()
+        if ref_dir:
+            shutil.rmtree(ref_dir, ignore_errors=True)
 
 
 def test_mark_rejects_out_of_range_frame():

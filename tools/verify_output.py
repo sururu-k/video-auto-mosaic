@@ -43,6 +43,34 @@ from automosaic import video as vid  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# automosaic/cli.py の既定 --model / --conf と同じ値。値を変えたら両方直す。
+PROD_MODEL_BASENAME = "640m.onnx"
+PROD_CONF = 0.06
+
+
+def structural_warning(mode: str, model_path: str) -> str | None:
+    """この実行が「独立した第二の意見」になっていないなら警告文を返す。None なら該当なし。
+
+    source モードで本番と同じ重みを使う限り、検出器自身が盲目な場所は
+    もう一度検出しても同じく盲目になる。conf・infer-size・TTA をどう変えても、
+    重みが同じなら盲点の本質は動かない（docs/05: 実測 source モード 0/2 件、
+    「検出器を自分自身では検証できない」という循環）。
+    """
+    if mode != "source":
+        return None
+    if os.path.basename(model_path) != PROD_MODEL_BASENAME:
+        return None
+    return (
+        f"[警告] 検証モデルが本番既定と同じ重み ({PROD_MODEL_BASENAME}) です。\n"
+        "  conf/infer-size/TTA をどう変えても、同じ重みが盲目な場所は\n"
+        "  再検出でも同じく盲目になります（docs/05: source モード実測 0/2 件、\n"
+        "  「検出器を自分自身では検証できない」という循環）。\n"
+        "  ここで 0 件が出ても「漏れが無い証拠」にはなりません。「この検証が\n"
+        "  対象を捕捉できない構造になっている」可能性のほうが高いです。\n"
+        "  独立した出荷判定には、別アーキテクチャ・別学習データの検出器\n"
+        "  （issue #7 の画素被覆指標 / issue #12 の segmenter 併走）が要ります。"
+    )
+
 
 def _covered_fraction(box, regions) -> float:
     """box のうち、regions のどれかに覆われている面積の割合。
@@ -67,7 +95,7 @@ def _covered_fraction(box, regions) -> float:
     return covered / (n * n)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="出力動画に別の検出器をかけて漏れを探す（出荷ゲート）"
     )
@@ -97,7 +125,7 @@ def main() -> None:
         type=float,
         default=0.05,
         help="検出のこの割合以上がモザイクの外にあれば漏れとみなす。"
-        "旧既定は0.5で、検出矩形の49%がモザイクの外でも報告しなかった（issue #7）",
+        "0.5 だと検出矩形の49%がモザイクの外でも報告しない（issue #13）",
     )
     p.add_argument("--frame-step", type=int, default=1, help="Nフレームおきに検証")
     p.add_argument("--limit-frames", type=int)
@@ -106,7 +134,11 @@ def main() -> None:
     p.add_argument("--margin-scale", type=float, default=0.35)
     p.add_argument("--margin-cap", type=float, default=16.0)
     p.add_argument("--estimate-gaps", action="store_true")
-    args = p.parse_args()
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     classes = {c.strip() for c in args.classes.split(",") if c.strip()}
 
@@ -145,6 +177,10 @@ def main() -> None:
     print(f"検証モデル {os.path.basename(args.model)}  プロバイダ {det.active_provider}")
     print(f"モード {args.mode}")
     print(f"対象 {args.video}  {info.width}x{info.height}  {n_frames} フレーム")
+
+    warning = structural_warning(args.mode, args.model)
+    if warning:
+        print(f"\n{warning}\n", file=sys.stderr)
 
     dec_w, dec_h = vid.detection_frame_size(info, args.infer_size, path=args.video)
     frame_bytes = dec_w * dec_h * 3
@@ -195,6 +231,12 @@ def main() -> None:
     sys.stderr.write("\n")
 
     print(f"\n検証 {checked} フレーム / 疑い {len(findings)} 件")
+    if not findings and warning:
+        print(
+            "[判定] 0件ですが、上の警告のとおりこの実行は独立検証になっていません。"
+            "「漏れが無い」の根拠にしないこと。",
+            file=sys.stderr,
+        )
     if findings:
         print("\n[モザイクの外に検出が出たフレーム]")
         for fd in findings[:40]:
@@ -217,6 +259,7 @@ def main() -> None:
                     "min_outside": args.min_outside,
                     "frames_checked": checked,
                     "findings": findings,
+                    "structural_warning": warning,
                 },
                 f,
                 ensure_ascii=False,

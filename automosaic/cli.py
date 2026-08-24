@@ -173,6 +173,29 @@ def load_partial(
     return per_frame, n_frames
 
 
+def compute_detect_scale(
+    net_w: int,
+    net_h: int,
+    tiles: int,
+    mat_w: int,
+    mat_h: int,
+    override: int | None = None,
+) -> int:
+    """パス1のデコード長辺（detect_scale）を決める。
+
+    タイル分割時は「ネット入力の長辺 * タイル数」を基準にしてきたが、これは
+    素材の実解像度を無視する。素材より大きくデコードしても画素は補間で
+    埋まるだけで情報は増えないのに、デコードと各タイルの推論コストだけが
+    増える（issue #37）。素材の長辺で頭打ちにする。
+
+    `--detect-scale` で明示指定された場合（override）は、利用者の意図的な
+    指定なのでそのまま通す（頭打ちを掛けない）。
+    """
+    if override:
+        return override
+    return min(max(net_w, net_h) * max(1, tiles), max(mat_w, mat_h))
+
+
 def run_detection(
     src: str,
     info: vid.VideoInfo,
@@ -336,6 +359,11 @@ def run_render(
 ) -> None:
     pix_fmt = vid.detect_pix_fmt(info)
     ten_bit = pix_fmt.endswith("10le")
+    # issue #32: FrameBuffer の長さ検査は width/height の入れ替えに対して
+    # 不変なので、reader を開く前に実デコードサイズを測って突き合わせる。
+    # 食い違えば reader/writer を一切開かずに例外で止める（出力ファイルを
+    # 作らない。quarantine の必要すら無い）。
+    vid.verify_full_frame_size(info, src)
     fb = FrameBuffer(info.width, info.height, ten_bit=ten_bit)
 
     reader = vid.open_full_reader(src, pix_fmt, limit_frames)
@@ -751,6 +779,19 @@ def main(argv: list[str] | None = None) -> int:
         classes = {c.strip() for c in args.classes.split(",") if c.strip()}
 
     info = vid.probe(src)
+
+    # issue #2: 奇数解像度は検出（パス1）だけは通ってしまい、描画（パス2）で
+    # 初めて FrameBuffer の guard に当たって落ちる。数時間かけた検出が無駄に
+    # なる壊れ方なので、無駄にする前にここで検査する。--detect-only は
+    # パス1しか実行しない（＝奇数のままでも正しく動く）ので警告に留めて進める。
+    geometry_problem = vid.check_render_geometry(info)
+    if geometry_problem:
+        if args.detect_only:
+            print(f"警告: {geometry_problem} --detect-only のため続行します。", file=sys.stderr)
+        else:
+            print(geometry_problem, file=sys.stderr)
+            return 1
+
     block = args.block or default_block_size(info.long_edge)
 
     if info.rotation and not args.quiet:
@@ -910,7 +951,11 @@ def main(argv: list[str] | None = None) -> int:
         # 旧: infer_size(正方の辺) * タイル数。新: net の長辺 * タイル数
         # （decode 自体は正方 box への fit なので、box の長辺だけ渡せば足りる。
         # box が正方でも中身は縦横比なりに縮む＝黒帯にはならない）。
-        detect_scale = args.detect_scale or max(net_w, net_h) * max(1, args.tiles)
+        # ただし素材の実解像度を超える拡大は情報を増やさない（issue #37）ので
+        # 素材の長辺で頭打ちにする。
+        detect_scale = compute_detect_scale(
+            net_w, net_h, args.tiles, info.width, info.height, args.detect_scale
+        )
         if not args.quiet:
             print(f"プロバイダ {det.active_provider}")
             extra = []
