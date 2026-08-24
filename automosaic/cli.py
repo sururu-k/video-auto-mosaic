@@ -173,6 +173,29 @@ def load_partial(
     return per_frame, n_frames
 
 
+def compute_detect_scale(
+    net_w: int,
+    net_h: int,
+    tiles: int,
+    mat_w: int,
+    mat_h: int,
+    override: int | None = None,
+) -> int:
+    """パス1のデコード長辺（detect_scale）を決める。
+
+    タイル分割時は「ネット入力の長辺 * タイル数」を基準にしてきたが、これは
+    素材の実解像度を無視する。素材より大きくデコードしても画素は補間で
+    埋まるだけで情報は増えないのに、デコードと各タイルの推論コストだけが
+    増える（issue #37）。素材の長辺で頭打ちにする。
+
+    `--detect-scale` で明示指定された場合（override）は、利用者の意図的な
+    指定なのでそのまま通す（頭打ちを掛けない）。
+    """
+    if override:
+        return override
+    return min(max(net_w, net_h) * max(1, tiles), max(mat_w, mat_h))
+
+
 def run_detection(
     src: str,
     info: vid.VideoInfo,
@@ -910,7 +933,11 @@ def main(argv: list[str] | None = None) -> int:
         # 旧: infer_size(正方の辺) * タイル数。新: net の長辺 * タイル数
         # （decode 自体は正方 box への fit なので、box の長辺だけ渡せば足りる。
         # box が正方でも中身は縦横比なりに縮む＝黒帯にはならない）。
-        detect_scale = args.detect_scale or max(net_w, net_h) * max(1, args.tiles)
+        # ただし素材の実解像度を超える拡大は情報を増やさない（issue #37）ので
+        # 素材の長辺で頭打ちにする。
+        detect_scale = compute_detect_scale(
+            net_w, net_h, args.tiles, info.width, info.height, args.detect_scale
+        )
         if not args.quiet:
             print(f"プロバイダ {det.active_provider}")
             extra = []
