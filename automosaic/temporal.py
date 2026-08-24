@@ -547,23 +547,40 @@ def densify(
                 Region(box, t.cls, score, "detected", local[f], lineage=lineage)
             )
 
-        # 観測と観測のあいだを線形補間で埋める。バッチなので未来を使える。
-        for a, b in zip(frames, frames[1:]):
+        # 観測と観測のあいだを埋める。バッチなので未来を使える。
+        # issue #11: 以前は2点を線形補間した「線上の1点」を矩形にしていたが、
+        # 対象は直進するとは限らない（往復運動なら区間の中間で線から外側へ膨らむ）。
+        # 「そのまま止まった/戻った」（両端観測の外接矩形）と「その速度のまま
+        # ギャップの中へ進み続けた」（各端からの直線外挿）の両方の仮説を
+        # 不確かさの包絡として和で覆う。前者だけだと往復の折り返し点を外すことがあり、
+        # 後者だけだと直進する対象に置いていかれる（下記 memory と同じ理由）。
+        for i, (a, b) in enumerate(zip(frames, frames[1:])):
             gap = b - a
             if gap <= 1:
                 continue
             box_a, score_a = t.obs[a]
             box_b, score_b = t.obs[b]
+            va = _velocity_at(t, frames, i, look_back=True)
+            vb = _velocity_at(t, frames, i + 1, look_back=False)
             for f in range(a + 1, b):
-                w = (f - a) / gap
+                d_from_a = f - a
+                d_from_b = b - f
+                envelope = _union_box(
+                    [
+                        box_a,
+                        box_b,
+                        _shift_box(box_a, va[0] * d_from_a, va[1] * d_from_a),
+                        _shift_box(box_b, -vb[0] * d_from_b, -vb[1] * d_from_b),
+                    ]
+                )
                 per_frame[f].append(
                     Region(
-                        _lerp_box(box_a, box_b, w),
+                        envelope,
                         t.cls,
                         min(score_a, score_b),
                         "interpolated",
                         max(local[a], local[b]),
-                        min(f - a, b - f),
+                        min(d_from_a, d_from_b),
                         lineage,
                     )
                 )
@@ -573,17 +590,29 @@ def densify(
         step = max(1, cfg.frame_step)
         mem_after = cfg.memory * step
         mem_before = (cfg.memory_before or cfg.memory) * step
-        # memory 区間は矩形を固定してはいけない。対象が動いていると置いていかれる。
-        # 端点の速度で外挿し、観測から離れた分は hold として持たせて、
-        # expand 側で不確かさぶんを広げる。
+        # issue #11: 以前は端点速度で矩形そのものを直進外挿していた。往復運動では
+        # 速度の符号がすぐ反転するため、外挿は「置いていかれる」どころか実測
+        # （振幅250px/周期20f、memory=20）で 12/19 フレームが完全に対象を外した
+        # （固定するより悪い）。かといって外挿をやめて固定するだけだと、今度は
+        # 直進する対象で置いていかれる側の regression が出る（実測: 速度20px/f の
+        # 直進で 0/19 -> 3/19 に悪化）。「止まった」仮説と「その速度で進み続けた」
+        # 仮説の両方を外接矩形として和で覆うことで、両方向の壊れ方を避ける。
         if mem_before > 0:
             head_box, head_score = t.obs[frames[0]]
-            vx, vy = _endpoint_velocity(t, frames, at_start=True)
+            vx_short, vy_short = _velocity_at(t, frames, 0, look_back=False)
+            vx_long, vy_long = _endpoint_velocity(t, frames, at_start=True)
             for f in range(max(0, frames[0] - mem_before), frames[0]):
                 d = frames[0] - f
+                envelope = _union_box(
+                    [
+                        head_box,
+                        _shift_box(head_box, -vx_short * d, -vy_short * d),
+                        _shift_box(head_box, -vx_long * d, -vy_long * d),
+                    ]
+                )
                 per_frame[f].append(
                     Region(
-                        _shift_box(head_box, -vx * d, -vy * d),
+                        envelope,
                         t.cls,
                         head_score,
                         "memory",
@@ -594,12 +623,20 @@ def densify(
                 )
         if mem_after > 0:
             tail_box, tail_score = t.obs[frames[-1]]
-            vx, vy = _endpoint_velocity(t, frames, at_start=False)
+            vx_short, vy_short = _velocity_at(t, frames, len(frames) - 1, look_back=True)
+            vx_long, vy_long = _endpoint_velocity(t, frames, at_start=False)
             for f in range(frames[-1] + 1, min(n_frames, frames[-1] + mem_after + 1)):
                 d = f - frames[-1]
+                envelope = _union_box(
+                    [
+                        tail_box,
+                        _shift_box(tail_box, vx_short * d, vy_short * d),
+                        _shift_box(tail_box, vx_long * d, vy_long * d),
+                    ]
+                )
                 per_frame[f].append(
                     Region(
-                        _shift_box(tail_box, vx * d, vy * d),
+                        envelope,
                         t.cls,
                         tail_score,
                         "memory",
@@ -637,10 +674,37 @@ def _local_speeds(track: Track, frames: list[int]) -> dict[int, float]:
     return out
 
 
-def _endpoint_velocity(track: Track, frames: list[int], at_start: bool) -> tuple[float, float]:
+def _velocity_at(
+    track: Track, frames: list[int], i: int, look_back: bool
+) -> tuple[float, float]:
+    """観測点 frames[i] における速度ベクトル px/frame。外挿仮説に使う。
+
+    look_back=True: 直前の区間 (frames[i-1], frames[i]) から求める（先頭なら 0）。
+    look_back=False: 直後の区間 (frames[i], frames[i+1]) から求める（末尾なら 0）。
+    どちらも 1 区間のみを見る単純な有限差分。速度が 0 なら外挿仮説は
+    「止まった」仮説と一致し、包絡が余計に膨らむことはない。
+    """
+    if look_back:
+        if i <= 0:
+            return (0.0, 0.0)
+        a, b = frames[i - 1], frames[i]
+    else:
+        if i >= len(frames) - 1:
+            return (0.0, 0.0)
+        a, b = frames[i], frames[i + 1]
+    dt = b - a
+    if dt <= 0:
+        return (0.0, 0.0)
+    ca, cb = _center(track.obs[a][0]), _center(track.obs[b][0])
+    return ((cb[0] - ca[0]) / dt, (cb[1] - ca[1]) / dt)
+
+
+def _endpoint_velocity(
+    track: Track, frames: list[int], at_start: bool
+) -> tuple[float, float]:
     """トラック端での速度ベクトル px/frame。memory 区間の外挿に使う。
 
-    端の数観測から求める。1点しかなければ 0（外挿せず固定）。
+    端の最大3観測から求める平均速度。1点しかなければ 0（外挿せず固定）。
     """
     if len(frames) < 2:
         return (0.0, 0.0)
