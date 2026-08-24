@@ -815,20 +815,27 @@ def bridge_uncovered(
     に従って両側を包む矩形で塞ぐ。
 
     2段構成（issue #10）。
-      1. _bridge_by_lineage: 同一対象と判定できるトラック同士を、他対象の
-         矩形に隠れていても系統単位で埋める。
-      2. _bridge_globally: 1で埋まらなかった、フレーム丸ごと未処理の区間を、
-         対象の同定をせず時間的な近さだけで埋める（従来の挙動そのまま）。
-    1 が先に regions を足すので、2 が見る「覆われているか」は 1 の結果を
-    反映した状態になる。1 が対象を正しく繋げた分だけ 2 の出番は減るが、
-    対象の同定ができない場合の最終防波堤としては変えていない。
+      1. _bridge_globally: フレーム丸ごと未処理の区間を、対象の同定をせず
+         時間的な近さだけで埋める（従来の最終防波堤。両端の全 region の
+         外接矩形で塞ぐ）。
+      2. _bridge_by_lineage: 1 で埋まらなかった、同一対象と判定できる
+         トラック同士の穴を、他対象の矩形に隠れていても系統単位で埋める。
+    順序が重要。_bridge_by_lineage を先に呼ぶと、その系統の region が
+    先に足された状態で _bridge_globally の「覆われているか」判定が
+    行われてしまい、フレーム丸ごと空だった区間が「覆われている」と
+    誤認されて最終防波堤が起動しなくなる。その結果、後続トラックを持たない
+    （そこでトラックが終わって二度と復活しない）対象は、系統としての
+    橋渡し候補がないまま素通しになる（漏れる方向。実測で bench3
+    123フレーム・736126セルが master 比で失われることを確認した）。
+    _bridge_globally を先に呼べば、フレーム丸ごと空の区間は従来どおり
+    確実に塞がれたうえで、系統単位の橋渡しがさらに隙間を埋める。
 
-    戻り値: (埋めたフレーム数の合計, 2 でも埋められなかった未処理区間)。
+    戻り値: (埋めたフレーム数の合計, 1 でも埋められなかった未処理区間)。
     左側は従来どおり「フレーム丸ごと空」の区間のみを指す。
     """
-    filled_by_lineage = _bridge_by_lineage(per_frame, n_frames, cfg)
     filled_globally, left_open = _bridge_globally(per_frame, n_frames, cfg)
-    return filled_by_lineage + filled_globally, left_open
+    filled_by_lineage = _bridge_by_lineage(per_frame, n_frames, cfg)
+    return filled_globally + filled_by_lineage, left_open
 
 
 def _track_speed(tracks: list[Track]) -> dict[int, float]:
@@ -1123,6 +1130,18 @@ def estimated_only_ranges(
     系統がそれぞれ推定のみなら、その分だけ複数件として報告される
     （フレーム数の単純合計は延べ数になる。1フレームに2対象の穴があれば
     2件ぶんとして数える。これは「見えている問題の数」であって水増しではない）。
+
+    系統ごとの判定だけに切り替えると、別の消え方をする。effective_min_len は
+    系統ごとに独立して効くため、以前はフレーム単位で連結されて
+    effective_min_len 以上あった区間が、系統の切り替わり（トラックが
+    途中で終わって別トラックに繋ぎ直った境目など）で分断され、
+    それぞれ effective_min_len 未満に落ちて両方とも報告から消えることがある
+    （実測: bench3 で系統単位のみだと86-89等の4フレーム区間が複数、
+    フレーム単位では報告されていたのに消える）。人手レビューの導線が消える
+    のは漏れる方向なので、系統ごとの判定（対象Bに隠れる穴を拾う）と
+    従来のフレーム単位の判定（系統の切れ目をまたいだ連結を拾う）の
+    **両方を計算し、区間の和集合**として報告する。片方にしか出ない区間も
+    両方に出る区間も、最終的に消えることはない。
     """
     if frame_step <= 0:
         frame_step = _infer_frame_step(regions_per_frame, n_frames)
@@ -1133,7 +1152,7 @@ def estimated_only_ranges(
         for item in regions_per_frame.get(f, []):
             by_lineage.setdefault(item[1].lineage, {}).setdefault(f, []).append(item)
 
-    out: list[tuple[int, int, float]] = []
+    lineage_out: list[tuple[int, int, float]] = []
     for frames_map in by_lineage.values():
         if not frames_map:
             continue
@@ -1149,12 +1168,53 @@ def estimated_only_ranges(
                 peak = max(peak, max((r.hold for _, r in regs), default=0))
             else:
                 if start is not None and f - start >= effective_min_len:
-                    out.append((start, f - 1, peak))
+                    lineage_out.append((start, f - 1, peak))
                 start = None
         if start is not None and hi + 1 - start >= effective_min_len:
-            out.append((start, hi, peak))
+            lineage_out.append((start, hi, peak))
 
-    out.sort(key=lambda t: (t[0], t[1]))
+    # フレーム単位（従来どおり、対象を区別しない any() 判定）の区間。
+    # 系統の切れ目で分断されて effective_min_len 未満に落ちる区間を、
+    # フレーム全体で見れば繋がっていた分として拾い直すために計算する。
+    global_out: list[tuple[int, int, float]] = []
+    start = None
+    peak = 0
+    for f in range(n_frames):
+        regs = regions_per_frame.get(f, [])
+        has_real = any(r.source == "detected" or r.source == "manual" for _, r in regs)
+        if regs and not has_real:
+            if start is None:
+                start, peak = f, 0
+            peak = max(peak, max((r.hold for _, r in regs), default=0))
+        else:
+            if start is not None and f - start >= effective_min_len:
+                global_out.append((start, f - 1, peak))
+            start = None
+    if start is not None and n_frames - start >= effective_min_len:
+        global_out.append((start, n_frames - 1, peak))
+
+    return _merge_ranges(lineage_out + global_out)
+
+
+def _merge_ranges(
+    ranges: list[tuple[int, int, float]],
+) -> list[tuple[int, int, float]]:
+    """(開始, 終了, peak) の区間リストを、重なる/接する区間ごとに1本へまとめる。
+
+    2つの判定基準（系統ごと・フレーム単位）の出力をそのまま連結すると、同じ
+    区間や重なる区間が重複して報告されうる。ここでまとめて、見た目の水増しを
+    防ぎつつ、どちらか一方にしか出ない区間は取りこぼさない。
+    """
+    if not ranges:
+        return []
+    ranges = sorted(ranges, key=lambda t: (t[0], t[1]))
+    out: list[tuple[int, int, float]] = [ranges[0]]
+    for start, end, peak in ranges[1:]:
+        last_start, last_end, last_peak = out[-1]
+        if start <= last_end + 1:
+            out[-1] = (last_start, max(last_end, end), max(last_peak, peak))
+        else:
+            out.append((start, end, peak))
     return out
 
 

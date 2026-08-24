@@ -384,6 +384,92 @@ def test_estimated_only_is_not_masked_by_other_object():
     print(f"  他対象の実観測に隠れた推定のみ区間の報告 OK ({est})")
 
 
+def test_estimated_only_range_split_across_lineages_is_not_dropped():
+    """系統ごとの判定に切り替えた副作用で、フレーム単位なら effective_min_len
+    以上あった推定のみ区間が、系統の境目で分断されて両方とも
+    effective_min_len 未満に落ち、報告からまるごと消える回帰テスト。
+
+    対象A（frame0のみ実観測、その後 memory で3フレーム推定=1-3）と
+    対象B（frame7のみ実観測、その手前に memory_before で3フレーム推定=4-6）
+    は別の場所にいる別対象で、系統としては繋がらない
+    （中心距離が stitch_dist_ratio の許容範囲を大きく超える）。
+
+    フレーム単位で見れば 1-6 の6フレームが連続して「どの対象も実観測が無い」
+    区間だが、系統ごとに見ると A は 1-3（3フレーム）、B は 4-6（3フレーム）
+    に分断され、どちらも min_len=5 未満で個別には報告されない。
+    系統ごとの判定とフレーム単位の判定の**両方**を計算して和を取らないと、
+    この6フレームは報告から丸ごと消える（人手レビューの導線が消える＝
+    漏れる方向）。
+    """
+    N = 20
+    dets: dict[int, list[Detection]] = {f: [] for f in range(N)}
+    dets[0].append(Detection(CLS, 0.9, (50, 50, 40, 40)))   # 対象A
+    dets[7].append(Detection(CLS, 0.9, (500, 400, 40, 40)))  # 対象B（遠い別対象）
+
+    cfg = TemporalConfig(
+        max_gap=12, memory=3, memory_before=3, min_track_len=0,
+        bridge_max=0, stitch_max_gap=0,
+    )
+    regions, stats = process(dets, N, W, H, {CLS}, cfg)
+    assert stats["tracks_stitched"] == 0, "対象Aと対象Bが stitch で繋がってしまっている（前提が崩れている）"
+
+    est = estimated_only_ranges(regions, N, min_len=5)
+    covered = set()
+    for s, e, _ in est:
+        covered.update(range(s, e + 1))
+    missing = [f for f in range(1, 7) if f not in covered]
+    assert not missing, (
+        f"系統の境目で分断され、フレーム単位なら6フレーム連続だった推定のみ"
+        f"区間が報告から消えている（消えたフレーム: {missing}, 報告: {est}）"
+    )
+    print(f"  系統の境目で分断される推定のみ区間の報告 OK ({est})")
+
+
+def test_lineage_groups_never_merges_temporally_overlapping_tracks():
+    """_lineage_groups() の gap<=0 除外を検証する回帰テスト。
+
+    docstring は「同時に映る別対象2体が1系統に潰れると issue #10 の欠陥を
+    そのまま再現する」と明記している。ここでは、位置が完全に同一で
+    （素性判定だけなら確実にマッチする）、かつ時間的に重なる2トラックが、
+    重なっている一点をもって絶対に同じ系統にならないことを直接確認する。
+    """
+    tracks = [
+        temporal.Track(cls=CLS, obs={0: ((100.0, 100.0, 40.0, 40.0), 0.9)}),
+        temporal.Track(cls=CLS, obs={0: ((100.0, 100.0, 40.0, 40.0), 0.9)}),
+    ]
+    cfg = TemporalConfig()
+    ids = temporal._lineage_groups(tracks, W, H, cfg)
+    assert ids[0] != ids[1], (
+        f"完全に同時刻・同位置の別トラックが同じ系統に潰れている（gap<=0 除外が"
+        f"効いていない）: ids={ids}"
+    )
+    print(f"  同時に映るトラックは系統を分ける OK (ids={ids})")
+
+
+def test_lineage_groups_does_not_transitively_merge_via_shared_candidate():
+    """_lineage_groups() の claimed 除外を検証する回帰テスト。
+
+    docstring は「1つの後続トラックを複数の先行トラックが取り合うと、
+    無関係な同時対象2体が共通の後続候補を介して間接的に同じ系統へ潰れる」と
+    明記している。同時刻に映る2トラック A・B が、どちらも同じ後続トラック C
+    と（時間的にも空間的にも）良くマッチする場面を作り、A が先に C を
+    掴んだあとは B が C 経由で A と同じ系統へ潰れないことを確認する。
+    """
+    box = (100.0, 100.0, 40.0, 40.0)
+    a = temporal.Track(cls=CLS, obs={0: (box, 0.9)})
+    b = temporal.Track(cls=CLS, obs={0: (box, 0.9)})
+    c = temporal.Track(cls=CLS, obs={10: (box, 0.9)})
+    tracks = [a, b, c]
+    cfg = TemporalConfig()
+    ids = temporal._lineage_groups(tracks, W, H, cfg)
+
+    assert ids[0] != ids[1], (
+        f"同時に映る A・B が、共通の後続候補 C を介して間接的に同じ系統へ"
+        f"潰れている（claimed 除外が効いていない）: ids={ids}"
+    )
+    print(f"  共通候補の取り合いで系統が潰れない OK (ids={ids})")
+
+
 def test_module_docstring_matches_implementation():
     """冒頭 docstring の処理順が、process() の実装順と食い違わないこと。"""
     import inspect
