@@ -44,7 +44,12 @@ import numpy as np
 from .corrections import Correction, CorrectionSet
 from .detector import CONSERVATIVE_CLASSES, DEFAULT_CLASSES, Detection
 from .render import apply_regions, default_block_size
-from .temporal import TemporalConfig, estimated_only_ranges, process
+from .temporal import (
+    TemporalConfig,
+    estimated_only_ranges,
+    narrow_without_estimate_gaps,
+    process,
+)
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
@@ -2097,8 +2102,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--default-size",
         help="手で置く矩形の既定サイズ。'80' か '80x60'（既定: 検出サイズの中央値）",
     )
-    p.add_argument("--block", type=int, default=0, help="モザイクのブロックサイズ px（0で自動）")
-    p.add_argument("--mode", default="pixelize", choices=["pixelize", "black"])
     p.add_argument(
         "--export-dataset",
         help="UI を起動せず、手修正を YOLO 形式の学習データとして書き出す",
@@ -2110,6 +2113,15 @@ def build_parser() -> argparse.ArgumentParser:
     # 過去に書き写した2つ（margin-scale/margin-cap）が実際に食い違って、レビュー画面
     # が焼き込みより広く塗って見せていたため（#14: 実測で5,950フレームぶん）。
     cd = _cli_defaults()
+
+    # --block / --mode も焼き込みの見た目に直結するので同じ理由でここに数値を
+    # 書き写さない（issue #33 完了条件）。以前は 0 / "pixelize" を直書きしており、
+    # cli.py 側の既定が変わっても追随しない構造だった（値は今のところ食い違って
+    # いなかったが、margin-scale/margin-cap と同じ形の潜在的リスク）。
+    p.add_argument(
+        "--block", type=int, default=cd["--block"], help="モザイクのブロックサイズ px（0で自動）"
+    )
+    p.add_argument("--mode", default=cd["--mode"], choices=["pixelize", "black"])
     t = p.add_argument_group("時間方向（cli と同じ既定値）")
     t.add_argument("--classes", default=cd["--classes"])
     t.add_argument("--max-gap", type=int, default=cd["--max-gap"])
@@ -2207,43 +2219,16 @@ def session_from_args(args, argv: list[str] | None = None) -> ReviewSession:
         }
     per_frame = {f: per_frame.get(f, []) for f in range(n_frames)}
 
-    # cli.py の main() と同じ絞り込み。--estimate-gaps 無しが既定で、これは
-    # 「実際に検出できた箇所だけ」を塗る方針（塗り過ぎを避ける）。この絞り込みが
-    # 無いと、レビューは常に memory/橋渡し/不確かさ膨張ありで領域を計算し、
-    # 焼き込みでは塗られない橋渡し・memory 領域を「塗られている」と見せてしまう
-    # （#14: 実測で bench3 素材 9,344 フレームぶん。issue #14 記載の実素材では
-    # 5,950フレーム）。明示指定された値は上書きしない。
+    # --estimate-gaps 無しが既定で、これは「実際に検出できた箇所だけ」を塗る方針
+    # （塗り過ぎを避ける）。この絞り込みが無いと、レビューは常に memory/橋渡し/
+    # 不確かさ膨張ありで領域を計算し、焼き込みでは塗られない橋渡し・memory 領域を
+    # 「塗られている」と見せてしまう（#14: 実測で bench3 素材 9,344 フレームぶん。
+    # issue #14 記載の実素材では 5,950フレーム）。絞り込みの式そのものは
+    # temporal.narrow_without_estimate_gaps() に一本化してある（cli.py の main()
+    # と共有。issue #33。以前は同じ式が2箇所に別々に書かれていた）。
     if not args.estimate_gaps:
         given = explicit_options(argv)
-        narrowed = [
-            ("memory", "--memory", args.memory, min(args.memory, 2)),
-            ("memory_before", "--memory-before",
-             args.memory_before, min(args.memory_before or 2, 2)),
-            ("bridge_max", "--bridge-max", args.bridge_max, 0),
-            ("hold_growth", "--hold-growth", args.hold_growth, 0.0),
-            ("motion_weight", "--motion-weight",
-             args.motion_weight, min(args.motion_weight, 1.0)),
-        ]
-        applied: list[str] = []
-        kept: list[str] = []
-        for name, flag, old, new in narrowed:
-            if name in given:
-                if old != new:
-                    kept.append(f"{flag} {old}")
-                continue
-            if old != new:
-                setattr(args, name, new)
-                applied.append(f"{flag} {old} -> {new}")
-
-        # cli.py の C-6 と同じ理由。実効設定が画面の見た目に直結するので黙って絞らない
-        if applied:
-            print(
-                "--estimate-gaps 無しのため推定で広げる設定を絞りました: "
-                + ", ".join(applied),
-                file=sys.stderr,
-            )
-        if kept:
-            print("明示指定を優先: " + ", ".join(kept), file=sys.stderr)
+        narrow_without_estimate_gaps(args, given)
 
     classes = resolve_classes(args.classes)
     cfg = TemporalConfig(

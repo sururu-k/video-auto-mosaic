@@ -2026,6 +2026,46 @@ def test_review_cfg_matches_cli_cfg_for_default_job():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# -- review.py と cli.py の block/mode/classes 既定値一致（issue #33） -----
+
+
+def test_review_block_mode_classes_defaults_match_cli():
+    """review.py の --block / --mode / --classes の既定値が cli.py と一致すること。
+
+    この3つは TemporalConfig のフィールドではないため、
+    test_review_cfg_matches_cli_cfg_for_default_job（#14）の比較対象に
+    含まれない。実際、review.py の --block と --mode は cli.py と同じ値を
+    ここに直書きしているだけで、cli.py の build_parser() から借りていなかった
+    （--classes は #14 で既に借りる形になっていた）。
+
+    このテストを追加する前に、review.py の --block の既定値だけを 0 -> 40 に、
+    --mode を "pixelize" -> "black" に書き換えて
+    tests/test_review.py tests/test_render.py tests/test_webapp.py を
+    フルスイート実行し、**1件も失敗しないこと**を確認した（issue #33 記載の
+    変異D/Eの再現）。焼き込みと違うブロックサイズ・モードでレビュー画面を
+    見せても、既存のどのテストも検出しない構造的な穴だった。
+    """
+    cli_defaults = review._cli_defaults()
+    rev_args = review.build_parser().parse_args([])
+
+    mismatches = []
+    if rev_args.block != cli_defaults["--block"]:
+        mismatches.append(("block", cli_defaults["--block"], rev_args.block))
+    if rev_args.mode != cli_defaults["--mode"]:
+        mismatches.append(("mode", cli_defaults["--mode"], rev_args.mode))
+    if rev_args.classes != cli_defaults["--classes"]:
+        mismatches.append(("classes", cli_defaults["--classes"], rev_args.classes))
+
+    assert not mismatches, (
+        f"review.py の既定値が cli.py と食い違う（フィールド, cli値, review値）: "
+        f"{mismatches}"
+    )
+    print(
+        "  review --block/--mode/--classes 既定値 == cli 既定値 "
+        f"(block={rev_args.block}, mode={rev_args.mode}) OK"
+    )
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"{len(tests)} 件のテストを実行\n")
