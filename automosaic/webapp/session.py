@@ -101,20 +101,35 @@ class SessionCache:
 
         try:
             new_s = session_for_job(job, **overrides)
-        finally:
+        except BaseException:
+            # 構築に失敗しても、待っているスレッドは解放する。ここでは
+            # self._items を触らない（new_s が無い）ので、_items への反映と
+            # _building の解除を分けて2回ロックを取り直すと、その間隙で
+            # 「_items にまだ無い・_building ももう無い」を見た待機スレッドが
+            # 自分も構築側に回ってしまう（TOCTOU。二重構築の実測あり）。
+            # 正常系はこの隙間を作らないよう、下の1回のロックで両方を済ませる
             with self._lock:
                 self._building.pop(job.id, None)
                 ev.set()
+            raise
 
         with self._lock:
             # 設定違いで作り直された場合、古い方の動画ハンドルは必ず閉じる。
             # 構築が終わるまで古いセッションを差し替えないので、構築中も
-            # 他の要求は（overrides が空である限り）引き続き古い方を使える
+            # 他の要求は（overrides が空である限り）引き続き古い方を使える。
+            #
+            # self._items への反映と _building の解除・ev.set() を同じロック
+            # 保持区間でやる。分けると、解除後・反映前の隙間で目覚めた待機
+            # スレッドが「_items にまだ無い」「_building ももう無い」を見て
+            # 自分も構築側に回り、二重構築になる（実測: setswitchinterval
+            # 1e-6 下で500試行中320件、最大6重）。
             old = self._items.get(job.id)
             self._items[job.id] = new_s
             self._touch(job.id)
             while len(self._order) > self.limit:
                 self._close(self._order[0])
+            self._building.pop(job.id, None)
+            ev.set()
         if old is not None and old is not new_s:
             try:
                 old.reader.close()

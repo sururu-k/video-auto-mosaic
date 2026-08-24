@@ -1234,6 +1234,71 @@ def test_session_cache_build_does_not_block_other_jobs():
     )
 
 
+def test_session_cache_get_no_toctou_under_tight_switching():
+    """SessionCache.get() の _building.pop/ev.set() と self._items[job.id]=new_s の間に
+    ロック解放の隙間があると、目覚めた待機スレッドが「まだキャッシュに無い・building 印も
+    消えている」を見て自分も構築側に回り、同じジョブを二重に構築してしまう（TOCTOU）。
+
+    通常のスイッチ間隔ではまず発火しない窓なので、sys.setswitchinterval で頻繁に
+    スレッド切り替えを起こして突く。他のテストに影響しないよう、必ず元に戻す。
+    """
+    class DummyJob:
+        def __init__(self, jid: str) -> None:
+            self.id = jid
+
+    n_trials = 150
+    n_threads = 8
+    dup_trials = 0
+    max_dup = 0
+
+    orig_switch = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        for t in range(n_trials):
+            cache = session_mod.SessionCache()
+            dummy_job = DummyJob(f"toctou-{t}")
+            build_count = {"n": 0}
+            lock = threading.Lock()
+
+            def fake_build(j, **overrides):
+                with lock:
+                    build_count["n"] += 1
+                return object()
+
+            orig_build = session_mod.session_for_job
+            session_mod.session_for_job = fake_build
+            try:
+                barrier = threading.Barrier(n_threads)
+
+                def worker() -> None:
+                    barrier.wait()
+                    cache.get(dummy_job)
+
+                threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+                for th in threads:
+                    th.start()
+                for th in threads:
+                    th.join(timeout=10)
+            finally:
+                session_mod.session_for_job = orig_build
+            cache.close_all()
+
+            if build_count["n"] > 1:
+                dup_trials += 1
+                max_dup = max(max_dup, build_count["n"])
+    finally:
+        sys.setswitchinterval(orig_switch)
+
+    assert dup_trials == 0, (
+        f"SessionCache.get() が同じジョブを二重に構築した: "
+        f"{dup_trials}/{n_trials} 試行、最大 {max_dup} 重"
+    )
+    print(
+        f"  setswitchinterval(1e-6) 下 {n_trials} 試行・{n_threads} スレッドで"
+        f" 二重構築 0 件 OK"
+    )
+
+
 def test_mark_roundtrip_and_undo():
     """判定 -> 次のフレーム -> 取り消し の往復。
 
