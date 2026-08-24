@@ -620,6 +620,29 @@ def test_preflight_blocks_before_pass1_detection():
     print("  段2単独: パス1を待たせない事前確認 OK")
 
 
+def test_preflight_advice_only_for_codec_container_errors():
+    """_preflight_advice(): ffmpeg 自身が「コーデックがコンテナ非対応」と
+    言っている場合だけ字幕・添付フォントの助言を出し、それ以外の理由
+    （権限・ディスク不在など preflight が拾いうる他のエラー）には
+    付けないこと。無条件に助言を返す変異ではここで落ちる。
+    """
+    codec_err = (
+        "[mp4 @ 0x1] Could not find tag for codec subrip in stream #0, "
+        "codec not currently supported in container"
+    )
+    other_err = "[Errno 13] Permission denied: 'out.mp4'"
+
+    advice = cli._preflight_advice(codec_err)
+    assert advice != "", "コーデック非対応の理由なのに助言が出ていない"
+    assert "字幕" in advice, f"助言の中身がおかしい: {advice!r}"
+
+    assert cli._preflight_advice(other_err) == "", (
+        "コーデックと無関係な理由にまで助言を付けている"
+    )
+    assert cli._preflight_advice("") == ""
+    print("  _preflight_advice の出し分け OK")
+
+
 def test_reuse_rejects_incomplete_and_mismatched():
     """C-4: 途中保存（complete: false）と解像度違いの検出JSONを弾くこと。"""
     if not _have_ffmpeg():
