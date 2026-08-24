@@ -1,5 +1,6 @@
 """tools/pixel_coverage.py の判定ロジック。ffmpeg 不要で回る部分だけ。"""
 
+import io
 import os
 import sys
 
@@ -19,6 +20,8 @@ from pixel_coverage import (  # noqa: E402
     detect_block_size_over_frames,
     frame_is_painted,
     GtItem,
+    print_calibrate_section,
+    print_old_existence_section,
 )
 from automosaic.render import pixelize_plane  # noqa: E402
 
@@ -216,6 +219,20 @@ def test_regression_box_mask_fraction_weights_by_overlap_area():
     )
     print(f"  box_mask_fraction がセル全体でなく重なり面積で重み付けされている OK ({frac:.4f})")
 
+    # 上のケースは重なり (5,5)-(10,10) が 5x5 の正方形で、独立検証が見つけた
+    # 生存変異 MUT6b (`ow * oh` を `max(ow, oh) ** 2` に変える) が
+    # ow == oh のときは元の式と同じ値になってしまい検出できなかった。
+    # ここでは重なりを非正方 (5 x 8) にして区別する。
+    box_nonsquare = (5.0, 2.0, 20.0, 30.0)
+    # 左上セル(0,0)-(10,10)との重なりは x:[5,10) y:[2,10) = 5 x 8 = 40px^2。
+    frac_ns = box_mask_fraction(box_nonsquare, mask, cell)
+    expected_ns = (5.0 * 8.0) / (20.0 * 30.0)  # 0.0666...
+    assert abs(frac_ns - expected_ns) < 1e-9, (
+        f"非正方の重なりで面積重みが overlap 面積になっていない"
+        f"(max(ow,oh)^2 を使っている疑い、MUT6b): {frac_ns} != {expected_ns}"
+    )
+    print(f"  非正方の重なり(5x8)でも overlap 面積で重み付けされている OK ({frac_ns:.4f})")
+
 
 def test_regression_detect_block_size_picks_mode_not_min_gap():
     """`detect_block_size` は最頻の gap を取る(最小 gap ではない)。
@@ -262,6 +279,61 @@ def test_regression_naive_existence_can_diverge_from_pixel_coverage():
     assert old_existence is True, "フレームのどこかは塗られているはず"
     assert new_coverage == 0.0, f"GT box は塗られていないはずなのに被覆率 {new_coverage}"
     print(f"  旧指標=True(存在する) / 新指標=0.0(GT上には無い) の乖離を再現 OK")
+
+
+def _captured_stdout_stderr(fn, *args, **kwargs):
+    """`fn` を呼び、stdout/stderr を文字列として返す（呼び出し自体は実行する）。"""
+    out, err = io.StringIO(), io.StringIO()
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = out, err
+    try:
+        fn(*args, **kwargs)
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+    return out.getvalue(), err.getvalue()
+
+
+def test_regression_cell_mismatch_suppresses_old_metric_and_calibrate():
+    """`--cell` 省略時、実測値が理論値と食い違ったら旧指標と`--calibrate`を抑止する。
+
+    独立検証の指摘: 警告(a)〔実測値が理論値と食い違う〕は640x480の出荷既定
+    実行でも必ず発火し判別力が無いのに、旧指標は警告を出したまま走り続けて
+    未塗装フレームを「塗装あり」と誤判定していた（1080pコントロールで実測:
+    docs/12参照）。`cell_mismatch=True` のときは旧指標と`--calibrate`の
+    出力そのものを抑止し、box指標だけを出す。
+    """
+    result = {
+        "old_existence_metric_true": 999,
+        "n_gt": 999,
+        "old_existence_metric_pct": 100.0,
+    }
+
+    # 食い違いが無い場合: 旧指標の数字がそのまま出る
+    out, err = _captured_stdout_stderr(print_old_existence_section, result, False)
+    assert "999 / 999" in out, f"cell が一致するときは旧指標の数字が出るはず: {out!r}"
+    assert "抑止" not in out and "抑止" not in err
+
+    # 食い違いがある場合: 旧指標の数字が出ず、抑止の警告だけが出る
+    out, err = _captured_stdout_stderr(print_old_existence_section, result, True)
+    assert "999 / 999" not in out, (
+        f"cell_mismatch=True なのに旧指標の数字(素通し側に誤りうる)が出ている: {out!r}"
+    )
+    assert "抑止" in err, f"抑止の警告が出ていない: {err!r}"
+    print("  print_old_existence_section: cell_mismatch=True で数字を抑止 OK")
+
+    cal = {
+        "gt_frame_collapsed_cells": {"n": 999, "median": 12345},
+        "other_frame_collapsed_cells": {"n": 1, "median": 1},
+    }
+
+    # calibrate も同じ扱い
+    out, err = _captured_stdout_stderr(print_calibrate_section, cal, False)
+    assert "12345" in out, f"cell が一致するときは分布が出るはず: {out!r}"
+
+    out, err = _captured_stdout_stderr(print_calibrate_section, None, True)
+    assert "12345" not in out, f"cell_mismatch=True なのに分布(cal)が参照されている: {out!r}"
+    assert "抑止" in err, f"抑止の警告が出ていない: {err!r}"
+    print("  print_calibrate_section: cell_mismatch=True で分布を抑止 OK")
 
 
 if __name__ == "__main__":

@@ -523,6 +523,60 @@ def calibrate(
     }
 
 
+def print_old_existence_section(result: dict, cell_mismatch: bool) -> None:
+    """[旧指標] セクションの出力。`cell_mismatch` が真なら抑止する。
+
+    旧指標（`old_existence_covered` / `frame_is_painted`）は cell が実際の
+    ブロックサイズと一致しているときだけ意味を持つ。`--cell` を省略した自動
+    実測が理論値(`default_block_size`)と食い違ったときにこのまま出すと、
+    未塗装フレームを「塗装あり」と誤判定する側（素通し側）に誤る実測がある
+    （docs/12「旧指標・--calibrate・box指標は cell の誤りに対して同じ強さで
+    壊れない」参照）。呼び出し側から分離してあるのは、ffmpeg 無しでも
+    抑止の有無をテストできるようにするため。
+    """
+    if cell_mismatch:
+        print(
+            "\n[旧指標] 実測ブロックサイズが理論値と食い違ったため抑止しました。"
+            "旧指標（矩形/塗りの有無）は cell を外すと素通し側に誤る"
+            "（未塗装フレームを「塗装あり」と誤判定する。docs/12 参照）。"
+            "--cell で明示指定するか、目視で確認してからやり直すこと。",
+            file=sys.stderr,
+        )
+        return
+    print("\n[旧指標] フレームに矩形/塗りが存在するか（有無のみ）")
+    print(f"  {result['old_existence_metric_true']} / {result['n_gt']} ({result['old_existence_metric_pct']}%)")
+
+
+def print_calibrate_section(cal: dict | None, cell_mismatch: bool) -> None:
+    """[校正] セクションの出力。`cell_mismatch` が真なら抑止する。
+
+    `--calibrate` は `frame_is_painted` 相当の分布を見る機能なので、
+    `print_old_existence_section` と同じ理由・同じ壊れ方で cell の食い違いに
+    弱い。`cal` は `cell_mismatch` が真のときは使わない(None で構わない)。
+    """
+    if cell_mismatch:
+        print(
+            "\n[校正] 実測ブロックサイズが理論値と食い違ったため抑止しました。"
+            "--calibrate（frame_is_painted 相当の分布測定）は cell が実際のブロック"
+            "サイズと一致しているときだけ意味を持ち、外れると非GTフレーム側の潰れた"
+            "セル数が実際より多く出て素通し側に誤る（docs/12 参照）。"
+            "--cell で明示指定するか、目視で確認してからやり直すこと。",
+            file=sys.stderr,
+        )
+        return
+    print("\n[校正] 潰れたセル数の分布")
+    print(f"  GT フレーム    : {cal['gt_frame_collapsed_cells']}")
+    print(f"  その他(間引き) : {cal['other_frame_collapsed_cells']}")
+    print(
+        "  注意: この分布は cell が実際のブロックサイズと一致しているときだけ意味を持つ。"
+        "cell を外すと非GTフレーム側の潰れたセル数が実際より多く出て、素通し側に誤る"
+        "（docs/12「旧指標・--calibrate・box指標は cell の誤りに対して同じ強さで壊れない」"
+        "参照）。GT/非GT の分離が良く見えても、それが cell の正しさを保証しない。",
+        file=sys.stderr,
+    )
+
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -578,6 +632,7 @@ def main() -> None:
         print(f"YOLO データセットから GT {len(yolo_items)} 件（{gw}x{gh} で正規化解除）")
         gt += yolo_items
 
+    cell_mismatch = False
     if args.cell:
         cell = args.cell
     else:
@@ -607,6 +662,7 @@ def main() -> None:
                     file=sys.stderr,
                 )
             if cell != fallback:
+                cell_mismatch = True
                 print(
                     f"警告: 実測ブロックサイズ {cell}px が理論値 default_block_size="
                     f"{fallback}px と一致しません。どちらか一方が誤っている可能性がある"
@@ -627,6 +683,9 @@ def main() -> None:
     print(f"診断格子セルサイズ {cell}px  std_min={args.std_min}  ratio_max={args.ratio_max}  min_cells={args.min_cells}")
 
     if args.calibrate:
+        if cell_mismatch:
+            print_calibrate_section(None, cell_mismatch)
+            return
         gt_frames = {it.frame for it in gt}
         cal = calibrate(
             args.source,
@@ -638,16 +697,7 @@ def main() -> None:
             args.calibrate_sample_step,
             args.calibrate_limit_frames,
         )
-        print("\n[校正] 潰れたセル数の分布")
-        print(f"  GT フレーム    : {cal['gt_frame_collapsed_cells']}")
-        print(f"  その他(間引き) : {cal['other_frame_collapsed_cells']}")
-        print(
-            "  注意: この分布は cell が実際のブロックサイズと一致しているときだけ意味を持つ。"
-            "cell を外すと非GTフレーム側の潰れたセル数が実際より多く出て、素通し側に誤る"
-            "（docs/12「旧指標・--calibrate・box指標は cell の誤りに対して同じ強さで壊れない」"
-            "参照）。GT/非GT の分離が良く見えても、それが cell の正しさを保証しない。",
-            file=sys.stderr,
-        )
+        print_calibrate_section(cal, cell_mismatch)
         if args.report:
             with open(args.report, "w", encoding="utf-8") as f:
                 json.dump(cal, f, ensure_ascii=False, indent=1)
@@ -659,8 +709,7 @@ def main() -> None:
     print(f"\nGT {result['n_gt']} 件（{result['n_gt_frames']} フレーム）")
     if result["missing_frames"]:
         print(f"  警告: 動画から読めなかった GT フレーム {len(result['missing_frames'])} 件: {result['missing_frames'][:10]}")
-    print(f"\n[旧指標] フレームに矩形/塗りが存在するか（有無のみ）")
-    print(f"  {result['old_existence_metric_true']} / {result['n_gt']} ({result['old_existence_metric_pct']}%)")
+    print_old_existence_section(result, cell_mismatch)
     print(f"\n[新指標] GT矩形のうち実際に画素で塗られている割合")
     print(f"  平均被覆率            {result['mean_pixel_coverage'] * 100:.1f}%")
     print(f"  100%被覆              {result['gt_fully_covered']} / {result['n_gt']} ({result['new_pixel_metric_fully_covered_pct']}%)")
@@ -674,6 +723,13 @@ def main() -> None:
             "あります。--calibrate で分布を確認し、閾値を下げることを検討してください。",
             file=sys.stderr,
         )
+
+    result["cell_mismatch"] = cell_mismatch
+    if cell_mismatch:
+        # old_existence_metric 系は cell を外すと素通し側に誤るため、JSON 側にも
+        # 「抑止された」ことを明示する。値自体は残す（デバッグ用）が、cell_mismatch
+        # を見ずにこの値だけを読むと誤る。
+        result["old_existence_metric_suppressed"] = True
 
     if args.report:
         with open(args.report, "w", encoding="utf-8") as f:
