@@ -26,7 +26,7 @@ import math
 import sys
 from dataclasses import dataclass, field
 
-from .detector import Detection
+from .detector import CONSERVATIVE_CLASSES, DEFAULT_CLASSES, Detection
 
 try:  # scipy があれば最適割当を使う。無くても動くようにしておく
     from scipy.optimize import linear_sum_assignment as _lsa
@@ -197,6 +197,22 @@ def narrow_without_estimate_gaps(args, given: set[str]) -> None:
         )
     if kept:
         print("明示指定を優先: " + ", ".join(kept), file=sys.stderr)
+
+
+def resolve_classes(spec: str) -> set[str]:
+    """`--classes` の文字列（"default" / "conservative" / カンマ区切り）を
+    実際のクラス名集合に解決する。
+
+    cli.py の main() と review.py の session_from_args() の両方から呼ばれる
+    唯一の実装（issue #33・#56）。narrow_without_estimate_gaps() と同じ理由で
+    統合した: 2箇所に別々に書かれていると、片方だけ書き換えても壊れ方が
+    検出できない（#14 と同型の構造的リスク）。
+    """
+    if spec == "default":
+        return set(DEFAULT_CLASSES)
+    if spec == "conservative":
+        return set(CONSERVATIVE_CLASSES)
+    return {c.strip() for c in spec.split(",") if c.strip()}
 
 
 def filter_classes(

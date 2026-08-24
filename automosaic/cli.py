@@ -20,8 +20,6 @@ import numpy as np
 
 from . import __version__
 from .detector import (
-    CONSERVATIVE_CLASSES,
-    DEFAULT_CLASSES,
     Detection,
     Detector,
     available_providers,
@@ -35,6 +33,7 @@ from .temporal import (
     frames_with_mosaic_count,
     narrow_without_estimate_gaps,
     process,
+    resolve_classes,
     review_flags,
     uncovered_ranges,
 )
@@ -827,12 +826,7 @@ def main(argv: list[str] | None = None) -> int:
         print("出力が入力と同じパスです。上書きは行いません。", file=sys.stderr)
         return 1
 
-    if args.classes == "default":
-        classes = set(DEFAULT_CLASSES)
-    elif args.classes == "conservative":
-        classes = set(CONSERVATIVE_CLASSES)
-    else:
-        classes = {c.strip() for c in args.classes.split(",") if c.strip()}
+    classes = resolve_classes(args.classes)
 
     info = vid.probe(src)
 

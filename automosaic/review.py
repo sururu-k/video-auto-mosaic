@@ -42,13 +42,14 @@ import cv2
 import numpy as np
 
 from .corrections import Correction, CorrectionSet
-from .detector import CONSERVATIVE_CLASSES, DEFAULT_CLASSES, Detection
+from .detector import Detection
 from .render import apply_regions, default_block_size
 from .temporal import (
     TemporalConfig,
     estimated_only_ranges,
     narrow_without_estimate_gaps,
     process,
+    resolve_classes,
 )
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
@@ -2050,6 +2051,15 @@ def _cli_defaults() -> dict[str, object]:
     値をここに書き写すと、cli.py 側の既定が変わったときに追随できず、レビュー画面が
     焼き込みと違う設定で領域を計算する（#14）。cli.py の build_parser() を直接呼んで
     値を借りることで、既定値の唯一の正を cli.py 側に保つ。
+
+    リスク（PR #34 の検証が指摘）: この関数自体は辞書を作るだけだが、呼び出し側
+    （build_parser() の cd["--block"] のようなフラグ名引き）は .get() ではなく [] を
+    使っている。cli.py 側でそのオプションが改名・削除されると、この辞書に該当キーが
+    無くなり、呼び出し側で KeyError が飛ぶ。Web アプリは起動時に review.build_parser()
+    を呼ぶため、cli.py 側の改名・削除と review.py 側の追随が同一コミットでないと
+    Web アプリごと起動不能になる。#56 で --block / --mode をこの仕組みに乗せたことで、
+    この KeyError リスクを持つフラグは --classes と合わせて3つに増えた
+    （リスクの種類自体は元からある。増えたのは対象フラグの数）。
     """
     from . import cli as _cli
 
@@ -2169,14 +2179,6 @@ def explicit_options(argv: list[str] | None) -> set[str]:
     except SystemExit:
         return set()
     return {k for k, v in vars(parsed).items() if v is not None}
-
-
-def resolve_classes(spec: str) -> set[str]:
-    if spec == "default":
-        return set(DEFAULT_CLASSES)
-    if spec == "conservative":
-        return set(CONSERVATIVE_CLASSES)
-    return {c.strip() for c in spec.split(",") if c.strip()}
 
 
 def session_from_args(args, argv: list[str] | None = None) -> ReviewSession:
