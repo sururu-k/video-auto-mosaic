@@ -440,6 +440,84 @@ def test_render_stops_when_detections_short():
     print("  短い検出での描画停止 OK")
 
 
+def _make_video_with_subtitle(path: str, w: int, h: int, seconds: int,
+                               fps: int = 5) -> None:
+    """字幕（srt）付きの mkv を作る（issue #3 の再現手順）。"""
+    srt = path + ".srt"
+    with open(srt, "w", encoding="utf-8") as f:
+        f.write("1\n00:00:00,000 --> 00:00:01,000\ntest\n")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-y",
+                "-f", "lavfi",
+                "-i", f"testsrc2=size={w}x{h}:rate={fps}:duration={seconds}",
+                "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+                "-i", srt,
+                "-map", "0:v", "-map", "1:a", "-map", "2:s",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-c:s", "srt",
+                path,
+            ],
+            check=True,
+        )
+    finally:
+        os.remove(srt)
+
+
+def test_subtitle_mkv_to_mp4_reveals_real_reason_not_brokenpipe():
+    """issue #3: 字幕付き mkv を mp4 に出そうとすると、修正前は
+    BrokenPipeError（writer.stdin.write の例外処理なし）が本当の理由
+    （mp4 は subrip コーデックのコンテナ非対応）を隠し、0バイトの
+    出力ファイルだけが残っていた。preflight が検出・描画に入る前に
+    本当の理由つきで止め、0バイト出力を残さないことを見る。
+    """
+    if not _have_ffmpeg():
+        print("  字幕mkv->mp4 の実理由表示 SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "subbed.mkv")
+        dst = os.path.join(d, "out.mp4")
+        _make_video_with_subtitle(src, 320, 240, 2)
+
+        err = io.StringIO()
+        real_stderr, sys.stderr = sys.stderr, err
+        try:
+            rc = cli.main([src, "-o", dst, "--quiet"])
+        finally:
+            sys.stderr = real_stderr
+        msg = err.getvalue()
+        assert rc == 1, f"想定と違う終了コード: {rc}\n{msg}"
+        assert "BrokenPipeError" not in msg, (
+            f"本当の理由の代わりに例外名が出ている: {msg!r}"
+        )
+        assert "subrip" in msg, f"本当の理由（subrip 非対応）が出ていない: {msg!r}"
+        assert not os.path.exists(dst), f"0バイトの出力が残っている: {dst}"
+    print("  字幕mkv->mp4 の実理由表示 OK")
+
+
+def test_subtitle_mkv_to_mkv_still_succeeds():
+    """同じ字幕付き入力でも、出力を mkv にすれば preflight を通って
+    従来どおり焼けること（回帰確認）。"""
+    if not _have_ffmpeg():
+        print("  字幕mkv->mkv の従来動作 SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "subbed.mkv")
+        dst = os.path.join(d, "out.mkv")
+        _make_video_with_subtitle(src, 320, 240, 2)
+        det = os.path.join(d, "det.json")
+        info = vid.probe(src)
+        _write_detections(det, info.estimated_frames(), info.width, info.height)
+
+        rc = cli.main(
+            [src, "-o", dst, "--detections", det, "--reuse-detections", "--quiet"]
+        )
+        assert rc == 0, f"字幕付き mkv->mkv が失敗した（rc={rc}）"
+        assert os.path.exists(dst) and os.path.getsize(dst) > 0
+    print("  字幕mkv->mkv の従来動作 OK")
+
+
 def test_reuse_rejects_incomplete_and_mismatched():
     """C-4: 途中保存（complete: false）と解像度違いの検出JSONを弾くこと。"""
     if not _have_ffmpeg():

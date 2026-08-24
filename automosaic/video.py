@@ -420,20 +420,20 @@ def open_full_reader(
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
-def open_writer(
+def _writer_cmd(
     src_path: str,
     dst_path: str,
     info: VideoInfo,
     pix_fmt: str,
-    crf: int = 16,
-    preset: str = "slow",
-    limit_frames: int | None = None,
-) -> subprocess.Popen:
-    """rawvideo を受け取って書き出す。
+    crf: int,
+    preset: str,
+    limit_frames: int | None,
+    zero_frames: bool = False,
+) -> list[str]:
+    """本番の writer と preflight の writer、両方が同じコマンドを組み立てるための共通部。
 
-    元ファイルを2番目の入力として渡し、音声・字幕・添付・チャプタ・メタデータを
-    そこから stream copy する。これが音声無劣化・字幕保持の最も確実な方法。
-    色空間タグは rawvideo 経由で失われるので、probe で読んだ値を明示的に付け直す。
+    preflight（zero_frames=True）だけを別のコマンドで代用すると、preflight を
+    通っても本番側だけコンテナ/コーデックの組み合わせが違うということが起こりうる。
     """
     ffmpeg = _require("ffmpeg")
     cmd = [
@@ -477,7 +477,32 @@ def open_writer(
     if dst_path.lower().endswith(".mp4"):
         cmd += ["-movflags", "+faststart"]
 
+    if zero_frames:
+        # 出力尺を0にする。付けないと、映像フレームを1枚も渡していなくても
+        # 音声・字幕はコンテナの尺なりに丸ごとコピーされてしまい、preflight のはずが
+        # 長尺素材で本番同然の時間がかかる（実測で確認済み）。
+        cmd += ["-t", "0"]
+
     cmd += [dst_path]
+    return cmd
+
+
+def open_writer(
+    src_path: str,
+    dst_path: str,
+    info: VideoInfo,
+    pix_fmt: str,
+    crf: int = 16,
+    preset: str = "slow",
+    limit_frames: int | None = None,
+) -> subprocess.Popen:
+    """rawvideo を受け取って書き出す。
+
+    元ファイルを2番目の入力として渡し、音声・字幕・添付・チャプタ・メタデータを
+    そこから stream copy する。これが音声無劣化・字幕保持の最も確実な方法。
+    色空間タグは rawvideo 経由で失われるので、probe で読んだ値を明示的に付け直す。
+    """
+    cmd = _writer_cmd(src_path, dst_path, info, pix_fmt, crf, preset, limit_frames)
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -579,3 +604,37 @@ def nb_frames(path: str) -> int | None:
     プロキシとoutput.mp4のフレーム数照合はこちらを使う。
     """
     return probe(path).nb_frames
+
+
+def preflight_writer(
+    src_path: str,
+    dst_path: str,
+    info: VideoInfo,
+    pix_fmt: str,
+    crf: int = 16,
+    preset: str = "slow",
+    limit_frames: int | None = None,
+) -> tuple[bool, str]:
+    """本番と同じ writer コマンドを0フレームだけ実行し、ヘッダ書き込み時点で
+    分かる失敗（字幕・添付のコーデックがコンテナに非対応、出力先の書き込み権限
+    など）を、時間のかかる検出・描画に入る前に見つける。
+
+    limit_frames は本番の open_writer に渡すのと同じ値を渡すこと。指定の有無で
+    音声・字幕・添付をマッピングするかどうかが変わるので、揃えないと preflight が
+    本番と違う組み合わせをテストしてしまう。
+
+    stdin には何も渡さない（rawvideo は -s/-pix_fmt/-r で仕様が確定しているので
+    ffmpeg はヘッダ確定に実データを必要としない）。所要は実測 0.1 秒未満。
+    戻り値は (成功したか, stderr の生テキスト)。
+    """
+    cmd = _writer_cmd(
+        src_path, dst_path, info, pix_fmt, crf, preset, limit_frames, zero_frames=True
+    )
+    proc = subprocess.run(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    ok = proc.returncode in (0, None)
+    return ok, proc.stderr.decode("utf-8", "replace")

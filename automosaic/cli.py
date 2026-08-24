@@ -370,8 +370,8 @@ def run_render(
     writer = vid.open_writer(src, dst, info, pix_fmt, crf, preset, limit_frames)
     rerr: list[str] = []
     werr: list[str] = []
-    _drain(reader.stderr, rerr)
-    _drain(writer.stderr, werr)
+    rdrain = _drain(reader.stderr, rerr)
+    wdrain = _drain(writer.stderr, werr)
 
     total = min(n_frames, limit_frames) if limit_frames else n_frames
     prog = None if quiet else Progress(total, "パス2 描画")
@@ -380,6 +380,7 @@ def run_render(
     last_boxes: list = []
     short_from: int | None = None
     hit_short_guard = False
+    write_failed = False
     try:
         while True:
             raw = reader.stdout.read(fb.nbytes)
@@ -405,7 +406,18 @@ def run_render(
                 boxes = last_boxes
 
             apply_regions(y, u, v, boxes, block, mode=mode, ten_bit=ten_bit)
-            writer.stdin.write(fb.pack(y, u, v))
+            try:
+                writer.stdin.write(fb.pack(y, u, v))
+            except OSError:
+                # writer（ffmpeg）が既に落ちて stdin を閉じている。Windows では
+                # BrokenPipeError（Errno 32）でなく OSError（Errno 22, Invalid
+                # argument）で来ることがあるので BrokenPipeError だけでは拾えない。
+                # ここで例外を外に投げると、下の returncode/stderr 表示コードに
+                # 到達する前に落ちて、本当の理由（例: コーデックがコンテナ非対応）
+                # が隠れたまま「0バイトの出力」だけが残る（実測）。break して
+                # finally 以降の本来のエラー表示に委ねる。
+                write_failed = True
+                break
             idx += 1
             if prog:
                 prog.update(idx)
@@ -420,6 +432,12 @@ def run_render(
         except Exception:
             pass
         writer.wait()
+        # プロセスの終了と、その stderr を読み切ったかは別。wait() の直後に werr/rerr
+        # を読むと、_drain スレッドがまだ最後の数行を読んでいる途中のことがある
+        # （実測: writer.poll() は None のままでも stderr は6行溜まっていた一方、
+        # 早すぎるタイミングで読むと空だったケースがある）。join してから読む。
+        rdrain.join(timeout=2)
+        wdrain.join(timeout=2)
 
     if prog:
         prog.done(idx)
@@ -433,6 +451,16 @@ def run_render(
             f"（出力 {dst} は書き出していません）。\n"
             "  検出をやり直すか、--limit-frames での試写など未検出区間を"
             "承知のうえで描画する場合は --allow-short-detections を付けてください。"
+        )
+
+    if write_failed:
+        # writer への書き込みが失敗した時点で、real な失敗理由は werr に溜まっている
+        # はず（stderr は _drain が拾い続けている）。reader/idx の食い違いチェックより
+        # 先に、こちらを本当の理由として出す。
+        _quarantine_incomplete_output(dst)
+        raise RuntimeError(
+            "エンコードへの書き込みに失敗しました（ffmpeg が先に終了していました）:\n"
+            + "\n".join(werr[-15:])
         )
 
     # パス1（run_detection）には「デコードが途中で死んでいないか」
@@ -808,6 +836,38 @@ def main(argv: list[str] | None = None) -> int:
         print(f"          推定 {est} フレーム" if est else "          フレーム数不明")
         print(f"対象クラス {', '.join(sorted(classes))}")
         print(f"ブロック   {block} px  モード {args.mode}")
+
+    # writer が最終的に失敗する組み合わせ（字幕・添付のコーデックがコンテナに
+    # 非対応、出力先の書き込み権限が無い等）を、検出・描画に入る前に見つける。
+    # これが無いと、パス1・パス2をすべて終えたあとの writer.stdin.write() で
+    # 初めて失敗し、しかも BrokenPipeError が本当の理由（ffmpeg の stderr）を
+    # 隠したまま0バイトの出力だけが残る（issue #3、実測）。
+    # dst そのものではなく同じディレクトリの scratch ファイルに書く。dst に既存の
+    # 完成品があった場合、preflight が -y で先に潰してしまうのを避けるため
+    # （この後の検出が失敗しても、既存の dst は preflight の時点では触られない）。
+    pix_fmt = vid.detect_pix_fmt(info)
+    dst_stem, dst_ext = os.path.splitext(dst)
+    preflight_dst = f"{dst_stem}.preflight{dst_ext}"
+    try:
+        preflight_ok, preflight_err = vid.preflight_writer(
+            src, preflight_dst, info, pix_fmt, args.crf, args.preset, args.limit_frames
+        )
+    finally:
+        try:
+            if os.path.exists(preflight_dst):
+                os.remove(preflight_dst)
+        except OSError:
+            pass
+    if not preflight_ok:
+        print(
+            f"出力 {dst} を書き出せません（検出・描画に入る前の事前確認で判明しました）:\n"
+            + preflight_err.strip()
+            + "\n  字幕や添付フォントのコーデックがコンテナ非対応の可能性があります"
+            "（mkv の字幕付き動画を mp4 に出す場合など）。"
+            "拡張子を .mkv にするか、字幕を焼き込んでから試してください。",
+            file=sys.stderr,
+        )
+        return 1
 
     # ---- パス1: 検出 ----
     per_frame: dict[int, list[Detection]] = {}
