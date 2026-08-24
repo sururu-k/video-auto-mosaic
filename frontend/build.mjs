@@ -27,6 +27,7 @@ const ENTRIES = [
   { src: "src/webapp/job.tsx", out: "automosaic/webapp/static/job.js" },
   { src: "src/webapp/review.tsx", out: "automosaic/webapp/static/review.js" },
   { src: "src/webapp/draw.tsx", out: "automosaic/webapp/static/draw.js" },
+  { src: "src/framestep/framestep.tsx", out: "automosaic/webapp/static/framestep.js" },
 ];
 
 // DOM に依存しない判断と描画だけを ESM で別に出す。
@@ -39,7 +40,7 @@ const COMMON = {
   charset: "utf8",
   jsx: "automatic",
   jsxImportSource: "preact",
-  legalComments: "none",
+  legalComments: "eof",
   logLevel: "warning",
 };
 

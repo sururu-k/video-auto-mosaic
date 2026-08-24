@@ -179,6 +179,11 @@ def create_app(
         get_job(job_id)
         return page("draw.html")
 
+    @app.get("/framestep", response_class=HTMLResponse)
+    def framestep_page():
+        # ジョブに紐付かない独立した確認ビュー（issue #19）。?src= で動画 URL を渡す。
+        return page("framestep.html")
+
     @app.get("/static/{name:path}")
     def static_file(name: str):
         path = os.path.normpath(os.path.join(STATIC_DIR, name))
