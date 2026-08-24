@@ -346,17 +346,80 @@ def pid_alive(pid: int | None) -> bool:
     return True
 
 
+def process_creation_ticks(pid: int | None) -> int | None:
+    """プロセスの起動時刻を、比較にしか使わない整数値で返す。取れなければ None。
+
+    OS が pid を再利用すると、同じ pid でも実体は別プロセスになる
+    （issue #44）。pid が生きているかどうかだけでは、それが本当に
+    このジョブの処理プロセスなのか、たまたま同じ番号を割り当てられた
+    無関係な生きたプロセスなのかを区別できない。起動時刻は再利用された
+    プロセスとはまず一致しないので、記録しておいて後で照合する材料にする。
+    """
+    if not pid:
+        return None
+    if os.name == "nt":
+        import ctypes
+
+        class _FILETIME(ctypes.Structure):
+            _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return None
+        try:
+            creation = _FILETIME()
+            exit_t = _FILETIME()
+            kernel_t = _FILETIME()
+            user_t = _FILETIME()
+            ok = k32.GetProcessTimes(
+                h,
+                ctypes.byref(creation),
+                ctypes.byref(exit_t),
+                ctypes.byref(kernel_t),
+                ctypes.byref(user_t),
+            )
+            if not ok:
+                return None
+            return (creation.high << 32) | creation.low
+        finally:
+            k32.CloseHandle(h)
+    # POSIX: /proc/<pid>/stat の22番目のフィールド（システム起動からの
+    # jiffies 単位の起動時刻）。/proc の無い環境（mac 等）では取れない。
+    # 取れない場合は照合を諦め、呼び出し側は pid の生死だけで判断する
+    # 従来の挙動にとどまる（新たに拒否を増やす方向には倒さない）。
+    try:
+        with open(f"/proc/{int(pid)}/stat", encoding="ascii") as f:
+            data = f.read()
+        # comm フィールド（カッコの中）に空白や閉じ括弧が入りうるので、
+        # 最後の ")" より後ろから数える
+        after = data.rsplit(")", 1)[1].split()
+        return int(after[19])  # state から数えて22番目 = starttime
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def running_pid(job: Job) -> int | None:
     """このジョブを処理しているプロセスの pid。走っていなければ None。
 
-    走っているかどうかの唯一の根拠は meta.json の pid と、その pid が
-    実在するかどうか。サーバのメモリ上のレジストリはサーバを再起動すると
-    空になるが、サブプロセスは生き残る（RunnerRegistry.shutdown を見よ）。
-    レジストリだけを見て二重起動を弾いていると、再起動をまたいだ瞬間に
-    同じ output.mp4 へ2本が書き込む状態を作れてしまう。
+    走っているかどうかの根拠は meta.json の pid と、その pid が実在するか
+    どうか。サーバのメモリ上のレジストリはサーバを再起動すると空になるが、
+    サブプロセスは生き残る（RunnerRegistry.shutdown を見よ）。レジストリ
+    だけを見て二重起動を弾いていると、再起動をまたいだ瞬間に同じ
+    output.mp4 へ2本が書き込む状態を作れてしまう。
 
     死んだプロセスの pid には pid_alive が False を返すので、落ちたサーバの
     残骸でジョブが永久に起動できなくなることはない。
+
+    それだけでは足りない場合がある（issue #44）。元のプロセスが終了した
+    あとに OS がその pid を無関係な別プロセスへ再利用すると、pid_alive は
+    「生きている」と答え続け、そのジョブは永久に起動不能・キャンセル不能に
+    なる。meta.json に起動時刻（pid_started_ticks、JobRunner.start が記録）
+    があれば、生死だけでなく起動時刻も一致することまで確認する。一致しない
+    ものは「別プロセスに入れ替わっている」とみなして走っていない扱いにする。
+    起動時刻が記録されていない古い meta（この修正より前のジョブ）は、
+    従来どおり生死だけで判断する。
     """
     pid = job.meta.get("pid")
     if not pid:
@@ -365,7 +428,16 @@ def running_pid(job: Job) -> int | None:
         pid = int(pid)
     except (TypeError, ValueError):
         return None
-    return pid if pid_alive(pid) else None
+    if not pid_alive(pid):
+        return None
+    recorded = job.meta.get("pid_started_ticks")
+    if recorded is not None:
+        current = process_creation_ticks(pid)
+        if current is None or int(current) != int(recorded):
+            # 生きてはいるが、記録した起動時刻と一致しない = 別プロセスに
+            # 入れ替わっている（pid が再利用された）。走っていない扱いにする
+            return None
+    return pid
 
 
 def settle(job: Job) -> bool:
@@ -375,10 +447,15 @@ def settle(job: Job) -> bool:
     のに meta が running のままだと、そのジョブは二度と起動できない
     見た目になる。完成品が残っていれば「焼き上がってから落ちた」なので
     完了として扱い、無ければ中断として再開できると分かるようにする。
+
+    pid の生死だけでなく running_pid() で起動時刻の一致まで見る（issue #44）。
+    そうしないと、pid が無関係な別プロセスに再利用された場合にここが
+    「まだ実行中」と判定し続け、ジョブ一覧やジョブ画面を開いても永久に
+    running のまま固まる（UI からの回復手段が無くなる）。
     """
     if job.status not in (STATUS_RUNNING, STATUS_QUEUED):
         return False
-    if pid_alive(job.meta.get("pid")):
+    if running_pid(job) is not None:
         # 3〜4時間かかる処理を巻き戻さない。走っているものはそのままにする
         if not job.meta.get("detached"):
             job.update(detached=True)
