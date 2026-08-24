@@ -9,6 +9,7 @@ Python 側でフレームを合成し rawvideo を ffmpeg に pipe する。中�
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -394,3 +395,103 @@ def open_writer(
 
     cmd += [dst_path]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+# --------------------------------------------------------------------------
+# 確認用プロキシ動画（issue #18）
+# --------------------------------------------------------------------------
+
+#: 長辺のピクセル数。実測（30分・1920x1080素材、data/library の実ジョブ）:
+#: 640px 全Iフレームで 270MB（実測 2m15s）。現行の /frame（1枚JPEG）を
+#: 55,303枚集めると 7.2GB になるのに対し、この規模まで落ちる。
+PROXY_LONG_EDGE = 640
+PROXY_CRF = 26
+PROXY_PRESET = "veryfast"
+#: 全フレームをIフレームにする。シークのたびに直前のキーフレームまで
+#: 遡ってデコードする必要が無くなり、どのフレームへの移動も1枚のデコードで
+#: 済む（issue #18 の実測: 640px 全Iフレームの55,303フレームを 7.43秒で
+#: 全デコード = 約7,437fps）。GOPを開けるとサイズは1/3程度に縮むが、
+#: シークのたびにGOP先頭まで遡ってデコードする経路が発生する。#19
+#: （フレーム厳密なコマ送り）の土台にするため、既定は確実な全Iフレームにする。
+PROXY_GOP = 1
+
+
+def proxy_scale_filter(long_edge: int = PROXY_LONG_EDGE) -> str:
+    """プロキシ用の縮小フィルタ。縦横どちらが長辺でも long_edge に収める。
+
+    detection_scale_filter と同じ形（force_original_aspect_ratio=decrease +
+    force_divisible_by）にしてあるのは、libx264 が偶数サイズしか受けないため。
+    """
+    return (
+        f"scale=w={long_edge}:h={long_edge}"
+        ":force_original_aspect_ratio=decrease"
+        f":force_divisible_by={DETECTION_DIVISIBLE_BY}"
+        ":flags=bicubic"
+    )
+
+
+def generate_proxy(
+    src_path: str,
+    dst_path: str,
+    long_edge: int = PROXY_LONG_EDGE,
+    gop: int = PROXY_GOP,
+    crf: int = PROXY_CRF,
+    preset: str = PROXY_PRESET,
+) -> None:
+    """確認用プロキシ動画を作る。1本のffmpeg呼び出しで完結させる。
+
+    src_path には必ず焼き上がった output.mp4（モザイク済み）を渡すこと。
+    原画から作ると、モザイクをかける前のフレームがプロキシという形で
+    端末のディスクに残ってしまい、「原画を端末に残さない」という前提
+    （webapp/app.py の /frame が raw=1 のときキャッシュさせない理由と同じ）が崩れる。
+
+    h264_amf は -g 1 を受け付けない（実機で確認: Task finished with error
+    code: -22）ため、常に libx264 を使う。速度差は実測でほぼ無い。
+
+    失敗時は中間ファイル（.tmp）を残さない。中断された動画が「プロキシが
+    ある」ように見えると、シークしたときだけ壊れて気づく道具になる。
+    """
+    ffmpeg = _require("ffmpeg")
+    tmp = dst_path + ".tmp"
+    cmd = [
+        ffmpeg,
+        "-v", "error",
+        "-y",
+        "-i", src_path,
+        "-vf", proxy_scale_filter(long_edge),
+        "-an",
+        "-c:v", "libx264",
+        "-preset", preset,
+        "-crf", str(crf),
+        "-g", str(max(1, gop)),
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        # 出力先は "proxy.mp4.tmp"（拡張子が .tmp）。ffmpeg は出力形式を
+        # ファイル名の拡張子から推定するので、.tmp のままだと
+        # 「形式を選べない」で失敗する（実測）。-f で明示する
+        "-f", "mp4",
+        tmp,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True)
+    except OSError as e:
+        raise RuntimeError(f"プロキシ生成を起動できません: {e}")
+    if proc.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"プロキシ生成に失敗しました（ffmpeg 終了コード {proc.returncode}）:\n{err}")
+    os.replace(tmp, dst_path)
+
+
+def nb_frames(path: str) -> int | None:
+    """コンテナのヘッダから読めるフレーム数だけを返す（全デコードしない）。
+
+    mp4 の nb_frames はコンテナのヘッダ（stss/stsz）由来で、フルデコードせず
+    速く読める。実測（このリポジトリの実ジョブ、55,303フレーム）:
+    ヘッダ読み取りだけで 0.1秒、ffmpeg 側の全デコードで数えた値と完全一致した。
+    プロキシとoutput.mp4のフレーム数照合はこちらを使う。
+    """
+    return probe(path).nb_frames

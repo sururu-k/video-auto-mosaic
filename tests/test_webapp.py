@@ -29,8 +29,10 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from automosaic import video as video_mod  # noqa: E402
 from automosaic.corrections import Correction, CorrectionSet  # noqa: E402
 from automosaic.webapp import jobs as jobs_mod  # noqa: E402
+from automosaic.webapp import proxy as proxy_mod  # noqa: E402
 from automosaic.webapp import runner as runner_mod  # noqa: E402
 from automosaic.webapp.app import create_app  # noqa: E402
 
@@ -597,6 +599,193 @@ def test_run_and_progress_stream():
         print(f"  完成品のダウンロード OK（{len(body)} バイト）")
     finally:
         srv.close()
+
+
+def wait_proxy(srv, jid: str, timeout: float = 60.0) -> dict:
+    """プロキシの生成が終わる（done か failed になる）まで待つ。"""
+    end = time.time() + timeout
+    detail = {}
+    while time.time() < end:
+        detail = get_json(f"{srv.base}/api/jobs/{jid}?t={TOKEN}")
+        if detail.get("proxy_status") in ("done", "failed"):
+            return detail
+        time.sleep(0.1)
+    raise AssertionError(f"プロキシの生成が終わりません: {detail}")
+
+
+def test_proxy_generated_after_done_and_served_with_range():
+    """パス2完了後にプロキシが自動で作られ、Range 付きで配信されること。
+
+    issue #18 の核心である「プロキシのフレーム数が output.mp4 と一致する」を、
+    ここでは job.meta が言っている数字を信じず、ffprobe で両方を独立に数えて
+    突き合わせる。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = upload(srv.base, sample_video())
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        write_fake_detections(job, d["n_frames"], d["width"], d["height"])
+
+        # 未完了のあいだは「完成品が無い」で 404 になり、「作れなかった」と
+        # 同じ顔をしないこと
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/proxy?t={TOKEN}")
+        assert code == 404, (code, body[:200])
+
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}", {"reuse": True}
+        )
+        assert code == 200, r
+        status = wait_finished(srv, jid)
+        assert status == "done", status
+
+        detail = wait_proxy(srv, jid)
+        assert detail["proxy_status"] == "done", detail
+        assert detail["has_proxy"] is True
+        assert detail["proxy_size_bytes"] > 0
+        print(
+            f"  プロキシ生成 OK: {detail['proxy_size_bytes']} バイト"
+            f"（元 output.mp4 {detail['output_size_bytes']} バイト）"
+        )
+
+        # 実体を取得できること・mp4 として読めること
+        code, body, hdr = request(f"{srv.base}/api/jobs/{jid}/proxy?t={TOKEN}")
+        assert code == 200, code
+        assert body[4:8] == b"ftyp", "mp4 として読めない"
+        assert body == open(job.proxy, "rb").read(), "配信された中身がファイルと違う"
+
+        # Range が効くこと（/video と同じ FileResponse 経路）
+        code, partial, hdr = request(
+            f"{srv.base}/api/jobs/{jid}/proxy?t={TOKEN}",
+            headers={"Range": "bytes=0-99"},
+        )
+        assert code == 206, (code, hdr)
+        assert len(partial) == 100, len(partial)
+        assert partial == body[:100]
+
+        # フレーム数の一致を、job.meta を信じずに ffprobe で独立に検査する
+        n_output = video_mod.probe(job.output).nb_frames
+        n_proxy = video_mod.probe(job.proxy).nb_frames
+        assert n_output is not None and n_proxy is not None
+        assert n_output == n_proxy, (
+            f"output.mp4 と proxy.mp4 のフレーム数が違う: {n_output} != {n_proxy}"
+        )
+        # 全デコードでも一致することを二重に確かめる（ヘッダの nb_frames が
+        # 実体と食い違っていないか。issue #18 の完了条件そのもの）
+        def decode_count(path: str) -> int:
+            # video_mod._require と同じ解決を使う。winget 版 ffprobe は
+            # 素の PATH に無いことがあり、テストプロセス自身の PATH に
+            # 依存させると環境差で落ちる
+            ffprobe = video_mod._require("ffprobe")
+            return int(
+                subprocess.run(
+                    [
+                        ffprobe, "-v", "error", "-select_streams", "v:0",
+                        "-count_frames", "-show_entries", "stream=nb_read_frames",
+                        "-of", "default=nw=1:nk=1", path,
+                    ],
+                    capture_output=True, text=True, check=True,
+                ).stdout.strip()
+            )
+
+        assert decode_count(job.output) == decode_count(job.proxy) == n_output, (
+            "全デコードで数えたフレーム数が一致しない"
+        )
+        print(f"  フレーム数一致 OK（output={n_output} / proxy={n_proxy}、全デコードでも一致）")
+
+        # 原画からは作っていないこと（間接確認）: 解像度が長辺640に落ちている。
+        # 原画のプロキシが残っていたら「モザイク前を端末に残さない」前提が壊れる
+        proxy_info = video_mod.probe(job.proxy)
+        assert max(proxy_info.width, proxy_info.height) <= 640, proxy_info
+
+        # ジョブごと消せば一緒に消えること
+        code, _, _ = request(
+            f"{srv.base}/api/jobs/{jid}?t={TOKEN}", method="DELETE"
+        )
+        assert code == 200, code
+        assert not os.path.exists(job.proxy), "DELETE してもプロキシが残っている"
+        print("  DELETE でプロキシも一緒に消える OK")
+    finally:
+        srv.close()
+
+
+def test_proxy_frame_mismatch_is_rejected():
+    """フレーム数が1つでもずれたら「失敗」にすること（黙って公開しない）。
+
+    RULES.md 2 に従い、この検査を一時的に外すと実際に落ちることを
+    ここで確かめる: video.nb_frames を差し替えて output 側と proxy 側で
+    違う値を返させ、_run が status=failed にして proxy.mp4 を削除する
+    ことを見る。差し替えを戻せば同じジョブが今度は成功することも見て、
+    「失敗記録が残っているだけなら再試行する」ことも確かめる。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = upload(srv.base, sample_video())
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        write_fake_detections(job, d["n_frames"], d["width"], d["height"])
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}", {"reuse": True}
+        )
+        assert code == 200, r
+        assert wait_finished(srv, jid) == "done"
+        # 最初の自動生成が終わる（成功する）のを、サーバ越しに確認してから閉じる。
+        # ここを待たずに閉じると、「まだ始まってすらいない」瞬間に
+        # is_generating() を見て素通りするレースになる
+        detail = wait_proxy(srv, jid)
+        assert detail["proxy_status"] == "done", detail
+    finally:
+        srv.close()
+
+    L = jobs_mod.Library(lib)
+    job = L.get(jid)
+    assert job.meta.get("proxy", {}).get("status") == "done", job.meta.get("proxy")
+    assert os.path.exists(job.proxy)
+
+    real_nb_frames = video_mod.nb_frames
+
+    def lying_nb_frames(path: str):
+        n = real_nb_frames(path)
+        # output.mp4 に対しては本当の値、proxy.mp4 に対しては1ずらした値を返す。
+        # 「本当はズレていないのに検査が誤爆する」側を混ぜないよう、
+        # ずらすのは常にプロキシ側だけにする
+        if os.path.basename(path) == "proxy.mp4":
+            return (n or 0) + 1
+        return n
+
+    video_mod.nb_frames = lying_nb_frames
+    try:
+        # 生成し直す。既に status=done かつファイルがあるので、まず消して
+        # ensure_started が「未生成」経路を通るようにする
+        os.remove(job.proxy)
+        job.update(proxy=None)
+        proxy_mod.ensure_started(job)
+        end = time.time() + 30
+        while time.time() < end and proxy_mod.is_generating(jid):
+            time.sleep(0.1)
+        failed_job = L.get(jid)
+        p = failed_job.meta.get("proxy") or {}
+        assert p.get("status") == "failed", p
+        assert "フレーム数" in (p.get("error") or ""), p
+        assert not os.path.exists(failed_job.proxy), "失敗したのに proxy.mp4 が残っている"
+        print(f"  フレーム数不一致を検出して失敗にする OK: {p.get('error')}")
+    finally:
+        video_mod.nb_frames = real_nb_frames
+
+    # 差し替えを戻せば、同じジョブが再試行で成功すること
+    # （失敗記録が残っているだけなら ensure_started がもう一度試す）
+    retry_job = L.get(jid)
+    proxy_mod.ensure_started(retry_job)
+    end = time.time() + 30
+    while time.time() < end and proxy_mod.is_generating(jid):
+        time.sleep(0.1)
+    recovered = L.get(jid)
+    p = recovered.meta.get("proxy") or {}
+    assert p.get("status") == "done", p
+    assert os.path.exists(recovered.proxy)
+    print("  検査を元に戻すと同じジョブが再試行で成功する OK")
 
 
 def test_sse_stream_sends_snapshot():

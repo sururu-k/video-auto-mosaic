@@ -96,6 +96,11 @@ class Job:
         return self.path("output.mp4")
 
     @property
+    def proxy(self) -> str:
+        """確認用プロキシ動画（issue #18）。output.mp4 からのみ作る。"""
+        return self.path("proxy.mp4")
+
+    @property
     def detections(self) -> str:
         return self.path("det.json")
 
@@ -175,6 +180,15 @@ class Job:
         # 数字は _merge_report が meta に入れてある（レポートは読み直さない）
         d["n_uncovered_ranges"] = self.meta.get("n_uncovered_ranges")
         d["n_estimated_only_ranges"] = self.meta.get("n_estimated_only_ranges")
+        # プロキシの状態。「まだ無い」（None）と「作れなかった」（failed）を
+        # 画面が区別できるよう、has_proxy だけでなく status も別に出す。
+        p = self.meta.get("proxy") or {}
+        d["proxy_status"] = p.get("status")
+        d["proxy_error"] = p.get("error")
+        d["has_proxy"] = os.path.exists(self.proxy)
+        d["proxy_size_bytes"] = (
+            os.path.getsize(self.proxy) if os.path.exists(self.proxy) else 0
+        )
         return d
 
 
