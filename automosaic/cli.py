@@ -336,6 +336,11 @@ def run_render(
 ) -> None:
     pix_fmt = vid.detect_pix_fmt(info)
     ten_bit = pix_fmt.endswith("10le")
+    # issue #32: FrameBuffer の長さ検査は width/height の入れ替えに対して
+    # 不変なので、reader を開く前に実デコードサイズを測って突き合わせる。
+    # 食い違えば reader/writer を一切開かずに例外で止める（出力ファイルを
+    # 作らない。quarantine の必要すら無い）。
+    vid.verify_full_frame_size(info, src)
     fb = FrameBuffer(info.width, info.height, ten_bit=ten_bit)
 
     reader = vid.open_full_reader(src, pix_fmt, limit_frames)
