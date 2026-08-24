@@ -333,5 +333,27 @@ section("重ね描き: 何を描くかの分岐");
   ok(drawn === 2, "しきい値未満の検出だけ隠れる（推定は隠さない）: " + drawn);
 }
 
+// --------------------------------------------------------------------
+section("プロキシ動画の状態表示（issue #18 / job.tsx）");
+// --------------------------------------------------------------------
+{
+  // 「まだ無い」（null）と「作れなかった」（failed）を画面が区別することが
+  // 完了条件そのものなので、4状態それぞれで違う文字列が出ることを見る。
+  // 単に truthy かどうかを見るテストだと、どれも同じ文字列を返す実装でも
+  // 通ってしまうので、4値を互いに突き合わせる
+  const labels = {
+    null: L.proxyLabel(null),
+    generating: L.proxyLabel("generating"),
+    done: L.proxyLabel("done"),
+    failed: L.proxyLabel("failed"),
+  };
+  ok(labels.null === "未生成", "未生成（null）: " + labels.null);
+  ok(labels.generating === "生成中", "生成中: " + labels.generating);
+  ok(labels.done === "完成", "完成: " + labels.done);
+  ok(labels.failed === "失敗", "失敗: " + labels.failed);
+  const set = new Set(Object.values(labels));
+  ok(set.size === 4, "4状態がすべて異なる文字列になる（同じ表示にしない）");
+}
+
 console.log(fails ? `\n${count} 件中 ${fails} 件失敗` : `\n${count} 件すべて通過`);
 process.exit(fails ? 1 : 0);

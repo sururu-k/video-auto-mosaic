@@ -258,6 +258,9 @@ export interface JobSummary {
   error: string | null;
 }
 
+/** proxy.py の STATUS_*。生成を一度も始めていなければ null（キー自体は常にある） */
+export type ProxyStatus = "generating" | "done" | "failed" | null;
+
 /** Job.detail() */
 export interface JobDetail extends JobSummary {
   settings: JobSettings;
@@ -268,6 +271,12 @@ export interface JobDetail extends JobSummary {
   n_uncovered_ranges: number | null;
   /** 検出が1つも無く、補間と memory だけで塗っている区間の数。焼く前は null */
   n_estimated_only_ranges: number | null;
+  /** 確認用プロキシ動画（issue #18）の生成状態。「まだ無い」（null）と
+   *  「作れなかった」（failed）を画面が区別するためのもの */
+  proxy_status: ProxyStatus;
+  proxy_error: string | null;
+  has_proxy: boolean;
+  proxy_size_bytes: number;
 }
 
 /** GET /api/jobs/{id}。job_state() は detail に生存確認を足す */
