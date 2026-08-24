@@ -599,11 +599,16 @@ def densify(
         # 仮説の両方を外接矩形として和で覆うことで、両方向の壊れ方を避ける。
         if mem_before > 0:
             head_box, head_score = t.obs[frames[0]]
-            vx, vy = _velocity_at(t, frames, 0, look_back=False)
+            vx_short, vy_short = _velocity_at(t, frames, 0, look_back=False)
+            vx_long, vy_long = _endpoint_velocity(t, frames, at_start=True)
             for f in range(max(0, frames[0] - mem_before), frames[0]):
                 d = frames[0] - f
                 envelope = _union_box(
-                    [head_box, _shift_box(head_box, -vx * d, -vy * d)]
+                    [
+                        head_box,
+                        _shift_box(head_box, -vx_short * d, -vy_short * d),
+                        _shift_box(head_box, -vx_long * d, -vy_long * d),
+                    ]
                 )
                 per_frame[f].append(
                     Region(
@@ -618,11 +623,16 @@ def densify(
                 )
         if mem_after > 0:
             tail_box, tail_score = t.obs[frames[-1]]
-            vx, vy = _velocity_at(t, frames, len(frames) - 1, look_back=True)
+            vx_short, vy_short = _velocity_at(t, frames, len(frames) - 1, look_back=True)
+            vx_long, vy_long = _endpoint_velocity(t, frames, at_start=False)
             for f in range(frames[-1] + 1, min(n_frames, frames[-1] + mem_after + 1)):
                 d = f - frames[-1]
                 envelope = _union_box(
-                    [tail_box, _shift_box(tail_box, vx * d, vy * d)]
+                    [
+                        tail_box,
+                        _shift_box(tail_box, vx_short * d, vy_short * d),
+                        _shift_box(tail_box, vx_long * d, vy_long * d),
+                    ]
                 )
                 per_frame[f].append(
                     Region(
@@ -682,6 +692,26 @@ def _velocity_at(
         if i >= len(frames) - 1:
             return (0.0, 0.0)
         a, b = frames[i], frames[i + 1]
+    dt = b - a
+    if dt <= 0:
+        return (0.0, 0.0)
+    ca, cb = _center(track.obs[a][0]), _center(track.obs[b][0])
+    return ((cb[0] - ca[0]) / dt, (cb[1] - ca[1]) / dt)
+
+
+def _endpoint_velocity(
+    track: Track, frames: list[int], at_start: bool
+) -> tuple[float, float]:
+    """トラック端での速度ベクトル px/frame。memory 区間の外挿に使う。
+
+    端の最大3観測から求める平均速度。1点しかなければ 0（外挿せず固定）。
+    """
+    if len(frames) < 2:
+        return (0.0, 0.0)
+    if at_start:
+        a, b = frames[0], frames[min(2, len(frames) - 1)]
+    else:
+        a, b = frames[max(0, len(frames) - 3)], frames[-1]
     dt = b - a
     if dt <= 0:
         return (0.0, 0.0)
