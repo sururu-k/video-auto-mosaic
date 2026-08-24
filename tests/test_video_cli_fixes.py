@@ -518,6 +518,101 @@ def test_subtitle_mkv_to_mkv_still_succeeds():
     print("  字幕mkv->mkv の従来動作 OK")
 
 
+def test_run_render_wraps_writer_oserror_without_preflight():
+    """issue #59 検証の条件1（段1単独）: run_render() 内の
+    `writer.stdin.write` を囲む `except OSError: break` だけを守っている
+    ケースを、main() の preflight を経由せず直接見る。
+
+    preflight（main() 側、段2）と run_render の except OSError（段1）は、
+    どちらも「字幕・添付のコーデックがコンテナ非対応で writer が死ぬ」
+    という同じ症状を独立に塞いでいる。main() 経由の end-to-end テストだと
+    段2が先に止めるので、段1を単独では検証できない。ここでは
+    cli.run_render() を preflight を経由せず直接呼び、段1だけで
+    「本当の理由（subrip 非対応）」つきの RuntimeError になり、
+    生の BrokenPipeError/OSError が外に漏れないこと、0バイトの出力が
+    残らないことを見る。
+    """
+    if not _have_ffmpeg():
+        print("  段1単独: writer 途中死亡の握りつぶし SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "subbed.mkv")
+        dst = os.path.join(d, "out.mp4")
+        _make_video_with_subtitle(src, 320, 240, 2, fps=5)
+        info = vid.probe(src)
+        n_frames = info.estimated_frames() or 10
+
+        err = io.StringIO()
+        real_stderr, sys.stderr = sys.stderr, err
+        try:
+            try:
+                cli.run_render(src, dst, info, {}, n_frames, 8, "black",
+                               28, "ultrafast", None, quiet=True)
+            except RuntimeError as e:
+                msg = str(e)
+                assert "エンコードへの書き込みに失敗しました" in msg, (
+                    f"想定と違う RuntimeError: {msg!r}"
+                )
+                assert "subrip" in msg, f"本当の理由が出ていない: {msg!r}"
+            else:
+                raise AssertionError(
+                    "字幕コーデック非対応で writer が落ちるはずなのに例外にならなかった"
+                    "（環境依存の可能性があるので疑わしければ再実行して確かめること）"
+                )
+        finally:
+            sys.stderr = real_stderr
+        assert not os.path.exists(dst), f"0バイト（または尻切れ）出力が残っている: {dst}"
+    print("  段1単独: writer 途中死亡の握りつぶし OK")
+
+
+def test_preflight_blocks_before_pass1_detection():
+    """issue #59 検証の条件1（段2単独）: main() の preflight 呼び出し
+    だけを守っているケースを、パス1（検出）が呼ばれたかどうかで見分ける。
+
+    段1（run_render 内の except OSError）は生きたままにする。段2
+    （preflight）を消しても、段1が最終的に同じ「本当の理由」つき
+    RuntimeError を出すので、失敗メッセージの中身だけでは段2の有無を
+    見分けられない。ここでは run_detection（パス1）にスパイを挟み、
+    preflight が検出・描画に入る前に止めるなら一度も呼ばれないことを見る。
+    段2が無いと、時間のかかるパス1が最後まで走ってしまってから
+    段1で初めて止まる（呼ばれてしまう）。
+    """
+    if not _have_ffmpeg():
+        print("  段2単独: パス1を待たせない事前確認 SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "subbed.mkv")
+        dst = os.path.join(d, "out.mp4")
+        _make_video_with_subtitle(src, 320, 240, 2, fps=5)
+
+        calls = []
+        real_run_detection = cli.run_detection
+
+        def _spy(*a, **kw):
+            calls.append(1)
+            return real_run_detection(*a, **kw)
+
+        cli.run_detection = _spy
+        try:
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli.main([src, "-o", dst, "--quiet"])
+        finally:
+            cli.run_detection = real_run_detection
+
+        msg = err.getvalue()
+        assert rc == 1, f"想定と違う終了コード: {rc}\n{msg}"
+        assert calls == [], (
+            "preflight が字幕コーデック非対応を検出・描画に入る前に"
+            f"止められず、時間のかかるパス1（検出）に入ってしまった: {len(calls)} 回呼び出し"
+        )
+        assert "事前確認で判明しました" in msg, (
+            f"preflight 由来の停止メッセージになっていない: {msg!r}"
+        )
+        assert not os.path.exists(dst)
+    print("  段2単独: パス1を待たせない事前確認 OK")
+
+
 def test_reuse_rejects_incomplete_and_mismatched():
     """C-4: 途中保存（complete: false）と解像度違いの検出JSONを弾くこと。"""
     if not _have_ffmpeg():

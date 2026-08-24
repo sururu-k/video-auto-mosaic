@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 
@@ -343,6 +344,27 @@ def _quarantine_incomplete_output(dst: str) -> None:
         print(f"  警告: 途中までの出力の退避に失敗しました（{dst}）: {e}", file=sys.stderr)
 
 
+def _preflight_advice(err: str) -> str:
+    """preflight の失敗理由から、助言を出すかどうかを出し分ける。
+
+    issue #3 は「本当の理由が隠れる」ことそのものが問題だった。preflight の
+    どんな失敗にも同じ「字幕・添付フォントを疑え」という文言を無条件に付けると、
+    別の理由（権限・ディスク・解像度など）まで字幕のせいに見せてしまい、
+    同じ問題を別の形で繰り返す（issue #59 検証で指摘）。
+    ffmpeg 自身が「コーデックがコンテナに非対応」と言っている場合だけ助言を出す。
+    """
+    if (
+        "Could not find tag for codec" in err
+        or "codec not currently supported in container" in err
+    ):
+        return (
+            "\n  字幕や添付フォントのコーデックがコンテナ非対応の可能性があります"
+            "（mkv の字幕付き動画を mp4 に出す場合など）。"
+            "拡張子を .mkv にするか、字幕を焼き込んでから試してください。"
+        )
+    return ""
+
+
 def run_render(
     src: str,
     dst: str,
@@ -457,10 +479,15 @@ def run_render(
         # writer への書き込みが失敗した時点で、real な失敗理由は werr に溜まっている
         # はず（stderr は _drain が拾い続けている）。reader/idx の食い違いチェックより
         # 先に、こちらを本当の理由として出す。
+        # writer が returncode=0 のまま stdin だけ閉じて途中で終わることがあり、
+        # そのときは werr が空でコロンの後に何も出ない（issue #59 検証で実測）。
+        # returncode と、何フレーム目まで書けていたかを添えて診断可能にする。
         _quarantine_incomplete_output(dst)
+        detail = "\n".join(werr[-15:])
         raise RuntimeError(
-            "エンコードへの書き込みに失敗しました（ffmpeg が先に終了していました）:\n"
-            + "\n".join(werr[-15:])
+            "エンコードへの書き込みに失敗しました（ffmpeg が先に終了していました、"
+            f"returncode={writer.returncode}, {idx} フレーム目まで書き込み済み）:\n"
+            + (detail if detail else "（werr が空でした。writer の stderr に情報がありません）")
         )
 
     # パス1（run_detection）には「デコードが途中で死んでいないか」
@@ -842,32 +869,63 @@ def main(argv: list[str] | None = None) -> int:
     # これが無いと、パス1・パス2をすべて終えたあとの writer.stdin.write() で
     # 初めて失敗し、しかも BrokenPipeError が本当の理由（ffmpeg の stderr）を
     # 隠したまま0バイトの出力だけが残る（issue #3、実測）。
-    # dst そのものではなく同じディレクトリの scratch ファイルに書く。dst に既存の
-    # 完成品があった場合、preflight が -y で先に潰してしまうのを避けるため
-    # （この後の検出が失敗しても、既存の dst は preflight の時点では触られない）。
-    pix_fmt = vid.detect_pix_fmt(info)
-    dst_stem, dst_ext = os.path.splitext(dst)
-    preflight_dst = f"{dst_stem}.preflight{dst_ext}"
-    try:
-        preflight_ok, preflight_err = vid.preflight_writer(
-            src, preflight_dst, info, pix_fmt, args.crf, args.preset, args.limit_frames
-        )
-    finally:
+    #
+    # --detect-only は動画を1バイトも書かない（パス2に入らない）ので、
+    # 出力コンテナの都合で足止めする理由が無い。奇数解像度 + --detect-only
+    # を通す issue #2 の受け入れ条件と衝突するため、必ず飛ばす（#59 検証で指摘）。
+    if not args.detect_only:
+        pix_fmt = vid.detect_pix_fmt(info)
+        dst_ext = os.path.splitext(dst)[1] or ".mp4"
+        dst_dir = os.path.dirname(os.path.abspath(dst)) or "."
+        if not os.path.isdir(dst_dir):
+            print(
+                f"出力 {dst} を書き出せません（出力先ディレクトリがありません: {dst_dir}）。",
+                file=sys.stderr,
+            )
+            return 1
+        # dst そのものではなく同じディレクトリの scratch ファイルに書く。dst に
+        # 既存の完成品があった場合、preflight が -y で先に潰してしまうのを避ける
+        # ため（この後の検出が失敗しても、既存の dst は preflight の時点では
+        # 触られない）。固定名（stem+".preflight"+ext）だと、同名の既存ファイルを
+        # 黙って消したり、同一出力先への並行実行が競合したりする（#59 検証で実測）
+        # ので tempfile.mkstemp で一意な名前を取る。
         try:
-            if os.path.exists(preflight_dst):
-                os.remove(preflight_dst)
-        except OSError:
-            pass
-    if not preflight_ok:
-        print(
-            f"出力 {dst} を書き出せません（検出・描画に入る前の事前確認で判明しました）:\n"
-            + preflight_err.strip()
-            + "\n  字幕や添付フォントのコーデックがコンテナ非対応の可能性があります"
-            "（mkv の字幕付き動画を mp4 に出す場合など）。"
-            "拡張子を .mkv にするか、字幕を焼き込んでから試してください。",
-            file=sys.stderr,
-        )
-        return 1
+            fd, preflight_dst = tempfile.mkstemp(
+                suffix=dst_ext, prefix=".preflight_", dir=dst_dir
+            )
+            os.close(fd)
+        except OSError as e:
+            # e.filename には mkstemp が組み立てた scratch パスが入りうる。
+            # strerror + dst_dir だけを見せ、内部の scratch 名は出さない。
+            print(
+                f"出力 {dst} を書き出せません"
+                f"（出力先ディレクトリの準備に失敗しました: {dst_dir}）: "
+                f"{e.strerror or e}",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            preflight_ok, preflight_err = vid.preflight_writer(
+                src, preflight_dst, info, pix_fmt, args.crf, args.preset, args.limit_frames
+            )
+        finally:
+            try:
+                if os.path.exists(preflight_dst):
+                    os.remove(preflight_dst)
+            except OSError:
+                pass
+        if not preflight_ok:
+            # ffmpeg 自身の stderr には scratch パス（preflight_dst）がそのまま
+            # 出てくることがある。利用者が指定した dst に置き換えてから見せる
+            # （内部の scratch 名を漏らさない。#59 検証で指摘）。
+            shown_err = preflight_err.strip().replace(preflight_dst, dst)
+            print(
+                f"出力 {dst} を書き出せません（検出・描画に入る前の事前確認で判明しました）:\n"
+                + shown_err
+                + _preflight_advice(shown_err),
+                file=sys.stderr,
+            )
+            return 1
 
     # ---- パス1: 検出 ----
     per_frame: dict[int, list[Detection]] = {}
