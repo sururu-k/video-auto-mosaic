@@ -63,14 +63,22 @@ COV_REAL = "1"       # 実観測（検出 or 手修正）を含む
 COV_ESTIMATED = "2"  # 推定だけで覆っている
 
 # 検査キューに載せる理由。優先度が小さいほど先に見る。
-# 「推定のみ」が最優先なのは、そこだけモザイクの位置が当てずっぽうだから。
-# 「未処理」が次点。素通しは事故そのものだが、区間としては短く数も少ない。
+# 「検出破棄」が最優先なのは、despike が実観測を丸ごと捨てた帯だから。捨てた
+# フレームに他の根拠が残っていれば「被覆あり」に見えてキューの他の基準
+# （uncovered 等）に一切引っかからない。#23 の実測では despike が捨てた
+# 125件のトラックのうち 40件が実際にそのフレームを素通しにしていたが、
+# 残り85件は「別の根拠でフレームは被覆扱いだが、捨てた対象の実在は未確認」
+# のまま埋もれていた。ここを最優先にしないと、いちばん確認が要る帯が
+# 検査キューに一度も現れない。
+# 「推定のみ」がその次なのは、そこだけモザイクの位置が当てずっぽうだから。
+# 「未処理」がその次点。素通しは事故そのものだが、区間としては短く数も少ない。
 QUEUE_REASONS = {
-    "estimated": (1, "推定のみ"),
-    "uncovered": (2, "未処理"),
-    "area_jump": (3, "面積の急変"),
-    "low_conf": (4, "低信頼"),
-    "sampled": (5, "定期確認"),
+    "despiked": (1, "検出破棄"),
+    "estimated": (2, "推定のみ"),
+    "uncovered": (3, "未処理"),
+    "area_jump": (4, "面積の急変"),
+    "low_conf": (5, "低信頼"),
+    "sampled": (6, "定期確認"),
 }
 
 # 判定の種類。
@@ -859,6 +867,7 @@ def build_queue(
     n_frames: int,
     step: int = 5,
     all_frames: bool = False,
+    despiked_ranges: list | None = None,
 ) -> list[dict]:
     """見るべきフレームを、見るべき順に並べる。
 
@@ -878,6 +887,15 @@ def build_queue(
         if cur is None or QUEUE_REASONS[reason][0] < QUEUE_REASONS[cur][0]:
             picked[frame] = reason
 
+    # despike が捨てた帯。temporal.despike() の契約により、呼び出し側は
+    # これを必ず報告すること（temporal.py の despike() docstring）。捨てた
+    # フレームに他の根拠（別トラックの補間・memory）が残っていることがあり、
+    # その場合は coverage 上「被覆あり」に見えて他のどの基準にも引っかからない。
+    # 区間の長さで足切りしない理由は uncovered と同じ: 1フレームでも
+    # 実観測を丸ごと捨てているなら、それだけで確認に値する。
+    for s, e, _cls, _score in despiked_ranges or []:
+        for f in _sample_range(s, e, step):
+            add(f, "despiked")
     # 推定のみ。temporal.estimated_only_ranges() をそのまま使う。以前はここで
     # runs_of(coverage, COV_ESTIMATED, min_len=5) を自前で書いており、
     # サンプリング刻みを考慮しない固定 min_len=5 のせいで1〜4フレームの
@@ -953,6 +971,10 @@ class ReviewSession:
     lock: threading.Lock = field(init=False)
     regions: dict = field(init=False, default_factory=dict)
     stats: dict = field(init=False, default_factory=dict)
+    # despike が捨てたトラックの (start, end, class, max_score)。既定では
+    # despike 自体が無効（min_track_len=0）なので通常は空。temporal.despike()
+    # の契約上、呼び出し側はこれを必ず検査キューに反映すること
+    despiked_ranges: list = field(init=False, default_factory=list)
     coverage: str = field(init=False, default="")
     queue: list = field(init=False, default_factory=list)
     verdicts: dict = field(init=False, default_factory=dict)
@@ -987,6 +1009,7 @@ class ReviewSession:
             self.per_frame, self.n_frames, self.width, self.height, self.classes, self.cfg
         )
         stats.pop("_left_open", None)
+        self.despiked_ranges = stats.pop("_despiked_ranges", [])
         self.regions = apply_corrections(regions, self.corrections)
         self.stats = stats
 
@@ -1011,6 +1034,7 @@ class ReviewSession:
             self.n_frames,
             step=self.queue_step,
             all_frames=self.queue_all,
+            despiked_ranges=self.despiked_ranges,
         )
 
     # -- 進捗の保存 ------------------------------------------------------
@@ -1119,6 +1143,12 @@ class ReviewSession:
             ],
             "uncovered_ranges": [
                 {"start": s, "end": e, "frames": e - s + 1} for s, e in unc
+            ],
+            # despike が捨てた帯。他の根拠で被覆済みに見えることがあるので、
+            # uncovered_ranges とは別に必ず出す（temporal.despike() の契約）
+            "despiked_ranges": [
+                {"start": s, "end": e, "class": c, "max_score": sc, "frames": e - s + 1}
+                for s, e, c, sc in self.despiked_ranges
             ],
         }
 

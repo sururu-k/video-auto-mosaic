@@ -80,8 +80,9 @@ button, .tag, #imgwrap, #ov {
   background: #2b2f38;
   color: #b9c1cc;
 }
-.tag.p1 { background: #4a3d12; color: #ffd479; }   /* 推定のみ */
-.tag.p2 { background: #4a1f1d; color: #ff9b95; }   /* 未処理 */
+.tag.p1 { background: #4a1f1d; color: #ff9b95; }   /* 検出破棄 */
+.tag.p2 { background: #4a3d12; color: #ffd479; }   /* 推定のみ */
+.tag.p3 { background: #3a1f4a; color: #dd9bff; }   /* 未処理 */
 
 .save {
   flex: 0 0 auto;                 /* 詰まったときに削るのは理由タグだけにする */

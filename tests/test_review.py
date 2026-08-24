@@ -456,6 +456,36 @@ def test_build_queue_dedupes_by_priority():
     print("  キューの重複排除 OK")
 
 
+def test_build_queue_reports_despiked_ranges():
+    """despike が捨てた帯が、他の理由に一切引っかからなくてもキューに出ること。
+
+    temporal.despike() は捨てた場所を返す契約になっていて、docstring は
+    「呼び出し側はこれを必ず報告すること」と明記している。ここが抜けると、
+    despike が実観測を丸ごと捨てたのに、そのフレームが別の理由（他の対象の
+    補間など）で被覆済みに見えてキューから完全に消える。
+    """
+    cov = COV_REAL * 60  # 被覆はすべて実観測済み。他のどの基準にも引っかからない
+    despiked = [(20, 24, CLS, 0.2), (45, 45, CLS, 0.1)]
+    q = build_queue(cov, {}, 60, step=5, despiked_ranges=despiked)
+    assert [it["reason"] for it in q] == ["despiked", "despiked"], q
+    assert [it["priority"] for it in q] == [1, 1], q
+    frames = [it["frame"] for it in q]
+    assert frames == [22, 45], frames  # 5フレーム区間は中央の1枚、1枚区間はそのまま
+    print("  despike が捨てた帯の報告 OK")
+
+
+def test_build_queue_despiked_outranks_everything():
+    """検出破棄は最優先。同じフレームで他の理由と当たっても検出破棄で出ること。"""
+    cov = COV_ESTIMATED * 30
+    regions = {f: _regs((0, 0, 10, 10), 0.1, "interpolated") for f in range(30)}
+    q = build_queue(cov, regions, 30, step=5, despiked_ranges=[(10, 14, CLS, 0.1)])
+    hit = [it for it in q if it["frame"] == 12]
+    assert hit and hit[0]["reason"] == "despiked", q
+    prios = [it["priority"] for it in q]
+    assert prios == sorted(prios), "優先度の順に並んでいない"
+    print("  検出破棄が推定のみより優先されること OK")
+
+
 def test_build_queue_flags_area_jump():
     cov = COV_REAL * 40
     regions = {}
@@ -489,6 +519,51 @@ def test_session_queue_targets_estimated_ranges():
             if it["reason"] == "estimated":
                 assert s.coverage[it["frame"]] == COV_ESTIMATED
         print(f"  セッションのキュー OK（{len(s.queue)} 枚）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_session_surfaces_despiked_ranges_hidden_by_other_coverage():
+    """despike が捨てた帯が、他対象の実観測でフレームが被覆済みに見えても出ること。
+
+    track A は全編を通して塗られる実観測。frame 25 だけ、track A とは
+    重ならない別対象 track B の単発・低スコア検出があり、--despike 相当の
+    設定（min_track_len=2）ではトラック長1・スコア0.2 で丸ごと捨てられる。
+    frame 25 は track A のおかげで coverage 上は実観測扱いのままなので、
+    despiked_ranges を報告しない実装ではこのフレームはキューに一度も
+    現れない（uncovered にも low_conf にも area_jump にも当たらない）。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        n_frames = 60
+        per_frame = {f: [Detection(CLS, 0.9, (200, 200, 60, 60))] for f in range(n_frames)}
+        per_frame[25] = per_frame[25] + [Detection(CLS, 0.2, (500, 50, 40, 40))]
+        s = ReviewSession(
+            video=os.path.join(tmp, "src.mp4"),
+            rendered=None,
+            corrections_path=os.path.join(tmp, "corrections.json"),
+            width=640,
+            height=480,
+            fps=30.0,
+            n_frames=n_frames,
+            classes={CLS},
+            cfg=TemporalConfig(max_gap=12, memory=6, bridge_max=150, min_track_len=2),
+            per_frame=per_frame,
+            corrections=CorrectionSet(),
+            block=8,
+            default_size=(64, 64),
+            default_class=CLS,
+        )
+        assert s.despiked_ranges, "捨てたはずの track B が報告されていない"
+        assert any(s == e == 25 for s, e, _c, _sc in s.despiked_ranges), s.despiked_ranges
+        # frame 25 は track A のおかげで実観測扱いのまま
+        assert s.coverage[25] == COV_REAL, s.coverage[25]
+        hit = [it for it in s.queue if it["frame"] == 25]
+        assert hit, "track B を捨てたフレームがキューに一度も現れていない"
+        assert hit[0]["reason"] == "despiked", hit
+        d = s.ranges_payload()
+        assert d["despiked_ranges"], "ranges_payload に despiked_ranges が出ていない"
+        print(f"  despike で隠れた帯のキュー反映 OK（{len(s.despiked_ranges)} 件）")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
