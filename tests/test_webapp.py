@@ -30,10 +30,12 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from automosaic import video as video_mod  # noqa: E402
+from automosaic import review as review_mod  # noqa: E402
 from automosaic.corrections import Correction, CorrectionSet  # noqa: E402
 from automosaic.webapp import jobs as jobs_mod  # noqa: E402
 from automosaic.webapp import proxy as proxy_mod  # noqa: E402
 from automosaic.webapp import runner as runner_mod  # noqa: E402
+from automosaic.webapp import session as session_mod  # noqa: E402
 from automosaic.webapp.app import create_app  # noqa: E402
 
 TOKEN = "webapptesttoken"
@@ -1052,6 +1054,184 @@ def test_frame_image():
         print(f"  /frame の縮小と JPEG 化 OK（{len(body)} バイト）")
     finally:
         srv.close()
+
+
+def test_api_frame_not_blocked_by_correction_recompute():
+    """POST /corrections が recompute() で止まっている間も /frame が動くこと。
+
+    api_frame は以前 s.lock を取っていたので、手修正の保存中は
+    フレーム画像が1本も出なかった（issue #25）。実測の「初回構築 5.2秒」と
+    同じ形（重い計算の最中）を作るため、review.process を一時的に遅くする
+    （遅延の注入自体は PR #45 の TOCTOU 再現と同じ手法。ここでは実際の
+    HTTP 経由の並行アクセスで、固まらないこと・壊れた画像を返さないこと・
+    recompute 完了後は必ず新しい絵になることを確かめる）。
+    """
+    import cv2
+    import numpy as np
+    from concurrent.futures import ThreadPoolExecutor
+
+    lib = make_lib()
+    srv = Server(lib)
+    orig_process = review_mod.process
+    try:
+        d = prepared_job(lib, srv)
+        jid = d["id"]
+
+        # frame 20 は write_fake_detections が検出を置かない区間（0-9, 30-39
+        # にしか置いていない）ので、修正前は素通しの絵のはず
+        code, before, _ = request(f"{srv.base}/api/jobs/{jid}/frame?n=20&fmt=png&t={TOKEN}")
+        assert code == 200, code
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_process(*a, **kw):
+            started.set()
+            release.wait(timeout=5)
+            return orig_process(*a, **kw)
+
+        review_mod.process = slow_process
+        try:
+            result = {}
+
+            def do_post():
+                code, r = post_json(
+                    f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}",
+                    {"corrections": [
+                        {"frame": 20, "box": [40, 40, 80, 80], "class": CLS, "kind": "add"}
+                    ]},
+                )
+                result["code"] = code
+                result["body"] = r
+
+            th = threading.Thread(target=do_post)
+            t0 = time.monotonic()
+            th.start()
+            assert started.wait(timeout=5), "recompute が呼ばれなかった"
+
+            frame_times: list[float] = []
+            frame_codes: list[int] = []
+
+            def hit_frame():
+                t1 = time.monotonic()
+                code, body, _ = request(
+                    f"{srv.base}/api/jobs/{jid}/frame?n=5&fmt=png&t={TOKEN}"
+                )
+                frame_times.append(time.monotonic() - t1)
+                frame_codes.append(code)
+                img = cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR)
+                assert img is not None and img.shape[1] == 320, "壊れた画像が返った"
+
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                list(ex.map(lambda _: hit_frame(), range(10)))
+            # recompute はまだ release.wait() で足止めされている。ここまでの
+            # 経過が短ければ、/frame は recompute の完了を待たずに返っている
+            during_elapsed = time.monotonic() - t0
+
+            release.set()
+            th.join(timeout=10)
+        finally:
+            review_mod.process = orig_process
+
+        assert result.get("code") == 200, result
+        assert all(c == 200 for c in frame_codes), frame_codes
+        assert during_elapsed < 3.0, (
+            f"/frame が recompute の完了を待っている疑い: {during_elapsed:.2f}s "
+            f"(release.wait のタイムアウトは 5s)"
+        )
+        print(
+            f"  recompute 中でも /frame 10本が固まらず・壊れず返る OK"
+            f"（経過 {during_elapsed:.2f}s、個々 {min(frame_times):.3f}"
+            f"〜{max(frame_times):.3f}s）"
+        )
+
+        # recompute が完了したあとは、必ず新しい領域を反映した絵を返すこと。
+        # 「直したのに直っていない絵」を返すのは漏れる方向の壊れ方（RULES 0）
+        code, after, _ = request(f"{srv.base}/api/jobs/{jid}/frame?n=20&fmt=png&t={TOKEN}")
+        assert code == 200
+        assert after != before, "recompute 後なのに古い絵のまま"
+        print("  recompute 完了後の /frame は新しい領域を反映する OK")
+    finally:
+        review_mod.process = orig_process
+        srv.close()
+
+
+def test_session_cache_build_does_not_block_other_jobs():
+    """あるジョブのセッション構築中、無関係なジョブの get() が止まらないこと。
+
+    SessionCache.get() は元々 self._lock を構築（session_for_job、実測
+    5.2秒/32,000フレーム）の間ずっと持っていたので、無関係なジョブの
+    get() まで待たされていた（issue #25）。session_for_job を一時的に
+    遅くして、実測と同じ形の「構築中」を作る。
+    同じジョブへ同時に来た2件の get() が二重に構築しない
+    （後発が先発の完了を待って使い回す）ことも合わせて確かめる。
+    """
+    lib_dir = make_lib()
+    lib = jobs_mod.Library(lib_dir)
+
+    job_slow = lib.create("slow")
+    job_fast = lib.create("fast")
+    src = sample_video()
+    for j in (job_slow, job_fast):
+        shutil.copyfile(src, j.source)
+
+    cache = session_mod.SessionCache()
+    orig_build = session_mod.session_for_job
+    started = threading.Event()
+    release = threading.Event()
+    build_count = {"slow": 0}
+
+    def patched(job, **overrides):
+        if job.id == job_slow.id:
+            build_count["slow"] += 1
+            started.set()
+            release.wait(timeout=10)
+        return orig_build(job, **overrides)
+
+    session_mod.session_for_job = patched
+    try:
+        result: dict = {}
+
+        def get_slow():
+            result["slow"] = cache.get(job_slow)
+
+        def get_slow2():
+            result["slow2"] = cache.get(job_slow)
+
+        th = threading.Thread(target=get_slow)
+        th.start()
+        assert started.wait(timeout=10), "job_slow の構築が始まらなかった"
+
+        # 構築中に2件目の要求が来ても、二重に構築せず先発の完了を待つこと
+        th2 = threading.Thread(target=get_slow2)
+        th2.start()
+        time.sleep(0.2)  # th2 が _building の待ちに入るのを待つ
+
+        # job_slow はまだ release.wait() で止まっている。無関係な job_fast の
+        # get() がここで止まらずに返ることを確かめる
+        t1 = time.monotonic()
+        s_fast = cache.get(job_fast)
+        fast_elapsed = time.monotonic() - t1
+
+        release.set()
+        th.join(timeout=10)
+        th2.join(timeout=10)
+    finally:
+        session_mod.session_for_job = orig_build
+        cache.close_all()
+
+    assert s_fast is not None
+    assert fast_elapsed < 1.0, (
+        f"無関係なジョブの get() が構築中の別ジョブに巻き込まれて止まった: "
+        f"{fast_elapsed:.2f}s"
+    )
+    assert result.get("slow") is not None and result.get("slow2") is not None
+    assert result["slow"] is result["slow2"], "同時要求が二重に別のセッションを作った"
+    assert build_count["slow"] == 1, f"二重に構築した: {build_count['slow']} 回"
+    print(
+        f"  構築中の別ジョブが get() を止めない OK（fast側 {fast_elapsed:.3f}s）、"
+        f"同時要求は二重構築しない OK（{build_count['slow']} 回）"
+    )
 
 
 def test_mark_roundtrip_and_undo():

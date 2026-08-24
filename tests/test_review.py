@@ -17,8 +17,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
 
 import cv2
@@ -1342,6 +1344,112 @@ def test_http_frame_image_is_scaled_and_mosaicked():
         print(f"  /frame の縮小と JPEG 化 OK（640px PNG {len(full.tobytes())//1024}KB 相当 "
               f"-> 320px JPEG {len(body)//1024}KB）")
     finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_http_frame_not_blocked_by_recompute():
+    """手修正の保存中（recompute()）でも /frame が止まらないこと。
+
+    ReviewHandler._serve_frame は以前 s.lock を取っていたので、
+    /api/mark が recompute() で止まっている間は /frame が1本も返らなかった
+    （issue #25）。実測の「初回構築 5.2秒」と同じ形（重い計算の最中）を
+    作るため、review.process を一時的に遅くする（遅延の注入自体は PR #45 の
+    TOCTOU 再現と同じ手法）。固まらないこと・壊れた画像を返さないこと・
+    recompute 完了後は必ず新しい絵になることを実際の HTTP で確かめる。
+    """
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    orig_process = review.process
+    try:
+        path = os.path.join(tmp, "src.avi")
+        vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 30.0, (640, 480))
+        if not vw.isOpened():
+            print("  recompute 中の /frame の確認は飛ばします（VideoWriter を開けない）")
+            return
+        rng = np.random.default_rng(0)
+        for _ in range(60):
+            vw.write(rng.integers(0, 256, (480, 640, 3), dtype=np.uint8))
+        vw.release()
+
+        s = make_session(tmp)
+        s.video = path
+        from automosaic.review import FrameReader
+
+        s.reader = FrameReader(path)
+        tok = "testtoken1234"
+        httpd, base = _serve(s, tok)
+
+        # フレーム 30 は make_session の既定検出（0-9, 40-49）の外なので、
+        # 修正前は素通しの絵のはず
+        code, before, _ = _get(f"{base}/frame?n=30&t={tok}")
+        assert code == 200, code
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_process(*a, **kw):
+            started.set()
+            release.wait(timeout=5)
+            return orig_process(*a, **kw)
+
+        review.process = slow_process
+        try:
+            result = {}
+
+            def do_mark():
+                code, d = _post(
+                    f"{base}/api/mark?t={tok}",
+                    {"frame": 30, "verdict": "fixed", "x": 0.5, "y": 0.5, "w": 80, "h": 80},
+                )
+                result["code"] = code
+                result["body"] = d
+
+            th = threading.Thread(target=do_mark)
+            t0 = time.monotonic()
+            th.start()
+            assert started.wait(timeout=5), "recompute が呼ばれなかった"
+
+            frame_times: list[float] = []
+            frame_codes: list[int] = []
+
+            def hit_frame():
+                t1 = time.monotonic()
+                code, body, _ = _get(f"{base}/frame?n=5&t={tok}")
+                frame_times.append(time.monotonic() - t1)
+                frame_codes.append(code)
+                img = cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR)
+                assert img is not None and img.shape[1] == 640, "壊れた画像が返った"
+
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                list(ex.map(lambda _: hit_frame(), range(10)))
+            during_elapsed = time.monotonic() - t0
+
+            release.set()
+            th.join(timeout=10)
+        finally:
+            review.process = orig_process
+
+        assert result.get("code") == 200, result
+        assert all(c == 200 for c in frame_codes), frame_codes
+        assert during_elapsed < 3.0, (
+            f"/frame が recompute の完了を待っている疑い: {during_elapsed:.2f}s "
+            f"(release.wait のタイムアウトは 5s)"
+        )
+        print(
+            f"  recompute 中でも /frame 10本が固まらず・壊れず返る OK"
+            f"（経過 {during_elapsed:.2f}s、個々 {min(frame_times):.3f}"
+            f"〜{max(frame_times):.3f}s）"
+        )
+
+        code, after, _ = _get(f"{base}/frame?n=30&t={tok}")
+        assert code == 200
+        assert after != before, "recompute 後なのに古い絵のまま"
+        print("  recompute 完了後の /frame は新しい領域を反映する OK")
+    finally:
+        review.process = orig_process
         if httpd:
             httpd.shutdown()
             httpd.server_close()
