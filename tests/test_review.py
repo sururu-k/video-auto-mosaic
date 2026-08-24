@@ -82,14 +82,20 @@ def _make_tiny_video(path: str, w: int, h: int, frames: int, fps: int = 30) -> N
     )
 
 
-def make_session(tmp, per_frame=None, n_frames=60, corrections=None):
-    """実ファイル無しで組み立てたセッション。FrameReader は遅延で開くので動く。"""
+def make_session(tmp, per_frame=None, n_frames=60, corrections=None, queue_all=False):
+    """実ファイル無しで組み立てたセッション。FrameReader は遅延で開くので動く。
+
+    `queue_all=True` は既定キュー（despiked/uncovered のみ、issue #21）を
+    バイパスして全理由を積む。この既定の素材（0-9, 40-49 だけ検出）は
+    「推定のみ」帯を作るためのもので、そこを対象にした既存テストの多くが
+    queue_all を要る
+    """
     if per_frame is None:
         # 0-9 と 40-49 だけ検出。あいだは補間と memory の推定だけになる
         per_frame = {f: [] for f in range(n_frames)}
         for f in list(range(0, 10)) + list(range(40, 50)):
             per_frame[f] = [Detection(CLS, 0.8, (200, 200, 60, 60))]
-    return ReviewSession(
+    s = ReviewSession(
         video=os.path.join(tmp, "src.mp4"),
         rendered=None,
         corrections_path=os.path.join(tmp, "corrections.json"),
@@ -105,6 +111,10 @@ def make_session(tmp, per_frame=None, n_frames=60, corrections=None):
         default_size=(64, 64),
         default_class=CLS,
     )
+    if queue_all:
+        s.queue_all = True
+        s.rebuild_queue()
+    return s
 
 
 # -- Range ヘッダ --------------------------------------------------------
@@ -192,6 +202,32 @@ def test_queue_items_carry_their_boxes():
             assert "boxes" in it
             assert it["boxes"] == s.frame_regions(it["frame"])
         print("  キュー項目の矩形同梱 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_queue_payload_reports_omitted_reasons():
+    """既定キューが理由を外していることを、payload 自身が数字で示すこと。
+
+    RULES.md 0「落としたものを黙って消さない」。all_frames=False で
+    estimated/area_jump/low_conf を既定キューから外す以上、往復のたびに
+    「外れている」ことと件数が payload に出ていないと、フロントが対応する
+    前は事実上「消した」のと見分けがつかない。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)  # 既定: 推定のみの帯を含む素材
+        q = s.queue_payload()
+        assert q["omitted_by_default"], "既定キューなのに omitted_by_default が空"
+        assert q["omitted_by_default"]["estimated"] > 0, q["omitted_by_default"]
+
+        s.queue_all = True
+        s.rebuild_queue()
+        q_all = s.queue_payload()
+        assert q_all["omitted_by_default"] == {}, (
+            "all_frames=True なのに何か外れていると報告している"
+        )
+        print(f"  omitted_by_default OK（既定: {q['omitted_by_default']}）")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -495,17 +531,25 @@ def _regs(box, score=0.9, source="detected"):
 
 
 def test_build_queue_priority_order():
-    """推定のみ -> 未処理 の順に並び、区間は間引いて出ること。
+    """未処理 -> 推定のみ の順に並び、区間は間引いて出ること（all_frames=True）。
 
     ここが崩れると、いちばん怪しい区間が数百枚の後ろに沈む。
     「順に叩けば重要なところから片付く」がキュー方式の唯一の取り柄なので、
     並び順は仕様そのもの。
+
+    以前は「推定のみ」を「未処理」より上に置いていたが、実測
+    （docs/13-queue-priority-2026-08-25.md、issue #21）で「未処理」だけが
+    既知漏れ78区間を100%捕捉し「推定のみ」は0%だったため、優先度を
+    入れ替えた。all_frames=True を明示しているのは、既定（all_frames=False）
+    では「推定のみ」自体がキューから外れる（次のテストで別に確認）ため。
+    max_per_range=None は、ここで見たいのが優先度の並びであって
+    1区間あたりの間引き（別のテストで確認済み）ではないため
     """
     cov = COV_REAL * 20 + COV_ESTIMATED * 20 + COV_NONE * 5 + COV_REAL * 15
     # 「推定のみ」の判定は regions（temporal.estimated_only_ranges 経由）を見る。
     # coverage 文字列だけでは判定できないので、20-39 を推定由来の領域にしておく
     regions = {f: _regs((0.0, 0.0, 10.0, 10.0), 0.1, "interpolated") for f in range(20, 40)}
-    q = build_queue(cov, regions, 60, step=5)
+    q = build_queue(cov, regions, 60, step=5, all_frames=True, max_per_range=None)
     prios = [it["priority"] for it in q]
     assert prios == sorted(prios), "優先度の順に並んでいない"
     est = [it["frame"] for it in q if it["reason"] == "estimated"]
@@ -513,14 +557,46 @@ def test_build_queue_priority_order():
     assert est == [20, 25, 30, 35], est
     # step 以下の短い区間は中央の1枚だけ。端を取ると隣の区間が写る
     assert unc == [42], unc
+    # 未処理(2) が推定のみ(3) より前に来ること
+    unc_pos = min(i for i, it in enumerate(q) if it["reason"] == "uncovered")
+    est_pos = min(i for i, it in enumerate(q) if it["reason"] == "estimated")
+    assert unc_pos < est_pos, (unc_pos, est_pos)
     print("  キューの並びと間引き OK")
 
 
+def test_build_queue_default_excludes_low_yield_reasons():
+    """既定(all_frames=False)は despiked/uncovered だけを積み、推定のみ・面積の
+    急変・低信頼は積まないこと。
+
+    実測（docs/13）でこの3理由が既知漏れ78区間の捕捉に1件も寄与しなかった
+    一方、既定キューの体積の大半を占めていた（低信頼だけで動画の66%）。
+    ここが崩れると、また「動画のほぼ全体を指すキュー」に戻る。
+    """
+    cov = COV_ESTIMATED * 30 + COV_NONE * 5
+    regions = {f: _regs((0.0, 0.0, 10.0, 10.0), 0.1, "interpolated") for f in range(30)}
+    q_default = build_queue(cov, regions, 35, step=5, despiked_ranges=[(1, 1, CLS, 0.1)])
+    reasons = {it["reason"] for it in q_default}
+    assert reasons <= {"despiked", "uncovered"}, reasons
+    assert "estimated" not in reasons, reasons
+
+    q_all = build_queue(cov, regions, 35, step=5, all_frames=True, despiked_ranges=[(1, 1, CLS, 0.1)])
+    assert "estimated" in {it["reason"] for it in q_all}, "all_frames=True で推定のみが出ない"
+    print("  既定キューが低寄与の理由を外すこと OK")
+
+
 def test_build_queue_dedupes_by_priority():
-    """同じフレームが複数の理由に当たっても、重い理由で1回だけ出すこと。"""
+    """同じフレームが複数の理由に当たっても、重い理由で1回だけ出すこと。
+
+    max_per_range=None: この regions は低スコア(0.1)なので all_frames=True では
+    low_conf の候補にも当たる。1区間あたりの間引き(max_per_range)が候補を
+    部分的にしか拾わないと、間引きで漏れた step 点が low_conf 側に「明け渡され」
+    てしまい、dedup 自体は正しく動いていても reason が混ざって見える
+    （道具の不具合ではなく、この統合テストの前提条件の問題）。ここで見たいのは
+    dedup なので、無制限にして estimated が全 step 点を先に確保するようにする
+    """
     cov = COV_ESTIMATED * 30
     regions = {f: _regs((0, 0, 10, 10), 0.1, "interpolated") for f in range(30)}
-    q = build_queue(cov, regions, 30, step=5)
+    q = build_queue(cov, regions, 30, step=5, all_frames=True, max_per_range=None)
     frames = [it["frame"] for it in q]
     assert len(frames) == len(set(frames)), "同じフレームが二重に出ている"
     assert all(it["reason"] == "estimated" for it in q), [it["reason"] for it in q]
@@ -549,7 +625,9 @@ def test_build_queue_despiked_outranks_everything():
     """検出破棄は最優先。同じフレームで他の理由と当たっても検出破棄で出ること。"""
     cov = COV_ESTIMATED * 30
     regions = {f: _regs((0, 0, 10, 10), 0.1, "interpolated") for f in range(30)}
-    q = build_queue(cov, regions, 30, step=5, despiked_ranges=[(10, 14, CLS, 0.1)])
+    q = build_queue(
+        cov, regions, 30, step=5, all_frames=True, despiked_ranges=[(10, 14, CLS, 0.1)]
+    )
     hit = [it for it in q if it["frame"] == 12]
     assert hit and hit[0]["reason"] == "despiked", q
     prios = [it["priority"] for it in q]
@@ -558,15 +636,19 @@ def test_build_queue_despiked_outranks_everything():
 
 
 def test_build_queue_flags_area_jump():
+    """面積の急変は all_frames=True でだけキューに出ること（既定は積まない）。"""
     cov = COV_REAL * 40
     regions = {}
     for f in range(40):
         w = 100 if f < 20 else 300  # frame 20 で面積が 9 倍になる
         regions[f] = _regs((0.0, 0.0, float(w), float(w)))
-    q = build_queue(cov, regions, 40, step=5)
-    assert [it["frame"] for it in q] == [20], q
-    assert q[0]["reason"] == "area_jump"
-    print("  面積の急変の検出 OK")
+    assert build_queue(cov, regions, 40, step=5) == [], "既定キューに面積の急変が出ている"
+    # all_frames=True は sampled（定期確認）も足すので、frame 20 だけが
+    # 出ることまでは期待できない。frame 20 が area_jump として出ることだけを見る
+    q = build_queue(cov, regions, 40, step=5, all_frames=True)
+    hit = [it for it in q if it["frame"] == 20]
+    assert hit and hit[0]["reason"] == "area_jump", q
+    print("  面積の急変の検出 OK（all_frames=True でのみ）")
 
 
 def test_build_queue_all_frames():
@@ -579,17 +661,87 @@ def test_build_queue_all_frames():
     print("  全フレーム対象の指定 OK")
 
 
-def test_session_queue_targets_estimated_ranges():
+def test_build_queue_max_per_range_caps_long_range():
+    """1区間が長くても、代表フレーム数は max_per_range で頭打ちになること。
+
+    以前は step 刻みで無制限に積んでおり、実素材の最長未処理区間
+    （644フレーム）1本だけでキュー項目129件を生んでいた（docs/13）。
+    始点・終点は残る（区間の存在とおおよその範囲は伝わる）ことも確認する。
+    """
+    cov = COV_NONE * 200  # 200フレームまるごと未処理の1区間
+    q = build_queue(cov, {}, 200, step=5, max_per_range=3)
+    assert len(q) == 3, q
+    frames = sorted(it["frame"] for it in q)
+    assert frames[0] <= 2 and frames[-1] >= 197, frames  # 始点・終点付近が残る
+
+    # max_per_range=None（明示的な無制限指定）なら従来どおり step 刻みで全部積む
+    q_unlimited = build_queue(cov, {}, 200, step=5, max_per_range=None)
+    assert len(q_unlimited) == 40, len(q_unlimited)  # 200 // 5
+    print("  範囲あたりの間引き上限 OK")
+
+
+def test_session_default_caps_long_uncovered_range():
+    """ReviewSession を build_queue の引数を明示せずに組んでも、1区間あたりの
+    間引きが既定で効くこと（DEFAULT_MAX_PER_RANGE がセッションの既定値
+    queue_max_per_range に配線されているかを見る）。
+
+    直前のテストは build_queue に max_per_range=3 を明示して渡しており、
+    ReviewSession 側の既定値配線までは検証していなかった
+    （DEFAULT_MAX_PER_RANGE を None に戻す変異でも通ってしまう）。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        n_frames = 100
+        per_frame = {f: [] for f in range(n_frames)}  # 全編未処理の1区間
+        s = ReviewSession(
+            video=os.path.join(tmp, "src.mp4"),
+            rendered=None,
+            corrections_path=os.path.join(tmp, "corrections.json"),
+            width=640, height=480, fps=30.0, n_frames=n_frames,
+            classes={CLS},
+            cfg=TemporalConfig(max_gap=12, memory=6, bridge_max=150),
+            per_frame=per_frame,
+            corrections=CorrectionSet(),
+            block=8, default_size=(64, 64), default_class=CLS,
+            # queue_max_per_range は指定しない -> ReviewSession のフィールド既定値
+        )
+        # step=5 かつ無制限なら 100//5=20 件になるところ、既定の間引きで頭打ちになる
+        assert len(s.queue) <= 5, (
+            f"1区間あたりの間引きが既定で効いていない（{len(s.queue)} 件、"
+            "無制限なら20件になるはず）"
+        )
+        assert s.queue, "キューが空（未処理区間自体は検出されているべき）"
+        print(f"  セッション既定の範囲あたり間引き OK（{len(s.queue)} 件）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_session_queue_targets_confirmed_gaps_by_default():
+    """既定のキューは despiked/uncovered だけで、推定のみは all_frames=True でのみ出ること。
+
+    以前は「先頭は推定のみ」が仕様だった（実測前の直感による並び）。
+    実測（docs/13）でこの並びと既定の中身を両方入れ替えた
+    """
     tmp = tempfile.mkdtemp()
     try:
         s = make_session(tmp)
         assert s.queue, "キューが空"
-        # 先頭は推定のみ。実際に検出のあるフレームは出てこない
-        assert s.queue[0]["reason"] == "estimated"
+        # 既定は despiked/uncovered だけ。推定のみは含まれない
+        reasons = {it["reason"] for it in s.queue}
+        assert reasons <= {"despiked", "uncovered"}, reasons
+        for it in s.queue:
+            if it["reason"] == "uncovered":
+                assert s.coverage[it["frame"]] == COV_NONE
+
+        s.queue_all = True
+        s.rebuild_queue()
+        assert any(it["reason"] == "estimated" for it in s.queue), (
+            "all_frames=True にしても推定のみが出ない"
+        )
         for it in s.queue:
             if it["reason"] == "estimated":
                 assert s.coverage[it["frame"]] == COV_ESTIMATED
-        print(f"  セッションのキュー OK（{len(s.queue)} 枚）")
+        print(f"  セッションのキュー OK（既定 -> 全件切替、既定 {len(reasons)} 種類の理由）")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -691,7 +843,11 @@ def test_mark_fixed_covers_span():
 def test_undo_restores_corrections_and_verdict():
     tmp = tempfile.mkdtemp()
     try:
-        s = make_session(tmp)
+        # frame 25/30 は「推定のみ」帯。progress_payload の done 集計は
+        # self.queue に載っているフレームだけを数えるので、既定のキュー
+        # （despiked/uncovered のみ）では対象外になる。ここで見たいのは
+        # undo の往復そのものなので all_frames にしておく
+        s = make_session(tmp, queue_all=True)
         s.mark(25, "fixed", tap=(0.5, 0.5), size=(64, 64), span=2)
         s.mark(30, "ok")
         assert s.progress_payload()["done"] >= 1
@@ -884,13 +1040,15 @@ def test_progress_survives_restart():
     """
     tmp = tempfile.mkdtemp()
     try:
-        s = make_session(tmp)
+        # 既定キュー（despiked/uncovered のみ）はこの素材では1枚しか無いので
+        # 2枚目を使うには all_frames が要る。開き直す側も揃える
+        s = make_session(tmp, queue_all=True)
         target = s.queue[0]["frame"]
         s.mark(target, "ok")
         s.mark(s.queue[1]["frame"], "unsure")
         assert os.path.exists(s.progress_path)
 
-        again = make_session(tmp)
+        again = make_session(tmp, queue_all=True)
         assert again.verdicts.get(target) == "ok"
         p = again.progress_payload()
         assert p["done"] == 2 and p["counts"]["unsure"] == 1, p
@@ -1572,7 +1730,12 @@ def test_http_accepts_token_in_query_cookie_and_header():
 
 
 def test_http_queue_and_mark_roundtrip():
-    """キューを取り、判定を投げ、進捗が進み、戻せること。"""
+    """キューを取り、判定を投げ、進捗が進み、戻せること。
+
+    2枚目を使うので all=1（既定の despiked/uncovered だけだと make_session の
+    素材では1枚しか出ない。ここで見たいのはキュー/mark/undo の往復そのもの
+    であって、既定キューの中身の絞り込みではない）
+    """
     tmp = tempfile.mkdtemp()
     httpd = None
     try:
@@ -1580,7 +1743,7 @@ def test_http_queue_and_mark_roundtrip():
         tok = "testtoken1234"
         httpd, base = _serve(s, tok)
 
-        code, body, _ = _get(f"{base}/api/queue?t={tok}")
+        code, body, _ = _get(f"{base}/api/queue?t={tok}&all=1")
         assert code == 200
         q = json.loads(body)
         assert q["items"], "キューが空"
@@ -1603,7 +1766,7 @@ def test_http_queue_and_mark_roundtrip():
         assert any(r[4] == "x" for r in d["regions"]), "手修正が領域に入っていない"
 
         # 判定済みの印がキューにも載ること（続きから再開できる根拠）
-        code, body, _ = _get(f"{base}/api/queue?t={tok}")
+        code, body, _ = _get(f"{base}/api/queue?t={tok}&all=1")
         items = {it["frame"]: it["verdict"] for it in json.loads(body)["items"]}
         assert items[first] == "ok" and items[second] == "fixed"
 
@@ -1776,7 +1939,10 @@ def test_http_toobig_roundtrip():
     tmp = tempfile.mkdtemp()
     httpd = None
     try:
-        s = make_session(tmp)
+        # frame 25 は「推定のみ」帯。既定キューには載らないので progress の
+        # 集計対象にするには all_frames が要る（ここで見たいのは でかすぎる の
+        # 往復そのもので、既定キューの絞り込みではない）
+        s = make_session(tmp, queue_all=True)
         tok = "testtoken1234"
         httpd, base = _serve(s, tok)
 
@@ -2083,6 +2249,10 @@ def test_ranges_keep_short_estimated_gaps():
     見ているのはここなので、ここが見えないのがいちばん悪い。
     temporal.estimated_only_ranges() はサンプリング刻みを自動推定したうえで
     min_len=1 を効かせるので、間引きなしの素材では短い区間も残る。
+
+    「推定のみ」は issue #21 の実測（docs/13）で既定キューから外した
+    （既定は despiked/uncovered のみ）ため、キュー側の確認は all_frames=True
+    で行う。ranges_payload() 側は既定のまま（キューの絞り込みと無関係）
     """
     tmp = tempfile.mkdtemp()
     try:
@@ -2091,7 +2261,7 @@ def test_ranges_keep_short_estimated_gaps():
         # 連続検出 0-4 と 7-39。5-6 の2フレームだけが推定のみの短い区間になる
         for f in list(range(0, 5)) + list(range(7, n_frames)):
             per_frame[f] = [Detection(CLS, 0.8, (200, 200, 60, 60))]
-        s = make_session(tmp, per_frame=per_frame, n_frames=n_frames)
+        s = make_session(tmp, per_frame=per_frame, n_frames=n_frames, queue_all=True)
 
         assert s.coverage[5] == COV_ESTIMATED and s.coverage[6] == COV_ESTIMATED
         d = s.ranges_payload()

@@ -72,6 +72,7 @@ COV_REAL = "1"       # 実観測（検出 or 手修正）を含む
 COV_ESTIMATED = "2"  # 推定だけで覆っている
 
 # 検査キューに載せる理由。優先度が小さいほど先に見る。
+#
 # 「検出破棄」が最優先なのは、despike が実観測を丸ごと捨てた帯だから。捨てた
 # フレームに他の根拠が残っていれば「被覆あり」に見えてキューの他の基準
 # （uncovered 等）に一切引っかからない。#23 の実測では despike が捨てた
@@ -79,16 +80,48 @@ COV_ESTIMATED = "2"  # 推定だけで覆っている
 # 残り85件は「別の根拠でフレームは被覆扱いだが、捨てた対象の実在は未確認」
 # のまま埋もれていた。ここを最優先にしないと、いちばん確認が要る帯が
 # 検査キューに一度も現れない。
-# 「推定のみ」がその次なのは、そこだけモザイクの位置が当てずっぽうだから。
-# 「未処理」がその次点。素通しは事故そのものだが、区間としては短く数も少ない。
+#
+# 「未処理」を「推定のみ」より上にしたのは実測による（issue #21、
+# docs/13-queue-priority-2026-08-25.md）。実素材（55,303フレーム、他社が
+# 漏らした78区間の人間検証つき）で、この動画の「確実に未塗装」5,075フレーム
+# （78区間 ∩ 未処理）を、despiked と uncovered の2理由だけで**100%捕捉した**
+# のに対し、estimated / area_jump / low_conf はこの5,075フレームを
+# **1件も追加で捕捉しなかった**（0/5075）。以前の並びは「推定のみ」を
+# 「未処理」より上に置いていたが、それは処理量の重さの直感で決めた並びで、
+# 実測してみたら未処理のほうが漏れ捕捉に直結していた
+# （RULES.md 2.1「既知の基準を借りてこない。分布を測ってから決める」）。
+# estimated / area_jump / low_conf を消していない理由: 78区間データセットは
+# 「他社ツールが完全に沈黙した場所」しか測れておらず、「検出はしたが位置が
+# ズレている」「そもそも塗り忘れ以外の壊れ方」を測る物差しではない。
+# 0/5075 は「この物差しでは効かなかった」であって「無価値」ではない。
+# 落とさず優先度を下げるだけにした（RULES.md 0）。
 QUEUE_REASONS = {
     "despiked": (1, "検出破棄"),
-    "estimated": (2, "推定のみ"),
-    "uncovered": (3, "未処理"),
+    "uncovered": (2, "未処理"),
+    "estimated": (3, "推定のみ"),
     "area_jump": (4, "面積の急変"),
     "low_conf": (5, "低信頼"),
     "sampled": (6, "定期確認"),
 }
+
+# 既定のキュー（all_frames=False）に載せる理由。despiked と uncovered は
+# 実測で「確実に未塗装」を100%捕捉した2理由（上のコメント参照）。それ以外
+# （estimated / area_jump / low_conf）は既定のキューから外し、all_frames=True
+# （フロントには既に「全部見る」トグルとして配線済み。frontend/src/review/app.tsx
+# の setAllFrames）でだけ出す。理由を削除するわけではない――計算はそのまま
+# 続ける。既定表示から外すだけで、build_queue() の呼び出し側が拾えば
+# いつでも全件に戻せる。
+DEFAULT_QUEUE_REASONS = frozenset({"despiked", "uncovered"})
+
+# 1つの区間（despiked/estimated/uncovered の各レンジ）から拾う代表フレーム数の
+# 上限。以前は区間の長さに関係なく queue_step おきに全部拾っており、実素材の
+# 最長未処理区間（644フレーム = 21.5秒）1本だけで129件のキュー項目を生んでいた。
+# 始点・中点・終点の3枚あれば区間の存在とおおよその範囲は伝わり、キューの
+# 「区間追従」操作（#81）で始点と終点を指定すればあいだは埋まる。実測
+# （docs/13）では despiked+uncovered の全区間をこの上限で間引いても、
+# 「確実に未塗装」5,075フレームの捕捉率は変わらなかった（区間が1件でも
+# キューに現れれば、その区間の存在自体は見逃さないため）。
+DEFAULT_MAX_PER_RANGE = 3
 
 # 判定の種類。
 #   ok              問題なし
@@ -836,14 +869,32 @@ def _thin(frames: list[int], step: int) -> list[int]:
     return out
 
 
-def _sample_range(start: int, end: int, step: int) -> list[int]:
+def _sample_range(start: int, end: int, step: int, max_items: int | None = None) -> list[int]:
     """区間から見るフレームを選ぶ。
 
     step より短い区間は中央の1枚だけにする。端を取ると隣の区間との
     境目が写り、その区間の実態が分からない絵になる。
+
+    `max_items` を指定すると、step 刻みで拾った候補数がそれを超える場合に
+    始点と終点を必ず含む均等間隔に切り替える。長い区間ほど step 刻みの
+    候補数が線形に増え、実素材の最長未処理区間（644フレーム）1本だけで
+    129件になっていた（issue #21）。始点・終点を必ず含むのは、区間の
+    存在とおおよその範囲（どこから どこまで）を、間引いたあとも
+    確実に伝えるため。
     """
     if end - start + 1 <= step:
         return [(start + end) // 2]
+    length = end - start + 1
+    n_by_step = (length + step - 1) // step
+    if max_items and max_items >= 1 and n_by_step > max_items:
+        if max_items == 1:
+            return [(start + end) // 2]
+        picked: list[int] = []
+        for i in range(max_items):
+            f = start + round(i * (end - start) / (max_items - 1))
+            if not picked or picked[-1] != f:
+                picked.append(f)
+        return picked
     return list(range(start, end + 1, step))
 
 
@@ -877,6 +928,7 @@ def build_queue(
     step: int = 5,
     all_frames: bool = False,
     despiked_ranges: list | None = None,
+    max_per_range: int | None = DEFAULT_MAX_PER_RANGE,
 ) -> list[dict]:
     """見るべきフレームを、見るべき順に並べる。
 
@@ -885,6 +937,21 @@ def build_queue(
 
     同じフレームが複数の理由に当たることはあるので、いちばん重い理由に
     寄せて1回だけ出す。同じ絵を理由違いで2回見せるのは時間の無駄。
+
+    `all_frames=False`（既定）では DEFAULT_QUEUE_REASONS（despiked・
+    uncovered）だけを載せる。この2理由だけで、実素材の「確実に未塗装」
+    5,075フレームを100%捕捉できることを実測している
+    （docs/13-queue-priority-2026-08-25.md、issue #21）。estimated・
+    area_jump・low_conf は計算はするが既定のキューには積まない――
+    削除ではなく降格で、`all_frames=True` で全理由が出る
+    （frontend の「全部見る」トグルが既にこの引数に配線されている。
+    frontend/src/review/app.tsx setAllFrames 参照）。
+
+    `max_per_range` は despiked/estimated/uncovered の1区間あたりに積む
+    代表フレーム数の上限（既定 DEFAULT_MAX_PER_RANGE=3）。None にすると
+    従来どおり step 刻みで無制限に積む（後方互換）。長い区間1本が
+    キューの大半を占める事態を防ぐためで、区間の存在自体（始点付近・
+    終点付近が残る）は間引いても失われない。
     """
     step = max(1, int(step))
     picked: dict[int, str] = {}
@@ -896,33 +963,42 @@ def build_queue(
         if cur is None or QUEUE_REASONS[reason][0] < QUEUE_REASONS[cur][0]:
             picked[frame] = reason
 
+    def want(reason: str) -> bool:
+        return all_frames or reason in DEFAULT_QUEUE_REASONS
+
     # despike が捨てた帯。temporal.despike() の契約により、呼び出し側は
     # これを必ず報告すること（temporal.py の despike() docstring）。捨てた
     # フレームに他の根拠（別トラックの補間・memory）が残っていることがあり、
     # その場合は coverage 上「被覆あり」に見えて他のどの基準にも引っかからない。
     # 区間の長さで足切りしない理由は uncovered と同じ: 1フレームでも
     # 実観測を丸ごと捨てているなら、それだけで確認に値する。
-    for s, e, _cls, _score in despiked_ranges or []:
-        for f in _sample_range(s, e, step):
-            add(f, "despiked")
+    if want("despiked"):
+        for s, e, _cls, _score in despiked_ranges or []:
+            for f in _sample_range(s, e, step, max_per_range):
+                add(f, "despiked")
+    # 未処理は1フレームでも素通しなので、長さで足切りしない
+    if want("uncovered"):
+        for s, e in runs_of(coverage, COV_NONE, min_len=1):
+            for f in _sample_range(s, e, step, max_per_range):
+                add(f, "uncovered")
     # 推定のみ。temporal.estimated_only_ranges() をそのまま使う。以前はここで
     # runs_of(coverage, COV_ESTIMATED, min_len=5) を自前で書いており、
     # サンプリング刻みを考慮しない固定 min_len=5 のせいで1〜4フレームの
     # 推定のみ区間がまるごとキューから消えていた。あちらは実観測間隔から
     # 間引き刻みを推定したうえで min_len=1 を効かせるので、短い区間も拾える
-    for s, e, _peak in estimated_only_ranges(regions, n_frames):
-        for f in _sample_range(s, e, step):
-            add(f, "estimated")
-    # 未処理は1フレームでも素通しなので、長さで足切りしない
-    for s, e in runs_of(coverage, COV_NONE, min_len=1):
-        for f in _sample_range(s, e, step):
-            add(f, "uncovered")
+    if want("estimated"):
+        for s, e, _peak in estimated_only_ranges(regions, n_frames):
+            for f in _sample_range(s, e, step, max_per_range):
+                add(f, "estimated")
 
-    jump, low = anomaly_frames(regions, n_frames)
-    for f in _thin(jump, step):
-        add(f, "area_jump")
-    for f in _thin(low, step):
-        add(f, "low_conf")
+    if want("area_jump") or want("low_conf"):
+        jump, low = anomaly_frames(regions, n_frames)
+        if want("area_jump"):
+            for f in _thin(jump, step):
+                add(f, "area_jump")
+        if want("low_conf"):
+            for f in _thin(low, step):
+                add(f, "low_conf")
 
     if all_frames:
         for f in range(0, n_frames, step):
@@ -962,6 +1038,7 @@ class ReviewSession:
     mode: str = "pixelize"
     queue_step: int = 5
     queue_all: bool = False
+    queue_max_per_range: int | None = DEFAULT_MAX_PER_RANGE
     progress_path: str | None = None
 
     reader: FrameReader = field(init=False)
@@ -1056,6 +1133,7 @@ class ReviewSession:
             step=self.queue_step,
             all_frames=self.queue_all,
             despiked_ranges=self.despiked_ranges,
+            max_per_range=self.queue_max_per_range,
         )
 
     # -- 進捗の保存 ------------------------------------------------------
@@ -1201,6 +1279,25 @@ class ReviewSession:
             "can_undo": bool(self.history),
         }
 
+    def omitted_reason_counts(self) -> dict:
+        """既定のキュー（all_frames=False）から外れている理由の区間・件数。
+
+        削除ではなく降格であることを、往復するたびに payload 自身が示す
+        （RULES.md 0「落としたものを黙って消さない」）。件数は区間・フレーム数
+        そのもの（1区間あたりの間引き前）で、`all_frames=True` にすれば
+        すべて同じキューに戻る。all_frames=True のときは何も外していないので
+        空の辞書を返す。
+        """
+        if self.queue_all:
+            return {}
+        est = estimated_only_ranges(self.regions, self.n_frames)
+        jump, low = anomaly_frames(self.regions, self.n_frames)
+        return {
+            "estimated": len(est),
+            "area_jump": len(jump),
+            "low_conf": len(low),
+        }
+
     def queue_payload(self) -> dict:
         """キューの中身。各枚に、その場で重ねる矩形も同梱する。
 
@@ -1211,6 +1308,7 @@ class ReviewSession:
         return {
             "step": self.queue_step,
             "all_frames": self.queue_all,
+            "max_per_range": self.queue_max_per_range,
             "version": self.version,
             "n_corrections": len(self.corrections.items),
             "items": [
@@ -1222,6 +1320,11 @@ class ReviewSession:
                 for it in self.queue
             ],
             "progress": self.progress_payload(),
+            # 既定のキューから外れている理由と件数（区間ベース）。
+            # all_frames=True で見れば全部戻る。0件ではなく「無い」を返す
+            # (queue_all=True時は{})のと「降格して見えていない」({}以外)を
+            # 区別できるようにしてある
+            "omitted_by_default": self.omitted_reason_counts(),
         }
 
     def state_payload(self, light: bool = False) -> dict:
@@ -1835,6 +1938,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 if "all" in q:
                     s.queue_all = q["all"][0] not in ("0", "", "false")
                     rebuild = True
+                if "max_per_range" in q:
+                    raw = q["max_per_range"][0]
+                    try:
+                        s.queue_max_per_range = None if raw in ("0", "", "none") else max(1, int(raw))
+                        rebuild = True
+                    except ValueError:
+                        pass
                 if rebuild or not s.queue:
                     s.rebuild_queue()
                 self._send_json(s.queue_payload(), extra=self._cookie_header())
@@ -2215,7 +2325,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--queue-all",
         action="store_true",
-        help="問題のある区間だけでなく、全フレームを間隔ごとにキューへ載せる",
+        help="問題のある区間だけでなく、全フレームを間隔ごとにキューへ載せる"
+        "（estimated / area_jump / low_conf も既定のキューに含める）",
+    )
+    p.add_argument(
+        "--queue-max-per-range",
+        type=int,
+        default=DEFAULT_MAX_PER_RANGE,
+        help="1区間あたりキューに積む代表フレーム数の上限（既定 %(default)s。"
+        "0 で無制限＝従来どおり step 刻みで全部積む）",
     )
     p.add_argument(
         "--default-size",
@@ -2389,6 +2507,7 @@ def session_from_args(args, argv: list[str] | None = None) -> ReviewSession:
         mode=args.mode,
         queue_step=max(1, args.queue_step),
         queue_all=args.queue_all,
+        queue_max_per_range=None if args.queue_max_per_range in (0, None) else max(1, args.queue_max_per_range),
     )
 
 
