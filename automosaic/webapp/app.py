@@ -559,7 +559,11 @@ def create_app(
 
     @app.get("/api/jobs/{job_id}/queue")
     def api_queue(
-        job_id: str, rebuild: int = 0, step: int | None = None, all: int | None = None
+        job_id: str,
+        rebuild: int = 0,
+        step: int | None = None,
+        all: int | None = None,
+        max_per_range: int | None = None,
     ):
         job = get_job(job_id)
         s = get_session(job)
@@ -569,6 +573,10 @@ def create_app(
                 rebuild = 1
             if all is not None:
                 s.queue_all = bool(all)
+                rebuild = 1
+            if max_per_range is not None:
+                # 0 は「無制限」（review.py の CLI 引数と同じ約束）
+                s.queue_max_per_range = None if max_per_range <= 0 else max_per_range
                 rebuild = 1
             if rebuild or not s.queue:
                 s.rebuild_queue()

@@ -1604,8 +1604,10 @@ def test_false_positive_via_webapp_mark_matches_review_session():
         job = jobs_mod.Library(lib).get(jid)
 
         # progress の done/counts はキューに載った項目でしか進まないので、
-        # 実在のキュー項目から選ぶ（f=5 決め打ちだと間引きで落ちることがある）
-        q = get_json(f"{srv.base}/api/jobs/{jid}/queue?t={TOKEN}")
+        # 実在のキュー項目から選ぶ（f=5 決め打ちだと間引きで落ちることがある）。
+        # 既定キュー（despiked/uncovered のみ、issue #21）は自動領域が無い
+        # フレームだけなので、pick を試すには all=1 で領域つきの項目を拾う
+        q = get_json(f"{srv.base}/api/jobs/{jid}/queue?all=1&t={TOKEN}")
         item = next((it for it in q["items"] if it["boxes"]), None)
         assert item, "自動領域のあるキュー項目が無い"
         f = item["frame"]
