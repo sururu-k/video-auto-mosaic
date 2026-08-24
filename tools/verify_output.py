@@ -95,8 +95,9 @@ def main() -> None:
     p.add_argument(
         "--min-outside",
         type=float,
-        default=0.5,
-        help="検出のこの割合以上がモザイクの外にあれば漏れとみなす",
+        default=0.05,
+        help="検出のこの割合以上がモザイクの外にあれば漏れとみなす。"
+        "旧既定は0.5で、検出矩形の49%がモザイクの外でも報告しなかった（issue #7）",
     )
     p.add_argument("--frame-step", type=int, default=1, help="Nフレームおきに検証")
     p.add_argument("--limit-frames", type=int)
