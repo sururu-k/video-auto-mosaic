@@ -10,7 +10,16 @@
 import { render } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 
-import type { Box, Correction, CorrectionsPayload, FrameRange, StateFull, UpdatePayload } from "../shared/api.js";
+import type {
+  Box,
+  Correction,
+  CorrectionsPayload,
+  FrameRange,
+  Region,
+  RegionsResponse,
+  StateFull,
+  UpdatePayload,
+} from "../shared/api.js";
 import { drawRegionOverlay, drawTimelineBand } from "../shared/canvas-draw.js";
 import { frameFromClient } from "../shared/geom.js";
 import type { FramePoint } from "../shared/geom.js";
@@ -45,6 +54,12 @@ function App() {
   const [stillSrc, setStillSrc] = useState<string | null>(null);
   const [stillShown, setStillShown] = useState(false);
   const [resizeTick, setResizeTick] = useState(0);
+  // コマ番号 -> 矩形。起動時に動画全体ぶんを読むが、手修正のあとは
+  // 直したコマだけを差し替える（#24）。他のコマは古いままキャッシュに残す
+  // （空白にしない。手修正は stitch_tracks / bridge_uncovered を通じて
+  // 離れたコマへ波及することがあるので、見に行った時点で /api/regions から
+  // 取り直す。それまでは1手前の絵が出るだけで、実際に焼く内容には影響しない）
+  const [regionsMap, setRegionsMap] = useState<Record<string, Region[]>>({});
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
@@ -63,8 +78,12 @@ function App() {
   // クラス選択。applyPending から読むだけなので ref にも写しておく
   const clsRef = useRef("");
   clsRef.current = cls || state?.default_class || "";
+  // 現在の regionsMap の版で「取り直し済み」のコマ番号。起動直後の
+  // 全量読み込みは動画全体を検証済みとして扱い、手修正のあとは
+  // 直したコマ1つだけを残して他は「未検証」に戻す
+  const verifiedFrames = useRef<Set<number>>(new Set());
 
-  const regions = state?.regions[String(cur)] ?? [];
+  const regions = regionsMap[String(cur)] ?? [];
 
   // ----------------------------------------------------------------
   // 読み込み
@@ -75,6 +94,8 @@ function App() {
         const st = (await (await fetch(u("/api/state"))).json()) as StateFull;
         const c = (await (await fetch(u("/api/corrections"))).json()) as CorrectionsPayload;
         setState(st);
+        setRegionsMap(st.regions);
+        verifiedFrames.current = new Set(Array.from({ length: st.n_frames }, (_, i) => i));
         setSize([st.default_size[0], st.default_size[1]]);
         setCls(st.default_class);
         setCorrections(c.corrections ?? []);
@@ -83,6 +104,28 @@ function App() {
       }
     })();
   }, []);
+
+  // 表示中のコマが未検証なら、そのコマぶんだけ取り直す。手修正の直後は
+  // 直したコマ以外がすべて未検証になっているので、そこへ移動したときに効く
+  useEffect(() => {
+    if (!state) return;
+    if (verifiedFrames.current.has(cur)) return;
+    let live = true;
+    void (async () => {
+      try {
+        const d = (await (await fetch(u("/api/regions", { n: cur }))).json()) as RegionsResponse;
+        if (!live) return;
+        verifiedFrames.current.add(d.frame);
+        setRegionsMap((prev) => ({ ...prev, [String(d.frame)]: d.regions }));
+      } catch {
+        // 取れなくても致命的ではない。古い絵のまま残るだけで、次にまた
+        // このコマへ来たとき（verifiedFrames に入れていないので）再試行する
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [state, cur]);
 
   // ----------------------------------------------------------------
   // フレーム移動
@@ -223,20 +266,30 @@ function App() {
     setCorrections(items);
     setSave({ kind: "dirty", text: "保存中" });
     try {
+      const at = curRef.current;
       const res = await fetch(u("/api/corrections"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ corrections: items }),
+        // frame を渡すと、応答の regions は表示中のこのコマぶんだけになる
+        // （#24）。矩形を1個置くたびに動画全体の領域マップが往復していたのが
+        // 元の壊れ方で、1時間の動画で10MBを超えていた
+        body: JSON.stringify({ corrections: items, frame: at }),
       });
       if (!res.ok) throw new Error(await res.text());
       const d = (await res.json()) as UpdatePayload;
-      // 手修正は実観測扱いなので、帯の色も推定のみ区間も変わる。丸ごと差し替える
+      // 手修正は実観測扱いなので、帯の色も推定のみ区間も変わる。
+      // regions は表示中のコマぶんだけ届く。手修正は stitch_tracks /
+      // bridge_uncovered を通じて離れたコマへも波及しうるので、それ以外の
+      // コマは「未検証」に戻し、実際にそこへ移動したときに取り直させる
+      // （空白にはしない。取り直すまでは1手前の絵が残るだけ）
+      verifiedFrames.current = new Set([at]);
+      setRegionsMap((prev) => ({ ...prev, ...d.regions }));
       setState((prev) =>
         prev
           ? {
               ...prev,
               coverage: d.coverage,
-              regions: d.regions,
+              version: d.version,
               estimated_only_ranges: d.estimated_only_ranges,
               uncovered_ranges: d.uncovered_ranges,
             }

@@ -1095,6 +1095,17 @@ class ReviewSession:
                 out[str(f)] = self.frame_regions(f)
         return out
 
+    def frame_regions_payload(self, n: int) -> dict:
+        """1コマぶんだけの矩形（#24）。
+
+        タイムライン画面（frontend/src/timeline/timeline.tsx）は同時に
+        1コマぶんの絵しか描かない（shared/canvas-draw.ts の
+        drawRegionOverlay 参照）。regions_payload() は動画全体を積むので
+        1時間の動画で10MBを超える。表示中のコマぶんだけ返せば足りる。
+        """
+        n = max(0, min(self.n_frames - 1, int(n)))
+        return {"frame": n, "version": self.version, "regions": self.frame_regions(n)}
+
     def ranges_payload(self) -> dict:
         # ブラウザの「推定のみの区間」リストと G（次の推定のみ区間）キーが
         # 見るのはここ。build_queue と同じ理由で、自前の min_len=5 固定をやめ
@@ -1180,15 +1191,27 @@ class ReviewSession:
             d.update(self.ranges_payload())
         return d
 
-    def update_payload(self) -> dict:
-        """修正を保存したあとに返す差分。state 全体より軽い。"""
+    def update_payload(self, frame: int | None = None) -> dict:
+        """修正を保存したあとに返す差分。state 全体より軽い。
+
+        frame を渡すと、regions はそのコマぶんだけになる（#24）。
+        タイムライン画面は矩形を1個置く・消す・戻すたびにここへ来るが、
+        描き直すのは表示中の1コマだけなので、動画全体の領域マップを
+        往復させる理由が無い（1時間の動画で10MB超。queue_payload() の
+        コメントと同じ実測）。frame を渡さない呼び出し元には、これまでどおり
+        全フレームぶんを返す（後方互換。webapp 側の /corrections など）。
+        """
         d = {
             "ok": True,
             "coverage": self.coverage,
-            "regions": self.regions_payload(),
             "version": self.version,
             "n_corrections": len(self.corrections.items),
         }
+        if frame is None:
+            d["regions"] = self.regions_payload()
+        else:
+            frame = max(0, min(self.n_frames - 1, int(frame)))
+            d["regions"] = {str(frame): self.frame_regions(frame)}
         d.update(self.ranges_payload())
         return d
 
@@ -1630,6 +1653,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
             light = (q.get("light") or ["0"])[0] not in ("0", "", "false")
             with s.lock:
                 self._send_json(s.state_payload(light), extra=self._cookie_header())
+        elif u.path == "/api/regions":
+            # タイムライン画面が表示中の1コマぶんだけ取りに来る経路（#24）。
+            # 修正のたびに動画全体の regions を積む代わりに、画面はここで
+            # 1コマぶんだけ取り直す
+            try:
+                n = int((q.get("n") or ["0"])[0])
+            except ValueError:
+                self._error(400, "n が数値ではありません")
+                return
+            with s.lock:
+                self._send_json(s.frame_regions_payload(n), extra=self._cookie_header())
         elif u.path == "/api/queue":
             rebuild = (q.get("rebuild") or ["0"])[0] not in ("0", "", "false")
             with s.lock:
@@ -1692,6 +1726,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if not isinstance(items, list):
                 self._error(400, "corrections（配列）が本文にありません")
                 return
+            # frame は任意（#24）。画面が「いま表示しているコマ」を教えてくれた
+            # ときだけ、そのコマぶんの regions に絞って返す。省略時は従来どおり
+            # 全フレームぶん（後方互換）
+            frame_arg: int | None = None
+            if "frame" in data:
+                try:
+                    frame_arg = int(data["frame"])
+                except (TypeError, ValueError):
+                    frame_arg = None
             try:
                 with s.lock:
                     s.set_corrections(items)
@@ -1699,7 +1742,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     # セッションを開き直した瞬間に .progress.json から古い履歴が
                     # 生き返り、次の undo が無関係な修正を末尾から削る（W-1）
                     s.save_progress()
-                    payload = s.update_payload()
+                    payload = s.update_payload(frame_arg)
             except Exception as e:  # noqa: BLE001
                 self._error(400, f"修正を適用できません: {e}")
                 return
