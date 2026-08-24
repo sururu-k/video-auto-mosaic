@@ -15,6 +15,9 @@
 import { render } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 
+import { dispatchKey, FRAMESTEP_KEYS, helpRows } from "../shared/keymap.js";
+import type { KeyLike } from "../shared/keymap.js";
+import { nextShuttleSpeed } from "../shared/shuttle.js";
 import { FrameStepPlayer, webCodecsSupported } from "./player.js";
 import type { FrameStepPlayerInfo } from "./player.js";
 
@@ -22,6 +25,10 @@ type LoadState =
   | { kind: "loading" }
   | { kind: "ready"; info: FrameStepPlayerInfo }
   | { kind: "error"; message: string };
+
+// Shift+← / Shift+→（大きく飛ぶ）のジャンプ幅。固定値（issue #79。timeline と揃えた）
+const JUMP_STEP = 10;
+const SHUTTLE_TICK_MS = 120;
 
 function App() {
   const params = new URLSearchParams(location.search);
@@ -34,12 +41,21 @@ function App() {
   const [playing, setPlaying] = useState(false);
   const [frameInput, setFrameInput] = useState("0");
   const [busy, setBusy] = useState(false);
+  // 「押したのに何も起きない」を避けるための案内（issue #79）。
+  // 再生できない状態（索引作成中・エラー）で Space / J / K / L を押したときに出す
+  const [notice, setNotice] = useState("");
+  const [helpOpen, setHelpOpen] = useState(false);
 
   const playerRef = useRef<FrameStepPlayer | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const curRef = useRef(0);
   const playingRef = useRef(false);
   const playTimer = useRef<number | null>(null);
+  // シャトル（J/K/L）。Space の等速再生とは別の仕組みにしてある。
+  // 逆再生は setInterval で1コマずつ戻すしかなく、Space 側の
+  // 「fps ぴったりの間隔で+1」という設計とは要件が違うため
+  const shuttleSpeed = useRef(0);
+  const shuttleTimer = useRef<number | null>(null);
 
   useEffect(() => {
     curRef.current = cur;
@@ -102,8 +118,17 @@ function App() {
     setPlaying(false);
   }
 
+  function stopShuttle() {
+    shuttleSpeed.current = 0;
+    if (shuttleTimer.current !== null) {
+      window.clearInterval(shuttleTimer.current);
+      shuttleTimer.current = null;
+    }
+  }
+
   function togglePlay() {
     if (state.kind !== "ready") return;
+    stopShuttle();
     if (playingRef.current) {
       stopPlay();
       return;
@@ -120,20 +145,89 @@ function App() {
     }, intervalMs);
   }
 
-  useEffect(() => () => stopPlay(), []);
+  /** J/K/L のシャトル。dir=0（K）は常に停止 */
+  function shuttle(dir: -1 | 0 | 1) {
+    if (state.kind !== "ready") {
+      setNotice(
+        state.kind === "loading"
+          ? "索引を作成中です。読み込みが終わってから動かせます"
+          : "この動画は読み込みに失敗しています",
+      );
+      return;
+    }
+    setNotice("");
+    stopPlay();
+    const total = state.info.frameCount;
+    const next = nextShuttleSpeed(shuttleSpeed.current, dir);
+    shuttleSpeed.current = next;
+    if (next === 0) {
+      stopShuttle();
+      return;
+    }
+    if (shuttleTimer.current !== null) return; // 既に回っている。速度だけ変わる
+    shuttleTimer.current = window.setInterval(() => {
+      const before = curRef.current;
+      const n = Math.max(0, Math.min(total - 1, before + shuttleSpeed.current));
+      if (n === before) {
+        stopShuttle();
+        return;
+      }
+      void draw(n);
+    }, SHUTTLE_TICK_MS);
+  }
+
+  useEffect(() => () => { stopPlay(); stopShuttle(); }, []);
+
+  /** 「できない」ことが分かるようにしてから、条件を満たせば n へ動かす */
+  function stepTo(n: number) {
+    if (state.kind !== "ready") {
+      setNotice(
+        state.kind === "loading"
+          ? "索引を作成中です。読み込みが終わってから動かせます"
+          : "この動画は読み込みに失敗しています",
+      );
+      return;
+    }
+    setNotice("");
+    stopPlay();
+    stopShuttle();
+    void draw(Math.max(0, Math.min(state.info.frameCount - 1, n)));
+  }
 
   function onKey(e: KeyboardEvent) {
-    if (state.kind !== "ready") return;
-    if (e.key === " ") {
-      e.preventDefault();
-      togglePlay();
-    } else if (e.key === "," || e.key === "ArrowLeft") {
-      stopPlay();
-      void draw(Math.max(0, curRef.current - 1));
-    } else if (e.key === "." || e.key === "ArrowRight") {
-      stopPlay();
-      void draw(Math.min(state.info.frameCount - 1, curRef.current + 1));
-    }
+    const t = e.target as HTMLElement | null;
+    const like: KeyLike = {
+      key: e.key,
+      shiftKey: e.shiftKey,
+      targetTag: t?.tagName ?? null,
+      targetEditable: !!t?.isContentEditable,
+    };
+    const handled = dispatchKey(FRAMESTEP_KEYS, like, {
+      stepBack: () => stepTo(curRef.current - 1),
+      stepForward: () => stepTo(curRef.current + 1),
+      jumpBack: () => stepTo(curRef.current - JUMP_STEP),
+      jumpForward: () => stepTo(curRef.current + JUMP_STEP),
+      playToggle: () => {
+        if (shuttleSpeed.current !== 0) { stopShuttle(); return; }
+        if (state.kind !== "ready") {
+          setNotice(
+            state.kind === "loading"
+              ? "索引を作成中です。読み込みが終わってから再生できます"
+              : "この動画は読み込みに失敗しています",
+          );
+          return;
+        }
+        setNotice("");
+        togglePlay();
+      },
+      goHome: () => stepTo(0),
+      goEnd: () => stepTo(state.kind === "ready" ? state.info.frameCount - 1 : 0),
+      shuttleReverse: () => shuttle(-1),
+      shuttleStop: () => shuttle(0),
+      shuttleForward: () => shuttle(1),
+      help: () => setHelpOpen((v) => !v),
+    });
+    if (handled) e.preventDefault();
   }
 
   useEffect(() => {
@@ -186,6 +280,20 @@ function App() {
 
       {state.kind === "loading" && <p class="dim">索引を作成中（全フレームの提示時刻を1回走査しています）...</p>}
       {state.kind === "error" && <p class="warn">{state.message}</p>}
+      {notice && <p class="warn">{notice}</p>}
+
+      {/* 割り当て表（shared/keymap.ts の FRAMESTEP_KEYS）から自動で作る。
+          ? キーで開閉する（issue #79） */}
+      {helpOpen && (
+        <div class="card" style={{ margin: "8px 0" }}>
+          <h2>キー</h2>
+          <ul>
+            {helpRows(FRAMESTEP_KEYS).map((r) => (
+              <li key={r.label}><b>{r.label}</b> {r.desc}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       <section class="stage">
         <canvas ref={canvasRef} style={{ maxWidth: "100%", background: "#000" }} />
@@ -193,11 +301,11 @@ function App() {
         {state.kind === "ready" && (
           <div class="controls">
             <button onClick={togglePlay}>{playing ? "停止" : "再生"} (Space)</button>
-            <button disabled={busy} onClick={() => { stopPlay(); void draw(Math.max(0, cur - 1)); }}>
-              &lt; コマ戻し (,)
+            <button disabled={busy} onClick={() => stepTo(cur - 1)}>
+              &lt; コマ戻し (←/,)
             </button>
-            <button disabled={busy} onClick={() => { stopPlay(); void draw(Math.min(state.info.frameCount - 1, cur + 1)); }}>
-              コマ送り (.) &gt;
+            <button disabled={busy} onClick={() => stepTo(cur + 1)}>
+              コマ送り (→/.) &gt;
             </button>
             <span class="field">
               フレーム
@@ -210,6 +318,7 @@ function App() {
                 onKeyDown={(e) => {
                   if (e.key === "Enter") {
                     stopPlay();
+                    stopShuttle();
                     const n = Number(frameInput);
                     if (Number.isFinite(n)) void draw(Math.max(0, Math.min(state.info.frameCount - 1, Math.trunc(n))));
                   }
@@ -220,6 +329,7 @@ function App() {
                 disabled={busy}
                 onClick={() => {
                   stopPlay();
+                  stopShuttle();
                   const n = Number(frameInput);
                   if (Number.isFinite(n)) void draw(Math.max(0, Math.min(state.info.frameCount - 1, Math.trunc(n))));
                 }}
@@ -228,6 +338,7 @@ function App() {
               </button>
             </span>
             <span class="field mono">t = {state.kind === "ready" ? playerRef.current?.timestampOf(cur).toFixed(4) : ""} s</span>
+            <button class="dim" onClick={() => setHelpOpen((v) => !v)}>キー一覧 (?)</button>
           </div>
         )}
       </section>

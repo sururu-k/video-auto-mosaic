@@ -13,6 +13,8 @@ import type { Annotation, AnnotationsPayload, ExpandResponse, StateLight } from 
 import { drawHandOverlay } from "../shared/canvas-draw.js";
 import { normFromClient, scaledSize, tapToBox } from "../shared/geom.js";
 import type { NormPoint } from "../shared/geom.js";
+import { dispatchKey, DRAW_KEYS, helpRows } from "../shared/keymap.js";
+import type { KeyLike } from "../shared/keymap.js";
 import { numOr, requestWidth } from "../shared/review-logic.js";
 import { api, errText, link, url } from "../shared/webapp-net.js";
 
@@ -44,6 +46,7 @@ function App() {
   const [expandMsg, setExpandMsg] = useState("");
   const [banner, setBanner] = useState("好きなフレームで画像をタップすると、そこに矩形を置きます");
   const [save, setSave] = useState<SaveState>({ kind: "ok", text: "-" });
+  const [helpOpen, setHelpOpen] = useState(false);
 
   const ovRef = useRef<HTMLCanvasElement>(null);
   // 「1つ進んでから置く」のように同じ処理で位置を2回動かす経路があるので ref でも持つ
@@ -114,28 +117,46 @@ function App() {
     }
   }
 
+  // この画面に動画再生は無い（1フレームずつ打点する道具）。Space / J / K / L
+  // を押しても無反応にはせず、できないことを banner に出す（issue #79）
+  function noPlayback() {
+    setBanner("この画面に連続再生はありません（1コマずつ打点する画面です）");
+  }
+
   useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
-      const t = ev.target as HTMLElement;
-      if (t.tagName === "INPUT" || t.tagName === "SELECT") return;
-      switch (ev.key) {
-        case ",": goto(frameRef.current - 1); break;
-        case ".": goto(frameRef.current + 1); break;
-        case "ArrowLeft": goto(frameRef.current - strideN); break;
-        case "ArrowRight": goto(frameRef.current + strideN); break;
-        case "Enter":
+      const t = ev.target as HTMLElement | null;
+      const like: KeyLike = {
+        key: ev.key,
+        shiftKey: ev.shiftKey,
+        targetTag: t?.tagName ?? null,
+        targetEditable: !!t?.isContentEditable,
+      };
+      const handled = dispatchKey(DRAW_KEYS, like, {
+        // ← / → / , / . はどれも1フレーム移動（全画面で揃える。issue #79）。
+        // 旧: ← / → だけ strideN フレーム移動だったのを Shift+← / Shift+→ へ移した
+        stepBack: () => goto(frameRef.current - 1),
+        stepForward: () => goto(frameRef.current + 1),
+        jumpBack: () => goto(frameRef.current - strideN),
+        jumpForward: () => goto(frameRef.current + strideN),
+        goHome: () => goto(0),
+        goEnd: () => goto((state?.n_frames ?? 1) - 1),
+        playToggle: noPlayback,
+        shuttleReverse: noPlayback,
+        shuttleStop: noPlayback,
+        shuttleForward: noPlayback,
+        help: () => setHelpOpen((v) => !v),
+        confirmTap: () => {
           if (tap && state) {
             void send({
               frame: frameRef.current, x: tap[0], y: tap[1],
               w: boxSize[0], h: boxSize[1], class: cls,
             });
           }
-          break;
-        case "n":
-        case "N": void send({ frame: frameRef.current, absent: true }); break;
-        default: return;
-      }
-      ev.preventDefault();
+        },
+        markAbsent: () => void send({ frame: frameRef.current, absent: true }),
+      });
+      if (handled) ev.preventDefault();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
@@ -177,8 +198,22 @@ function App() {
       </div>
       <div id="banner">{banner}</div>
 
+      {/* 割り当て表（shared/keymap.ts の DRAW_KEYS）から自動で作る。
+          ? キーで開閉する（issue #79） */}
+      {helpOpen && (
+        <div class="card" style={{ margin: "8px 0" }}>
+          <h2>キー</h2>
+          <ul>
+            {helpRows(DRAW_KEYS).map((r) => (
+              <li key={r.label}><b>{r.label}</b> {r.desc}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       <div class="pad">
         <div class="row">
+          <button id="b-help" onClick={() => setHelpOpen((v) => !v)}>キー一覧 (?)</button>
           <button id="b-first" onClick={() => goto(0)}>≪</button>
           <button id="b-back10" onClick={() => goto(frame - strideN)}>-10</button>
           <button id="b-back" onClick={() => goto(frame - 1)}>-1</button>

@@ -346,13 +346,186 @@ function proxyLabel(status) {
       return "未生成";
   }
 }
+
+// src/shared/keymap.ts
+function bind(action, keys, label, desc, shift = false) {
+  return { action, keys, label, desc, shift };
+}
+var TYPING_TAGS = /* @__PURE__ */ new Set(["INPUT", "SELECT", "TEXTAREA"]);
+function isTypingTarget(t) {
+  if (t.targetTag && TYPING_TAGS.has(t.targetTag)) return true;
+  if (t.targetEditable) return true;
+  return false;
+}
+function resolveKey(bindings, ev) {
+  if (isTypingTarget(ev)) return null;
+  const shift = !!ev.shiftKey;
+  for (const b of bindings) {
+    if (!!b.shift !== shift) continue;
+    if (b.keys.includes(ev.key)) return b.action;
+  }
+  return null;
+}
+function dispatchKey(bindings, ev, handlers) {
+  const action = resolveKey(bindings, ev);
+  if (!action) return false;
+  const fn = handlers[action];
+  if (!fn) return false;
+  fn();
+  return true;
+}
+var STEP_BACK = bind("stepBack", ["ArrowLeft", ","], "← / ,", "1フレーム戻る");
+var STEP_FWD = bind("stepForward", ["ArrowRight", "."], "→ / .", "1フレーム進む");
+var JUMP_BACK = bind("jumpBack", ["ArrowLeft"], "Shift+←", "大きく戻る", true);
+var JUMP_FWD = bind("jumpForward", ["ArrowRight"], "Shift+→", "大きく進む", true);
+var PLAY_TOGGLE = bind("playToggle", [" "], "Space", "再生 / 停止");
+var GO_HOME = bind("goHome", ["Home"], "Home", "先頭のフレームへ");
+var GO_END = bind("goEnd", ["End"], "End", "末尾のフレームへ");
+var SHUTTLE_REV = bind("shuttleReverse", ["j", "J"], "J", "逆再生（連打で加速）");
+var SHUTTLE_STOP = bind("shuttleStop", ["k", "K"], "K", "停止");
+var SHUTTLE_FWD = bind("shuttleForward", ["l", "L"], "L", "順再生（連打で加速）");
+var HELP = bind("help", ["?"], "?", "このキー一覧を出す");
+var CORE_TRANSPORT = [
+  STEP_BACK,
+  STEP_FWD,
+  PLAY_TOGGLE,
+  GO_HOME,
+  GO_END,
+  SHUTTLE_REV,
+  SHUTTLE_STOP,
+  SHUTTLE_FWD,
+  HELP
+];
+var JUMP = [JUMP_BACK, JUMP_FWD];
+var TL_ADD_MODE = bind("addMode", ["m", "M"], "M", "追加モード（矩形を置く）");
+var TL_APPLY_FRAME = bind("applyFrame", ["Enter"], "Enter", "置いた矩形をこのフレームだけに適用");
+var TL_APPLY_SPAN = bind(
+  "applySpan",
+  ["Enter"],
+  "Shift+Enter",
+  "置いた矩形を指定フレーム数ぶん適用",
+  true
+);
+var TL_DELETE_HERE = bind("deleteHere", ["d", "D"], "D", "カーソル下の手修正を削除");
+var TL_NEXT_ESTIMATED = bind("nextEstimated", ["g", "G"], "G", "次の推定のみ区間へ");
+var TL_SIZE_SMALLER = bind("sizeSmaller", ["["], "[", "矩形を縮小");
+var TL_SIZE_BIGGER = bind("sizeBigger", ["]"], "]", "矩形を拡大");
+var TIMELINE_KEYS = [
+  ...CORE_TRANSPORT,
+  ...JUMP,
+  TL_ADD_MODE,
+  TL_APPLY_FRAME,
+  TL_APPLY_SPAN,
+  TL_DELETE_HERE,
+  TL_NEXT_ESTIMATED,
+  TL_SIZE_SMALLER,
+  TL_SIZE_BIGGER
+];
+var FRAMESTEP_KEYS = [...CORE_TRANSPORT, ...JUMP];
+var DRAW_CONFIRM = bind("confirmTap", ["Enter"], "Enter", "タップした位置に打点を置く");
+var DRAW_ABSENT = bind("markAbsent", ["n", "N"], "N", "「ここには無い」として記録");
+var DRAW_KEYS = [
+  ...CORE_TRANSPORT,
+  ...JUMP,
+  DRAW_CONFIRM,
+  DRAW_ABSENT
+];
+var RV_JUDGE_OK = bind("judgeOk", ["1"], "1", "問題なし");
+var RV_JUDGE_ADD = bind("judgeAdd", ["2"], "2", "漏れている（追加モード）");
+var RV_JUDGE_UNSURE = bind("judgeUnsure", ["3"], "3", "判断できない");
+var RV_JUDGE_SHRINK = bind("judgeShrink", ["4"], "4", "でかすぎる");
+var RV_JUDGE_ERASE = bind("judgeErase", ["5"], "5", "誤検知");
+var RV_UNDO = bind("undo", ["u", "U"], "U", "ひとつ戻す");
+var RV_CANCEL = bind("cancel", ["Escape"], "Esc", "モードをやめる");
+var RV_QUEUE_PREV = bind("queuePrev", ["PageUp"], "PageUp", "検査キューの前の項目へ");
+var RV_QUEUE_NEXT = bind("queueNext", ["PageDown"], "PageDown", "検査キューの次の項目へ");
+var REVIEW_KEYS = [
+  ...CORE_TRANSPORT,
+  ...JUMP,
+  RV_JUDGE_OK,
+  RV_JUDGE_ADD,
+  RV_JUDGE_UNSURE,
+  RV_JUDGE_SHRINK,
+  RV_JUDGE_ERASE,
+  RV_UNDO,
+  RV_CANCEL,
+  RV_QUEUE_PREV,
+  RV_QUEUE_NEXT
+];
+var RV_INTERVAL_START = bind("intervalStart", ["i", "I"], "I", "区間の始点を置く");
+var RV_INTERVAL_END = bind("intervalEnd", ["o", "O"], "O", "区間の終点（確定）");
+var REVIEW_INTERVAL_KEYS = [RV_INTERVAL_START, RV_INTERVAL_END];
+function helpRows(bindings) {
+  const seen = /* @__PURE__ */ new Set();
+  const rows = [];
+  for (const b of bindings) {
+    const k = b.action + (b.shift ? "!shift" : "");
+    if (seen.has(k)) continue;
+    seen.add(k);
+    rows.push({ label: b.label, desc: b.desc });
+  }
+  return rows;
+}
+function helpLine(bindings) {
+  return helpRows(bindings).map((r) => `${r.label} ${r.desc}`).join(" ・ ");
+}
+
+// src/shared/shuttle.ts
+var SHUTTLE_MAX = 8;
+function nextShuttleSpeed(cur, dir) {
+  if (dir === 0) return 0;
+  if (cur === 0) return dir;
+  if (Math.sign(cur) !== dir) return dir;
+  const doubled = Math.abs(cur) * 2;
+  return dir * Math.min(doubled, SHUTTLE_MAX);
+}
 export {
+  CORE_TRANSPORT,
+  DRAW_ABSENT,
+  DRAW_CONFIRM,
+  DRAW_KEYS,
+  FRAMESTEP_KEYS,
+  GO_END,
+  GO_HOME,
+  HELP,
+  JUMP,
+  JUMP_BACK,
+  JUMP_FWD,
   MARK_MODES,
+  PLAY_TOGGLE,
+  REVIEW_INTERVAL_KEYS,
+  REVIEW_KEYS,
+  RV_CANCEL,
+  RV_INTERVAL_END,
+  RV_INTERVAL_START,
+  RV_JUDGE_ADD,
+  RV_JUDGE_ERASE,
+  RV_JUDGE_OK,
+  RV_JUDGE_SHRINK,
+  RV_JUDGE_UNSURE,
+  RV_QUEUE_NEXT,
+  RV_QUEUE_PREV,
+  RV_UNDO,
+  SHUTTLE_FWD,
+  SHUTTLE_MAX,
+  SHUTTLE_REV,
+  SHUTTLE_STOP,
   SRC_COLOR,
   SRC_NAME,
+  STEP_BACK,
+  STEP_FWD,
+  TIMELINE_KEYS,
+  TL_ADD_MODE,
+  TL_APPLY_FRAME,
+  TL_APPLY_SPAN,
+  TL_DELETE_HERE,
+  TL_NEXT_ESTIMATED,
+  TL_SIZE_BIGGER,
+  TL_SIZE_SMALLER,
   VERDICT_LABEL,
   autoBoxes,
   correctionsAfterDrop,
+  dispatchKey,
   drawHandOverlay,
   drawRegionOverlay,
   drawReviewOverlay,
@@ -362,7 +535,11 @@ export {
   firstUnjudged,
   frameFromClient,
   framePoint,
+  helpLine,
+  helpRows,
   intervalStatus,
+  isTypingTarget,
+  nextShuttleSpeed,
   normFromClient,
   normPoint,
   numOr,
@@ -371,6 +548,7 @@ export {
   progressPercent,
   proxyLabel,
   requestWidth,
+  resolveKey,
   scaledSize,
   spanOptions,
   tapToBox,
