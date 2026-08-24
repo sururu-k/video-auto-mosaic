@@ -2030,6 +2030,39 @@ def test_download_missing_is_404():
         srv.close()
 
 
+def test_session_overrides_transfers_critical_keys():
+    """session_overrides() が margin_scale/margin_cap/frame_step/estimate_gaps
+    を settings から overrides に転送すること。
+
+    M7 変異（これらのキーを落とす）が落ちることを確認するための
+    回帰テスト（issue #43）。レビューがこれらの設定を無視すると、
+    既定より小さい値で焼いたジョブが広く塗られて見える（漏れ隠し方向）。
+    """
+    from automosaic.webapp.session import session_overrides
+
+    # margin_scale / margin_cap（float）/ frame_step（int）/ estimate_gaps（bool）
+    overrides = session_overrides({
+        "margin_scale": "1.5",
+        "margin_cap": "50",
+        "frame_step": "2",
+        "estimate_gaps": "true",
+    })
+
+    assert "margin_scale" in overrides, f"margin_scale が落ちた: {overrides.keys()}"
+    assert overrides["margin_scale"] == 1.5, f"margin_scale 値が違う: {overrides['margin_scale']}"
+
+    assert "margin_cap" in overrides, f"margin_cap が落ちた: {overrides.keys()}"
+    assert overrides["margin_cap"] == 50, f"margin_cap 値が違う: {overrides['margin_cap']}"
+
+    assert "frame_step" in overrides, f"frame_step が落ちた: {overrides.keys()}"
+    assert overrides["frame_step"] == 2, f"frame_step 値が違う: {overrides['frame_step']}"
+
+    assert "estimate_gaps" in overrides, f"estimate_gaps が落ちた: {overrides.keys()}"
+    assert overrides["estimate_gaps"] is True, f"estimate_gaps 値が違う: {overrides['estimate_gaps']}"
+
+    print("  session_overrides が4キー（margin_scale/margin_cap/frame_step/estimate_gaps）を転送 OK")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"{len(tests)} 件のテストを実行\n")
@@ -2051,36 +2084,3 @@ if __name__ == "__main__":
             print(f"       ({t.__name__} {time.time() - t0:.1f}s)")
     print(f"\n{'すべて通過' if failed == 0 else f'{failed} 件失敗'}")
     sys.exit(1 if failed else 0)
-
-
-def test_session_overrides_transfers_critical_keys():
-    """session_overrides() が margin_scale/margin_cap/frame_step/estimate_gaps
-    を settings から overrides に転送すること。
-    
-    M7 変異（これらのキーを落とす）が落ちることを確認するための
-    回帰テスト（issue #43）。レビューがこれらの設定を無視すると、
-    既定より小さい値で焼いたジョブが広く塗られて見える（漏れ隠し方向）。
-    """
-    from automosaic.webapp.session import session_overrides
-    
-    # margin_scale / margin_cap（float）/ frame_step（int）/ estimate_gaps（bool）
-    overrides = session_overrides({
-        "margin_scale": "1.5",
-        "margin_cap": "50",
-        "frame_step": "2",
-        "estimate_gaps": "true",
-    })
-    
-    assert "margin_scale" in overrides, f"margin_scale が落ちた: {overrides.keys()}"
-    assert overrides["margin_scale"] == 1.5, f"margin_scale 値が違う: {overrides['margin_scale']}"
-    
-    assert "margin_cap" in overrides, f"margin_cap が落ちた: {overrides.keys()}"
-    assert overrides["margin_cap"] == 50, f"margin_cap 値が違う: {overrides['margin_cap']}"
-    
-    assert "frame_step" in overrides, f"frame_step が落ちた: {overrides.keys()}"
-    assert overrides["frame_step"] == 2, f"frame_step 値が違う: {overrides['frame_step']}"
-    
-    assert "estimate_gaps" in overrides, f"estimate_gaps が落ちた: {overrides.keys()}"
-    assert overrides["estimate_gaps"] is True, f"estimate_gaps 値が違う: {overrides['estimate_gaps']}"
-    
-    print("  session_overrides が4キー（margin_scale/margin_cap/frame_step/estimate_gaps）を転送 OK")
