@@ -751,6 +751,19 @@ def main(argv: list[str] | None = None) -> int:
         classes = {c.strip() for c in args.classes.split(",") if c.strip()}
 
     info = vid.probe(src)
+
+    # issue #2: 奇数解像度は検出（パス1）だけは通ってしまい、描画（パス2）で
+    # 初めて FrameBuffer の guard に当たって落ちる。数時間かけた検出が無駄に
+    # なる壊れ方なので、無駄にする前にここで検査する。--detect-only は
+    # パス1しか実行しない（＝奇数のままでも正しく動く）ので警告に留めて進める。
+    geometry_problem = vid.check_render_geometry(info)
+    if geometry_problem:
+        if args.detect_only:
+            print(f"警告: {geometry_problem} --detect-only のため続行します。", file=sys.stderr)
+        else:
+            print(geometry_problem, file=sys.stderr)
+            return 1
+
     block = args.block or default_block_size(info.long_edge)
 
     if info.rotation and not args.quiet:

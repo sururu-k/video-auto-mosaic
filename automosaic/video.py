@@ -202,6 +202,34 @@ def detect_pix_fmt(info: VideoInfo) -> str:
     return "yuv420p"
 
 
+def check_render_geometry(info: VideoInfo) -> str | None:
+    """パス2（描画）まで通せる解像度かどうかを検査する。通せないなら理由の
+    メッセージを返す。通せるなら None を返す。
+
+    奇数解像度は2枚の壁で原理的に描画できない（issue #2 実測）。
+      1. ffmpeg の 4:2:0 彩度平面は ceil(w/2) x ceil(h/2) だが、
+         `render.FrameBuffer` は width//2（切り捨て）で組んでいるため、
+         guard を外してもバイト数がずれて全フレームが斜めに壊れる
+         （guard を外すという直し方は採らない）。
+      2. libx264 は 4:2:0 の奇数解像度を 8bit/10bit とも拒否するため、
+         奇数のまま焼く経路はそもそも存在しない。
+
+    一方でパス1（検出）は奇数解像度でも正しく動く（scale フィルタが
+    force_divisible_by で偶数に丸めてから読むだけ）。そのため検出だけに
+    数時間かけたあとパス2で初めて落ちる、という壊れ方をする
+    （--detect-only は通るのに描画で落ちる）。呼び出し側は probe 直後に
+    これを呼び、--detect-only のときは警告に留めてパス1へ進めてよい。
+    """
+    if info.width % 2 or info.height % 2:
+        return (
+            f"入力の解像度が奇数です（{info.width}x{info.height}）。"
+            "モザイクの描画（パス2）は 4:2:0 の偶数解像度が前提で、"
+            "この解像度のまま焼く経路は存在しません"
+            "（libx264 が 4:2:0 の奇数解像度を拒否するため）。"
+        )
+    return None
+
+
 #: scale の force_divisible_by。奇数サイズを出させないために明示する
 DETECTION_DIVISIBLE_BY = 2
 
