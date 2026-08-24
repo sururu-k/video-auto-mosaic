@@ -728,6 +728,73 @@ def test_no_double_start_across_restart():
         srv.close()
 
 
+def test_pid_reuse_does_not_permanently_lock_job():
+    """meta.json の pid が無関係な生きたプロセスと一致しても、永久に固まらない。
+
+    OS が pid を再利用すると、meta.json に残った pid はそのジョブとは
+    無関係な、たまたま生きている別プロセスを指すようになる。pid の生死
+    だけで判定すると running_pid() が「まだ実行中」と答え続け、start も
+    cancel も拒否されたまま UI から解除する手段が無くなる（issue #44）。
+
+    起動時刻（pid_started_ticks、JobRunner.start が記録）が実際の起動時刻と
+    食い違う pid は「別プロセスに入れ替わった」とみなし、走っていない
+    扱いにする。ジョブ画面を開いた時点の settle() で自然に running から
+    抜け、起動もやり直せることを確かめる。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = upload(srv.base, sample_video())
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        write_fake_detections(job, d["n_frames"], d["width"], d["height"])
+    finally:
+        srv.close()
+
+    # このジョブとは無関係な、常に生きている「他人の」プロセスを用意する
+    impostor = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        real_ticks = jobs_mod.process_creation_ticks(impostor.pid)
+        assert real_ticks is not None, "起動時刻を取得できない環境（このテストは対象外）"
+
+        # 「昔このジョブを処理していたプロセスの起動時刻」として、いま
+        # impostor が実際に起動した時刻とは異なる値を記録する。OS が
+        # pid を再利用した状態を模す（本物の起動時刻とはまず一致しない）
+        jobs_mod.Library(lib).get(jid).update(
+            status="running",
+            pid=impostor.pid,
+            pid_started_ticks=real_ticks - 10_000_000_000,
+            detached=True,
+        )
+
+        srv = Server(lib)  # レジストリを持たない新しいサーバから見る
+        try:
+            st = get_json(f"{srv.base}/api/jobs/{jid}?t={TOKEN}")
+            assert st["status"] != "running", (
+                f"pid 再利用された無関係なプロセスを本人と誤認し、"
+                f"running のまま固まった: {st}"
+            )
+
+            code, r = post_json(
+                f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}", {"reuse": True}
+            )
+            assert code == 200, f"pid 再利用で起動不能のまま固まった: {code} {r}"
+            for _ in range(600):
+                s = get_json(f"{srv.base}/api/jobs/{jid}?t={TOKEN}")
+                if s["status"] in ("done", "failed", "canceled"):
+                    break
+                time.sleep(0.1)
+            print(
+                "  pid 再利用された無関係なプロセスを本人と誤認せず、"
+                "起動をやり直せる OK"
+            )
+        finally:
+            srv.close()
+    finally:
+        impostor.terminate()
+        impostor.wait()
+
+
 # --------------------------------------------------------------------------
 # 3. 検査キュー
 # --------------------------------------------------------------------------

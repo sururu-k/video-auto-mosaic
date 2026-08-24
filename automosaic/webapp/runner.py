@@ -162,6 +162,10 @@ class JobRunner:
         self.job.update(
             status=jobs_mod.STATUS_RUNNING,
             pid=self.proc.pid,
+            # OS の起動時刻。pid が後で無関係な別プロセスへ再利用された
+            # ときに区別する材料（issue #44、jobs.running_pid を見よ）。
+            # 取れなければ None（従来どおり pid の生死だけで判断する）
+            pid_started_ticks=jobs_mod.process_creation_ticks(self.proc.pid),
             argv=self.argv,
             settings=self.settings,
             started_at=self.started_at,
