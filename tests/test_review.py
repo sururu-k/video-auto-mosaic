@@ -1715,6 +1715,207 @@ def test_review_cfg_matches_cli_cfg_for_default_job():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# -- src=output（issue #17: レビューが出力 mp4 を一度も読んでいない）--------
+
+
+def test_frame_image_src_output_reads_rendered_file_not_source():
+    """src="output" は output.mp4 の画素をそのまま返し、領域計算をやり直さない。
+
+    直す前は frame_image() に src という概念自体が無く、常に self.reader
+    （= 元動画）を読んで mosaic_bgr() で塗り直した絵しか返せなかった。
+    output.mp4 を意図的に元動画と見分けが付く中身（全面白）にして、
+    src="output" がその白を返し、src="source" は白を返さないことを確かめる。
+    """
+    if not _have_ffmpeg():
+        print("  src=output の確認は飛ばします（ffmpeg が無い）")
+        return
+    tmp = tempfile.mkdtemp()
+    try:
+        src = os.path.join(tmp, "src.mp4")
+        _make_tiny_video(src, 64, 48, 10)
+        rendered = os.path.join(tmp, "output.mp4")
+        subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+                "-i", "color=c=white:size=64x48:r=30",
+                "-frames:v", "10", "-c:v", "libx264", "-pix_fmt", "yuv420p", rendered,
+            ],
+            check=True,
+        )
+        s = ReviewSession(
+            video=src,
+            rendered=rendered,
+            corrections_path=os.path.join(tmp, "corrections.json"),
+            width=64,
+            height=48,
+            fps=30.0,
+            n_frames=10,
+            classes={CLS},
+            cfg=TemporalConfig(max_gap=12, memory=6),
+            per_frame={f: [] for f in range(10)},
+            corrections=CorrectionSet(),
+            block=8,
+            default_size=(16, 16),
+            default_class=CLS,
+        )
+        try:
+            body_out, _ = s.frame_image(3, src="output")
+            img_out = cv2.imdecode(np.frombuffer(body_out, np.uint8), cv2.IMREAD_COLOR)
+            assert img_out.min() > 250, (
+                f"src=output が output.mp4 の画素を返していない（白一色のはずが min={img_out.min()}）"
+            )
+
+            body_src, _ = s.frame_image(3, src="source")
+            img_src = cv2.imdecode(np.frombuffer(body_src, np.uint8), cv2.IMREAD_COLOR)
+            assert img_src.min() <= 250, (
+                "src=source が output.mp4 側（全面白）の絵になっている。読み分けできていない"
+            )
+            print("  src=output は output.mp4、src=source は元動画をそれぞれ読み分けている OK")
+        finally:
+            s.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_frame_image_src_output_missing_raises_not_found():
+    """output.mp4 が無いジョブで src=output を頼むと OutputNotFound で止まること。
+
+    黙って source にフォールバックしない。フォールバックは「素通しの絵を
+    焼けた絵として見せる」ことになる（RULES.md 0）。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)  # rendered=None
+        try:
+            try:
+                s.frame_image(0, src="output")
+                raise AssertionError("output.mp4 が無いのに読めてしまった")
+            except review.OutputNotFound as e:
+                print(f"  output.mp4 が無いとき OutputNotFound で止まる OK（{e}）")
+        finally:
+            s.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_frame_image_src_output_frame_count_mismatch_raises():
+    """output.mp4 のフレーム数が元動画と違うとき OutputFrameMismatch で止まること。
+
+    可変フレームレートや --limit-frames を使ったジョブでは output.mp4 が
+    元動画とフレーム数が揃わない。黙って番号だけ対応付けると、別の瞬間の絵を
+    「このフレームです」と見せることになる（完了条件: 404 か 409 で止める）。
+    """
+    if not _have_ffmpeg():
+        print("  フレーム数不一致の確認は飛ばします（ffmpeg が無い）")
+        return
+    tmp = tempfile.mkdtemp()
+    try:
+        src = os.path.join(tmp, "src.mp4")
+        _make_tiny_video(src, 64, 48, 10)
+        rendered = os.path.join(tmp, "output.mp4")
+        _make_tiny_video(rendered, 64, 48, 6)  # わざとフレーム数を減らす（--limit-frames 相当）
+        s = ReviewSession(
+            video=src,
+            rendered=rendered,
+            corrections_path=os.path.join(tmp, "corrections.json"),
+            width=64,
+            height=48,
+            fps=30.0,
+            n_frames=10,
+            classes={CLS},
+            cfg=TemporalConfig(max_gap=12, memory=6),
+            per_frame={f: [] for f in range(10)},
+            corrections=CorrectionSet(),
+            block=8,
+            default_size=(16, 16),
+            default_class=CLS,
+        )
+        try:
+            try:
+                s.frame_image(0, src="output")
+                raise AssertionError("フレーム数が違うのに読めてしまった")
+            except review.OutputFrameMismatch as e:
+                assert "10" in str(e) and "6" in str(e), str(e)
+                print(f"  output.mp4 のフレーム数が違うとき OutputFrameMismatch で止まる OK（{e}）")
+        finally:
+            s.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_frame_src_output_vs_source_recompute_pixel_diff():
+    """src=output（実際に焼かれた画素）と src=source（現行の再計算）を、
+    同じ設定・同じフレーム番号で突き合わせる（完了条件: 画素差分を貼る）。
+
+    ここが大きく割れているなら、#14 #15 のような「見ている絵と焼いた絵の
+    食い違い」がまだ残っているということなので、そう書く。
+    """
+    if not _have_ffmpeg():
+        print("  画素差分の確認は飛ばします（ffmpeg が無い）")
+        return
+    tmp = tempfile.mkdtemp()
+    try:
+        src = os.path.join(tmp, "src.mp4")
+        n_frames = 20
+        _make_tiny_video(src, 320, 240, n_frames)
+        det_path = os.path.join(tmp, "det.json")
+        # ANUS_COVERED は conservative クラスにしかない（PR #43 のテストと同じ狙い）。
+        # classes の絞り込みが cli 側とレビュー側で同じに効いているかも一緒に確かめる
+        box = [40, 30, 60, 60]
+        dets = {
+            str(f): [{"class": "ANUS_COVERED", "score": 0.9, "box": box}]
+            for f in range(n_frames)
+        }
+        with open(det_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "n_frames": n_frames, "width": 320, "height": 240,
+                    "complete": True, "detections": dets,
+                },
+                f,
+            )
+
+        out_path = os.path.join(tmp, "output.mp4")
+        rc = cli.main([
+            src, "-o", out_path, "--detections", det_path, "--reuse-detections",
+            "--mode", "black", "--block", "20", "--classes", "conservative", "--quiet",
+        ])
+        assert rc == 0, f"cli.main が失敗（終了コード {rc}）"
+        assert os.path.exists(out_path), "output.mp4 が作られていない"
+
+        rev_argv = [
+            src, "--rendered", out_path, "--detections", det_path,
+            "--corrections", os.path.join(tmp, "corrections.json"),
+            "--mode", "black", "--block", "20", "--classes", "conservative",
+        ]
+        args = review.build_parser().parse_args(rev_argv)
+        s = review.session_from_args(args, rev_argv)
+        try:
+            diffs = []
+            for f in (0, 5, 10, 15, 19):
+                b_out, _ = s.frame_image(f, src="output")
+                b_src, _ = s.frame_image(f, src="source")
+                img_out = cv2.imdecode(np.frombuffer(b_out, np.uint8), cv2.IMREAD_COLOR)
+                img_src = cv2.imdecode(np.frombuffer(b_src, np.uint8), cv2.IMREAD_COLOR)
+                assert img_out.shape == img_src.shape, (f, img_out.shape, img_src.shape)
+                d = float(np.abs(img_out.astype(np.int16) - img_src.astype(np.int16)).mean())
+                diffs.append((f, d))
+            for f, d in diffs:
+                print(f"  frame {f:2d}: src=output vs src=source 平均絶対差 = {d:.3f}")
+            worst = max(d for _, d in diffs)
+            print(f"  最大 {worst:.3f}（x264 crf16 の非可逆エンコード誤差ぶんは残る）")
+            # 同一設定で作ったのに大きく割れるなら、領域計算そのものが
+            # cli.py と review.py で食い違っている（#14 #15 と同種の壊れ方）
+            assert worst < 5.0, (
+                f"src=output と src=source が {worst:.3f} 割れている。"
+                "#14 #15 のような領域計算の食い違いが残っている可能性がある"
+            )
+        finally:
+            s.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"{len(tests)} 件のテストを実行\n")

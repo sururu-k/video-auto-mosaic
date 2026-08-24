@@ -498,8 +498,16 @@ def create_app(
 
     @app.get("/api/jobs/{job_id}/frame")
     def api_frame(
-        job_id: str, n: int = 0, raw: int = 0, w: int = 0, fmt: str = "jpg", v: int = 0
+        job_id: str, n: int = 0, raw: int = 0, w: int = 0, fmt: str = "jpg", v: int = 0,
+        src: str = "source",
     ):
+        # src="source"（既定）: 元動画から領域を計算し直して重ねる（従来どおり）。
+        # src="output": 焼き上がった output.mp4 の画素をそのまま返す。領域計算を
+        # やり直さないので、見ている絵がそのまま出荷する絵になる（issue #17）。
+        if src not in ("source", "output"):
+            raise _err(400, f"不明な src です: {src}")
+        if src == "output" and raw:
+            raise _err(400, "raw=1 と src=output は同時に指定できません")
         job = get_job(job_id)
         s = get_session(job)
         # 範囲外に最終フレームの絵を返さない。同じ番号を /mark に出すと 400 なので、
@@ -508,18 +516,32 @@ def create_app(
             raise _err(404, f"フレーム番号が範囲外です: {n}（0〜{s.n_frames - 1}）")
         fmt = "jpg" if fmt in ("jpg", "jpeg") else "png"
         with s.lock:
-            got = s.frame_image(n, raw=bool(raw), max_w=max(0, int(w)), fmt=fmt)
+            try:
+                got = s.frame_image(n, raw=bool(raw), max_w=max(0, int(w)), fmt=fmt, src=src)
+            except review.OutputNotFound as e:
+                # output.mp4 が無い/まだ焼かれていない。黙って source に
+                # フォールバックしない（素通しの絵を焼けた絵として見せることになる）
+                raise _err(404, str(e))
+            except review.OutputFrameMismatch as e:
+                # フレーム数が元動画と揃わない。番号の対応を保証できないので止める
+                raise _err(409, str(e))
         if got is None:
             raise _err(404, f"フレーム {n} を読めません")
         body, ctype = got
         headers = {}
-        # 世代番号付きで取りに来ているなら先読みが効くようにする。
-        # 修正が入れば version が変わり URL も変わるので古い絵は残らない。
-        # ただし原画はキャッシュさせない。モザイク前のフレームが端末のディスクに
-        # 残り、「サーバを閉じたら見えない」という前提が崩れる
-        headers["Cache-Control"] = (
-            "private, max-age=600" if (v and not raw) else "no-store"
-        )
+        if src == "output":
+            # モザイク済みの完成品そのものなので、無条件にキャッシュを許す。
+            # raw=1（原画そのまま）だけが no-store のまま
+            # （app.py 516-522 の非対称の理由に沿う）
+            headers["Cache-Control"] = "private, max-age=600"
+        else:
+            # 世代番号付きで取りに来ているなら先読みが効くようにする。
+            # 修正が入れば version が変わり URL も変わるので古い絵は残らない。
+            # ただし原画はキャッシュさせない。モザイク前のフレームが端末のディスクに
+            # 残り、「サーバを閉じたら見えない」という前提が崩れる
+            headers["Cache-Control"] = (
+                "private, max-age=600" if (v and not raw) else "no-store"
+            )
         return Response(content=body, media_type=ctype, headers=headers)
 
     @app.get("/api/jobs/{job_id}/corrections")

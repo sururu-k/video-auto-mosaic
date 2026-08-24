@@ -1331,6 +1331,109 @@ def test_dataset_export():
         srv.close()
 
 
+# --------------------------------------------------------------------------
+# src=output（issue #17: レビューが出力 mp4 を一度も読んでいない）
+# --------------------------------------------------------------------------
+
+
+def test_frame_src_output_404_before_render_200_after():
+    """src=output は output.mp4 が無ければ 404、焼けば読めること。
+
+    直す前は /api/jobs/{id}/frame に src という概念が無く、常に元動画から
+    領域を再計算した絵しか返せなかった（issue #17 本文）。
+    """
+    from automosaic import cli
+
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = prepared_job(lib, srv)
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+
+        # -- 焼く前: output.mp4 が無いので 404。黙って source にフォールバックしない
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/frame?n=3&src=output&t={TOKEN}")
+        assert code == 404, (code, body)
+        print(f"  output.mp4 が無い間は src=output が 404 OK（{body[:120]!r}）")
+
+        # -- 不正な src / raw と src=output の同時指定は 400
+        code, _, _ = request(f"{srv.base}/api/jobs/{jid}/frame?n=3&src=bogus&t={TOKEN}")
+        assert code == 400, code
+        code, _, _ = request(
+            f"{srv.base}/api/jobs/{jid}/frame?n=3&src=output&raw=1&t={TOKEN}"
+        )
+        assert code == 400, code
+        print("  不正な src / raw+src=output の同時指定は 400 OK")
+
+        # -- 実際に焼く（検出は使い回すので推論器は不要）。review.py 側の既定値
+        #    （pixelize / 自動ブロック / default 3クラス）とそろえるため、
+        #    ここでは mode/block/classes を明示しない
+        rc = cli.main([
+            job.source, "-o", job.output,
+            "--detections", job.detections, "--reuse-detections", "--quiet",
+        ])
+        assert rc == 0, f"cli.main が失敗（終了コード {rc}）"
+        assert os.path.exists(job.output)
+
+        code, body, hdr = request(
+            f"{srv.base}/api/jobs/{jid}/frame?n=3&src=output&fmt=png&t={TOKEN}"
+        )
+        assert code == 200, (code, body[:200])
+        # モザイク済みの完成品なので、v が無くても無条件でキャッシュを許す
+        # （raw=1 のときだけ no-store のまま。app.py の非対称の理由に沿う）
+        assert "max-age" in hdr.get("cache-control", ""), hdr.get("cache-control")
+
+        import cv2
+        import numpy as np
+
+        img = cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR)
+        assert img.shape[1] == d["width"] and img.shape[0] == d["height"], img.shape
+        print(f"  焼いたあとは src=output が 200・キャッシュ可 OK（{len(body)} バイト）")
+    finally:
+        srv.close()
+
+
+def test_frame_src_output_frame_count_mismatch_is_409():
+    """output.mp4 のフレーム数が元動画と違うとき、src=output は 409 で止まる。
+
+    --limit-frames を使ったジョブは output.mp4 が元動画より短くなる。
+    黙って番号だけ対応付けると、別の瞬間の絵を「このフレームです」と
+    見せることになる（完了条件: 404 か 409 で止める。フォールバックしない）。
+    """
+    from automosaic import cli
+
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = prepared_job(lib, srv)
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        assert d["n_frames"] >= 40, d["n_frames"]
+
+        rc = cli.main([
+            job.source, "-o", job.output,
+            "--detections", job.detections, "--reuse-detections",
+            "--limit-frames", "20", "--quiet",
+        ])
+        assert rc == 0, f"cli.main が失敗（終了コード {rc}）"
+        assert os.path.exists(job.output)
+
+        code, body, _ = request(
+            f"{srv.base}/api/jobs/{jid}/frame?n=5&src=output&t={TOKEN}"
+        )
+        assert code == 409, (code, body)
+        detail = json.loads(body).get("detail", "")
+        assert "20" in detail and str(d["n_frames"]) in detail, detail
+        print(f"  フレーム数不一致で 409 OK（{detail}）")
+
+        # source 側は今回の変更の影響を受けず、そのまま読めること
+        code, _, _ = request(f"{srv.base}/api/jobs/{jid}/frame?n=5&t={TOKEN}")
+        assert code == 200, code
+        print("  src=source（既定）は不一致の影響を受けず読める OK")
+    finally:
+        srv.close()
+
+
 def test_download_missing_is_404():
     lib = make_lib()
     srv = Server(lib)

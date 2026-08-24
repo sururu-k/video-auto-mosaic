@@ -37,8 +37,13 @@ def session_for_job(job: Job, **overrides) -> review.ReviewSession:
     # 渡すと session_from_args が「見つかりません」で止まる
     if os.path.exists(job.detections):
         argv += ["--detections", job.detections]
-    if os.path.exists(job.output):
-        argv += ["--rendered", job.output]
+    # job.output は既存の有無にかかわらず常に渡す。存在チェックは
+    # ReviewSession 側で毎回動的に行う（state_payload の has_video、
+    # frame_image(src="output") の _output_reader() など）。ここで存在時
+    # だけに絞ると、review 画面を開いた「あと」に処理が完了して output.mp4 が
+    # 現れても、SessionCache が使い回している限り rendered=None のまま
+    # 固定されてしまい、src=output がいつまでも 404 のままになる（issue #17）
+    argv += ["--rendered", job.output]
     for k, v in overrides.items():
         if v is None:
             continue
@@ -98,7 +103,7 @@ class SessionCache:
             self._order.remove(job_id)
         if s is not None:
             try:
-                s.reader.close()
+                s.close()
             except Exception:  # noqa: BLE001
                 pass
 

@@ -674,6 +674,24 @@ def mosaic_bgr(
     return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
 
 
+class OutputNotFound(RuntimeError):
+    """output.mp4 がまだ無い（未処理、またはパスがずれている）。
+
+    黙って原画にフォールバックしない。原画は素通しなので、フォールバックは
+    「素通しの絵を焼けた絵として見せる」ことになる（RULES.md 0）。
+    """
+
+
+class OutputFrameMismatch(RuntimeError):
+    """output.mp4 のフレーム数が元動画と一致しない。
+
+    output.mp4 は再エンコードなので、可変フレームレートや --limit-frames を
+    使ったジョブでは元動画とフレーム数が揃わないことがある。その状態で
+    フレーム番号をそのまま対応付けると、別の瞬間の絵を「このフレームです」
+    と見せることになる（issue #17 の懸念）。
+    """
+
+
 # --------------------------------------------------------------------------
 # セッション状態
 # --------------------------------------------------------------------------
@@ -950,6 +968,13 @@ class ReviewSession:
     # corrections.json の remove からは「狭めたのか、そもそも違ったのか」を
     # 区別できないので、否定の例としてここに別建てで持つ。
     false_positives: list = field(init=False, default_factory=list)
+    # src=output 用の FrameReader。遅延で開く（懸念: MAX_OPEN=3 のセッション
+    # キャッシュで、起動のたびに開くと最大6本の VideoCapture が同時に開く。
+    # 実測 5.2秒/セッション構築なので、src=output を実際に使ったときだけ払う）
+    _out_reader: FrameReader | None = field(init=False, default=None)
+    # rendered のプローブ結果（フレーム数）。フレーム画像を返すたびに
+    # ffprobe/cv2 で開き直さないためのキャッシュ
+    _out_n_frames: int | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.reader = FrameReader(self.video)
@@ -1396,23 +1421,76 @@ class ReviewSession:
         self.save_progress()
         return h
 
+    # -- 出力動画 ----------------------------------------------------------
+    def _output_reader(self) -> FrameReader:
+        """output.mp4 用の FrameReader を、実際に必要になってから開く。
+
+        フレーム数が元動画と食い違うなら開かずに例外で止める（issue #17）。
+        可変フレームレートや --limit-frames を使ったジョブは output.mp4 の
+        フレーム数が元動画と一致しない。黙って番号だけ対応付けると、
+        別の瞬間の絵を「このフレームです」と見せることになる。
+        """
+        if not self.rendered or not os.path.exists(self.rendered):
+            raise OutputNotFound(f"完成品がありません: {self.rendered}")
+        if self._out_n_frames is None:
+            _, _, _, self._out_n_frames = probe_with_cv2(self.rendered)
+        if self._out_n_frames != self.n_frames:
+            raise OutputFrameMismatch(
+                f"output.mp4 のフレーム数（{self._out_n_frames}）が元動画の"
+                f"フレーム数（{self.n_frames}）と一致しません。可変フレームレートや"
+                "--limit-frames を使ったジョブでは、フレーム番号の対応が"
+                "保証されません"
+            )
+        if self._out_reader is None:
+            self._out_reader = FrameReader(self.rendered)
+        return self._out_reader
+
+    def close(self) -> None:
+        """開いている VideoCapture を全て閉じる。セッション破棄時に呼ぶ。"""
+        self.reader.close()
+        if self._out_reader is not None:
+            self._out_reader.close()
+
     # -- プレビュー画像 --------------------------------------------------
     def frame_image(
-        self, n: int, raw: bool = False, max_w: int = 0, fmt: str = "png"
+        self, n: int, raw: bool = False, max_w: int = 0, fmt: str = "png",
+        src: str = "source",
     ) -> tuple[bytes, str] | None:
         """1フレームを画像にする。既定はモザイク済み。
 
+        src="source"（既定）: 元動画から領域を計算し直して重ねる。手修正の
+        直後などまだ焼いていない状態でも見られるが、実際に焼かれる絵と
+        ずれる可能性を常に抱える（そのずれの一致は self.regions が
+        render.apply_regions と同じ経路を通ることに頼っている）。
+
+        src="output": 焼き上がった output.mp4 の画素をそのまま返す。領域計算を
+        まるごとやり直さない。「見ている絵」がそのまま「出荷する絵」になるので、
+        一致の保証が要らない（issue #17）。output.mp4 が無いか、フレーム数が
+        元動画と揃わない場合は OutputNotFound / OutputFrameMismatch を投げる。
+        黙って source にフォールバックしない。フォールバックは「素通しの絵を
+        焼けた絵として見せる」ことになりうる（RULES.md 0）。
+
+        raw は元動画をそのまま返す（モザイク無し）。output.mp4 は既にモザイク
+        済みで「元」が無いので、src="output" のときは raw を無視する
+        （呼び出し側の /api/jobs/{id}/frame は raw と src=output の組を弾く）。
+
         端末で見るときに原寸 PNG を投げると、1枚に数百 KB〜数 MB かかって
         タップの手応えが消える。max_w で縮めて JPEG に落とせるようにした。
-        モザイクは原寸で焼いてから縮める。縮めてから焼くと、実際に焼かれる
-        矩形と1〜2px ずれた絵を見せることになる。
+        src="source" のモザイクは原寸で焼いてから縮める。縮めてから焼くと、
+        実際に焼かれる矩形と1〜2px ずれた絵を見せることになる
+        （src="output" は既に焼かれた画をそのまま縮めるだけなのでこの心配が無い）。
         """
-        frame = self.reader.read(n)
+        if src not in ("source", "output"):
+            raise ValueError(f"不明な src です: {src}")
+        if src == "output":
+            frame = self._output_reader().read(n)
+        else:
+            frame = self.reader.read(n)
+            if frame is not None and not raw:
+                boxes = [b for b, _ in self.regions.get(n, [])]
+                frame = mosaic_bgr(frame, boxes, self.block, self.mode)
         if frame is None:
             return None
-        if not raw:
-            boxes = [b for b, _ in self.regions.get(n, [])]
-            frame = mosaic_bgr(frame, boxes, self.block, self.mode)
         h, w = frame.shape[:2]
         if max_w and w > max_w:
             scale = max_w / float(w)
@@ -1583,6 +1661,16 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         n = max(0, min(s.n_frames - 1, n))
         raw = (q.get("raw") or ["0"])[0] not in ("0", "", "false")
+        src = (q.get("src") or ["source"])[0]
+        if src not in ("source", "output"):
+            self._error(400, f"不明な src です: {src}")
+            return
+        if src == "output" and raw:
+            # output.mp4 は既にモザイク済みで「元」が無い。raw を無視して
+            # 黙って source を返すと「モザイク無しのつもりが乗っている」の
+            # 逆（見えているのに気づかず raw のつもりで見る）が起きうるので拒否する
+            self._error(400, "raw=1 と src=output は同時に指定できません")
+            return
         try:
             max_w = int((q.get("w") or ["0"])[0])
         except ValueError:
@@ -1590,7 +1678,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
         fmt = "jpg" if (q.get("fmt") or ["png"])[0] in ("jpg", "jpeg") else "png"
 
         with s.lock:
-            got = s.frame_image(n, raw=raw, max_w=max(0, max_w), fmt=fmt)
+            try:
+                got = s.frame_image(n, raw=raw, max_w=max(0, max_w), fmt=fmt, src=src)
+            except OutputNotFound as e:
+                self._error(404, str(e))
+                return
+            except OutputFrameMismatch as e:
+                self._error(409, str(e))
+                return
         if got is None:
             self._error(404, f"フレーム {n} を読めません")
             return
@@ -1600,8 +1695,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
         # ただし原画は絶対にキャッシュさせない。「サーバを閉じたら見えない」という
         # 前提が崩れ、モザイク前のフレームが端末のディスクに残る。
         # version はモザイク領域の更新を伝える番号なので、原画には意味も無い。
+        # src=output はモザイク済みの完成品なので、無条件にキャッシュを許す
+        # （raw=1 だけが no-store のまま。app.py の /api/jobs/{id}/frame と同じ非対称）
         extra = dict(self._cookie_header())
-        if (q.get("v") or [None])[0] and not raw:
+        if src == "output" or ((q.get("v") or [None])[0] and not raw):
             extra["Cache-Control"] = "private, max-age=600"
         self._send_bytes(body, ctype, extra=extra)
 
@@ -2275,7 +2372,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.export_dataset:
         export_dataset(session, args.export_dataset)
-        session.reader.close()
+        session.close()
         return 0
 
     token = "" if args.no_token else (args.token or make_token())
@@ -2305,7 +2402,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n終了します")
     finally:
         httpd.server_close()
-        session.reader.close()
+        session.close()
     return 0
 
 
