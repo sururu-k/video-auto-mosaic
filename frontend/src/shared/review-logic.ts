@@ -303,3 +303,41 @@ export function progressPercent(p: Progress): number {
 export function requestWidth(videoWidth: number, screenWidth: number, dpr: number): number {
   return Math.min(videoWidth, Math.max(480, Math.round(Math.min(screenWidth, 1280) * dpr)));
 }
+
+/** 区間の始点（issue #46）。「I」キーで置く。どのコマに置いたかだけ持たせる */
+export interface IntervalStart {
+  frame: number;
+}
+
+export interface IntervalStatus {
+  /** 始点が置かれている */
+  active: boolean;
+  /** いま見ているコマが始点そのもの */
+  onStartFrame: boolean;
+  /** 案内文 */
+  banner: string;
+  /** 「O」で確定できるか（終点の位置がまだタップされていないと確定できない） */
+  confirmDisabled: boolean;
+}
+
+/**
+ * 区間モードの案内と確定可否。
+ *
+ * 動画編集ソフトのイン点・アウト点にならい、キーボード（I=始点、O=終点で確定）
+ * だけで完結させる。ここではその案内文と確定可否だけを判断する。実際の
+ * タップ位置・API 呼び出しは画面側（review.tsx）が持つ。
+ */
+export function intervalStatus(
+  start: IntervalStart | null,
+  curFrame: number | null,
+  endTapPlaced: boolean,
+): IntervalStatus {
+  if (!start) {
+    return { active: false, onStartFrame: false, banner: "", confirmDisabled: true };
+  }
+  const onStartFrame = curFrame !== null && curFrame === start.frame;
+  const banner = endTapPlaced
+    ? `区間: frame ${start.frame} 〜 frame ${curFrame}。O で確定（Esc でやめる）`
+    : `始点は frame ${start.frame}。終点のコマへ移動してタップし、O で確定（Esc でやめる）`;
+  return { active: true, onStartFrame, banner, confirmDisabled: !endTapPlaced };
+}

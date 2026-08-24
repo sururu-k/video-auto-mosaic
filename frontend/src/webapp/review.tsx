@@ -8,6 +8,13 @@
 // 操作は指だけで完結させる。キーボードの割り当ては残してあるが、
 // それが無いと出来ないことは1つも作らない。
 //
+// 例外が区間追従（issue #46）。「2」でタップした位置を「I」で区間の始点に
+// し、矢印キーで終点のコマへ移動してタップ、「O」で確定するとあいだを
+// 補間で埋める。動画編集ソフトのイン点・アウト点と同じ操作系にしてある。
+// automosaic/webapp/spans.py の interval_add_records() を review.mark_interval()
+// が呼ぶ。「漏れている」（fixed）専用（review.mark_interval のドキュストリング
+// 参照。「でかすぎる」の remove を区間補間で動かすのは危険）。
+//
 // 判定は5つ（問題なし・漏れている・判断できない・でかすぎる・誤検知）。
 // 「でかすぎる」「誤検知」は自動領域を打ち消す remove を伴う（漏れる方向へ
 // 倒れうる操作）ので、position placement / pick の中身は
@@ -36,6 +43,7 @@ import {
   autoBoxes,
   eraseSummary,
   firstUnjudged,
+  intervalStatus,
   numOr,
   pickIndexAt,
   progressPercent,
@@ -52,6 +60,16 @@ const API = "/api/jobs/" + JOB;
 interface SaveState {
   kind: "ok" | "busy" | "err";
   text: string;
+}
+
+/**
+ * 区間の始点（issue #46）。動画編集ソフトのイン点にならい、キーボードの
+ * 「I」で置く。「O」を押した時点のコマが終点になり、あいだを補間で埋める。
+ */
+interface IntervalStartPoint {
+  frame: number;
+  tap: NormPoint;
+  size: [number, number];
 }
 
 /** そのコマの既定の案内。判定済みならそれを出す */
@@ -84,6 +102,8 @@ function App() {
   const [tap, setTap] = useState<NormPoint | null>(null);
   // 「誤検知」で選んだ自動領域の番号（autoBoxes() の添字）
   const [picked, setPicked] = useState<number[]>([]);
+  // 区間の始点（issue #46）。frame をまたいで生きるので markMode/tap とは別に持つ
+  const [intervalStart, setIntervalStart] = useState<IntervalStartPoint | null>(null);
 
   const [busy, setBusy] = useState(false);
   const [imgWidth, setImgWidth] = useState(720);
@@ -99,6 +119,12 @@ function App() {
   const pending =
     tap && state && markMode !== "erase" ? tapToBox(tap, boxSize, state.width, state.height) : null;
   const erase = markMode === "erase" ? eraseSummary(autos, picked, span) : null;
+  // 区間の始点を置いたコマそのものを見ているときだけ、その矩形を描く
+  const startBox =
+    intervalStart && cur && state && intervalStart.frame === cur.frame
+      ? tapToBox(intervalStart.tap, intervalStart.size, state.width, state.height)
+      : null;
+  const interval = intervalStatus(intervalStart, cur?.frame ?? null, markMode === "add" && !!tap);
 
   useEffect(() => {
     void (async () => {
@@ -154,17 +180,26 @@ function App() {
       markMode,
       picked,
       pending,
+      startBox,
     });
-  }, [state, cur, optBoxes, markMode, picked, pending]);
+  }, [state, cur, optBoxes, markMode, picked, pending, startBox]);
 
   function cancelMark() {
     setMarkMode(null);
     setTap(null);
     setPicked([]);
+    setIntervalStart(null);
   }
 
   function goto(i: number, list: QueueItem[] = items) {
-    cancelMark();
+    if (intervalStart) {
+      // 区間の始点はコマをまたいで生かす。タップ位置だけ捨てて、
+      // 終点のコマへ移動できるようにする（ナビゲーションは矢印キーのまま）
+      setTap(null);
+      setPicked([]);
+    } else {
+      cancelMark();
+    }
     setIdx(Math.max(0, Math.min(list.length, i)));
     setNotice("");
   }
@@ -286,6 +321,50 @@ function App() {
     void judge(m.verdict, payload);
   }
 
+  // -- 区間（issue #46） -------------------------------------------------
+  // 動画編集ソフトのイン点・アウト点と同じ操作系。「2」で漏れている位置を
+  // タップしたあと、「I」で始点として確定し、矢印キーで終点のコマへ移動、
+  // 再びタップして「O」で確定すると、あいだを補間で埋める。マウスでしか
+  // 押せない小さいボタンを増やすと編集ソフトらしさが消えるので、ここは
+  // キーだけで完結させ、ボタンはその代替（同じ関数を呼ぶ）として添える。
+
+  function markStart() {
+    if (markMode !== "add" || !tap || !cur) {
+      setNotice("先に「漏れている」でタップして位置を決めてから I を押してください");
+      return;
+    }
+    setIntervalStart({ frame: cur.frame, tap, size: boxSize });
+    setTap(null);
+    setNotice("");
+  }
+
+  async function confirmInterval() {
+    if (busy) return;
+    if (!intervalStart) {
+      setNotice("先に I で区間の始点を置いてください");
+      return;
+    }
+    if (markMode !== "add" || !tap || !cur || !state) {
+      setNotice("終点の位置をタップしてください");
+      return;
+    }
+    const useClass = cls || state.default_class;
+    const payload: Partial<MarkRequest> = {
+      x: tap[0],
+      y: tap[1],
+      w: boxSize[0],
+      h: boxSize[1],
+      class: useClass,
+      start_frame: intervalStart.frame,
+      start_x: intervalStart.tap[0],
+      start_y: intervalStart.tap[1],
+      start_w: intervalStart.size[0],
+      start_h: intervalStart.size[1],
+    };
+    cancelMark();
+    await judge("fixed", payload);
+  }
+
   async function reloadQueue(params: Record<string, string | number>) {
     setSave({ kind: "busy", text: "作り直し中" });
     try {
@@ -320,6 +399,10 @@ function App() {
         case "5": startMark("erase"); break;
         case "u":
         case "U": void undo(); break;
+        case "i":
+        case "I": markStart(); break;
+        case "o":
+        case "O": void confirmInterval(); break;
         case "ArrowLeft": goto(idx - 1); break;
         case "ArrowRight": goto(idx + 1); break;
         case "Escape": cancelMark(); break;
@@ -343,9 +426,11 @@ function App() {
   const bannerText = spec
     ? erase
       ? erase.banner
-      : tap
-        ? "大きさは下のスライダで調整できます"
-        : spec.hint
+      : interval.active
+        ? interval.banner
+        : tap
+          ? "大きさは下のスライダで調整できます。区間追従は I で始点を置けます"
+          : spec.hint
     : notice || bannerFor(items, idx);
   const posText = cur
     ? `${idx + 1} / ${items.length}`
@@ -420,6 +505,27 @@ function App() {
                       onClick={() => setSpan(o.v)}>{o.label}</button>
             ))}
           </div>
+          {markMode === "add" && (
+            // 区間追従（issue #46）。動画編集ソフトのイン点・アウト点と同じで、
+            // タップした位置を I で始点にし、終点のコマで O を押すとあいだを埋める
+            <div class="row" id="interval-row" style={{ marginTop: "8px" }}>
+              <button id="btn-interval-start" class="half" disabled={!tap}
+                      onClick={markStart}>
+                {intervalStart
+                  ? `始点を更新（I） / いま frame ${intervalStart.frame}`
+                  : "ここを区間の始点にする（I）"}
+              </button>
+              <button id="btn-interval-confirm" class="half ok" disabled={interval.confirmDisabled}
+                      onClick={() => void confirmInterval()}>
+                区間をここまで塗る（O）
+              </button>
+            </div>
+          )}
+          {interval.active && (
+            <div id="interval-banner" class="dim mono" style={{ marginTop: "4px" }}>
+              {interval.banner}
+            </div>
+          )}
           <button id="btn-confirm" class={"big " + (markMode === "erase" ? "ng" : "ok")}
                   style={{ marginTop: "8px" }} disabled={confirmDisabled} onClick={confirmMark}>
             {confirmLabel}
@@ -493,6 +599,10 @@ function App() {
         <p class="dim">
           キー: 1 問題なし / 2 漏れている / 3 判断できない / 4 でかすぎる /
           5 誤検知 / U ひとつ戻す / ← → 前後の1枚 / Esc やめる
+        </p>
+        <p class="dim">
+          区間追従（#46）: 2 でタップして I が始点 → ← → で終点のコマへ移動して
+          タップ → O で確定（あいだを補間して埋める）
         </p>
       </div>
     </>

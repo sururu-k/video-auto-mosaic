@@ -308,6 +308,43 @@ section("重ね描き: 何を描くかの分岐");
     pending: [10, 20, 30, 40],
   });
   ok(n(ctx, "strokeRect") === 1, "置いた矩形は枠の表示に関係なく描く");
+
+  // 区間の始点（issue #46）。枠の表示を切っていても、始点はそのコマにいる
+  // あいだ見えていないと「区間を張ったつもりが見えない」になる
+  ctx = fakeCtx();
+  L.drawReviewOverlay(ctx, {
+    width: W, height: H, boxes: [], showBoxes: false, markMode: "add", picked: [],
+    pending: null, startBox: [5, 5, 40, 40],
+  });
+  ok(n(ctx, "strokeRect") === 1, "区間の始点は枠表示を切っていても描く");
+
+  // startBox が無ければ何も足されない（他のケースの strokeRect 件数を変えない）
+  ctx = fakeCtx();
+  L.drawReviewOverlay(ctx, {
+    width: W, height: H, boxes, showBoxes: true, markMode: null, picked: [], pending: null,
+  });
+  ok(n(ctx, "strokeRect") === 3, "startBox を渡さなければ増えない");
+}
+
+// --------------------------------------------------------------------
+section("区間追従（issue #46）: 始点・終点の案内");
+// --------------------------------------------------------------------
+{
+  let s = L.intervalStatus(null, 10, false);
+  ok(!s.active, "始点が無ければ非アクティブ");
+  ok(s.confirmDisabled, "始点が無ければ確定できない");
+
+  s = L.intervalStatus({ frame: 10 }, 10, false);
+  ok(s.active, "始点があればアクティブ");
+  ok(s.onStartFrame, "始点そのもののコマにいることが分かる");
+  ok(s.confirmDisabled, "終点のタップが無ければ確定できない（漏れを防ぐ）");
+  ok(s.banner.includes("frame 10"), "始点のフレーム番号を案内に出す: " + s.banner);
+
+  s = L.intervalStatus({ frame: 10 }, 40, true);
+  ok(!s.onStartFrame, "終点のコマでは始点フレームと一致しない");
+  ok(!s.confirmDisabled, "終点をタップしていれば確定できる");
+  ok(s.banner.includes("frame 10") && s.banner.includes("frame 40"),
+     "始点と終点の両方のフレーム番号が案内に出る: " + s.banner);
 }
 
 {

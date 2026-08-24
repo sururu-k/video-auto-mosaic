@@ -485,16 +485,47 @@ def create_app(
             pick = None
             if payload.get("pick"):
                 pick = [[float(v) for v in b[:4]] for b in payload["pick"]]
+            # 区間の始点（issue #46）。end 側は既存のフィールド（frame/x/y/w/h）を
+            # そのまま使う。始点だけ別名にしてあるのは、フィールドが1組しか
+            # 無い既存の呼び出し（span 判定）とサーバ側で区別するため
+            start_frame = None
+            start_tap = None
+            start_size = None
+            if "start_frame" in payload and "start_x" in payload and "start_y" in payload:
+                start_frame = int(payload["start_frame"])
+                start_tap = (float(payload["start_x"]), float(payload["start_y"]))
+                if payload.get("start_w") and payload.get("start_h"):
+                    start_size = (float(payload["start_w"]), float(payload["start_h"]))
             with s.lock:
-                added = s.mark(
-                    frame,
-                    verdict,
-                    tap=tap,
-                    size=size,
-                    span=int(payload.get("span", 0)),
-                    cls=payload.get("class"),
-                    pick=pick,
-                )
+                if start_frame is not None:
+                    # 「でかすぎる」「誤検知」の remove を区間補間で動かすのは
+                    # 危険（review.mark_interval のドキュストリング参照）。
+                    # add だけの「漏れている」に限定する
+                    if verdict != "fixed":
+                        raise ValueError(
+                            "区間指定は「漏れている」判定だけに対応しています"
+                        )
+                    if tap is None:
+                        raise ValueError("終点の位置が指定されていません")
+                    added = s.mark_interval(
+                        frame,
+                        tap,
+                        start_frame,
+                        start_tap,
+                        size=size,
+                        start_size=start_size,
+                        cls=payload.get("class"),
+                    )
+                else:
+                    added = s.mark(
+                        frame,
+                        verdict,
+                        tap=tap,
+                        size=size,
+                        span=int(payload.get("span", 0)),
+                        cls=payload.get("class"),
+                        pick=pick,
+                    )
                 out = {
                     "ok": True,
                     "frame": frame,

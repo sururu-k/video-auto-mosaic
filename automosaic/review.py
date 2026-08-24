@@ -44,6 +44,7 @@ import numpy as np
 from .corrections import Correction, CorrectionSet
 from .detector import Detection
 from .render import apply_regions, default_block_size
+from .webapp import spans
 from .temporal import (
     TemporalConfig,
     estimated_only_ranges,
@@ -1359,6 +1360,92 @@ class ReviewSession:
         self.save_progress()
         return added
 
+    def mark_interval(
+        self,
+        frame: int,
+        tap: tuple[float, float],
+        start_frame: int,
+        start_tap: tuple[float, float],
+        size: tuple[float, float] | None = None,
+        start_size: tuple[float, float] | None = None,
+        cls: str | None = None,
+    ) -> int:
+        """区間の両端（打った2点）のあいだを補間して埋める（issue #46）。
+
+        「漏れている」（fixed = add のみ）専用。issue #22 が問題視した
+        「複製で展開する」`mark()` の経路とは別に、`spans.interval_add_records()`
+        （= `spans.interval_records()`。中身は
+        `tools/annotations_to_corrections.py` の `build()`）を呼んで、対象が
+        動いた分だけ両端のあいだを線形補間する。
+
+        **「でかすぎる」（toobig）の remove 側はここでは対象にしない。**
+        remove は自動検出領域を打ち消す操作なので、区間補間が対象の実際の
+        動き（往復・加減速）から外れたフレームでは、実際の検出領域より
+        狭い範囲しか残らず、漏れる方向に壊れる（`tests/test_spans.py` の実測:
+        150条件中26条件で mean_iou が複製より悪化、9条件で完全に外れる
+        フレームが発生）。add はもともと無条件で足すだけなので、この危険が
+        構造的に無い。安全な範囲（add のみ）から通す。
+
+        `spans.interval_add_records()` に `self.auto_cover_box` を渡し、
+        区間内の各フレームで補間した矩形と既存の自動検出領域の envelope を
+        採る（RULES.md 0「大きいほうを採る」）。
+
+        両端の前後関係は問わない。`start_frame` が `frame` より後ろでもよい
+        （キーボードで先に置いた点と、後で置いた点のどちらが時間的に先かは
+        利用者の操作順に依らない）。
+        """
+        lo_frame, lo_tap = int(start_frame), start_tap
+        lo_size = start_size or self.default_size
+        hi_frame, hi_tap = int(frame), tap
+        hi_size = size or self.default_size
+        if hi_frame < lo_frame:
+            lo_frame, hi_frame = hi_frame, lo_frame
+            lo_tap, hi_tap = hi_tap, lo_tap
+            lo_size, hi_size = hi_size, lo_size
+        if not 0 <= lo_frame < self.n_frames or not 0 <= hi_frame < self.n_frames:
+            raise ValueError(
+                f"フレーム番号が範囲外です: {lo_frame}〜{hi_frame}"
+                f"（0〜{self.n_frames - 1}）"
+            )
+
+        lo_box = tap_to_box(lo_tap[0], lo_tap[1], lo_size, self.width, self.height)
+        hi_box = tap_to_box(hi_tap[0], hi_tap[1], hi_size, self.width, self.height)
+        use_cls = cls or self.default_class
+
+        records = spans.interval_add_records(
+            lo_frame,
+            lo_box,
+            hi_frame,
+            hi_box,
+            use_cls,
+            self.width,
+            self.height,
+            existing_cover=self.auto_cover_box,
+        )
+        for rec in records:
+            self.corrections.items.append(
+                Correction(frame=rec.frame, box=rec.box, cls=rec.cls, kind="add")
+            )
+        added = len(records)
+        self._save_corrections()
+
+        # verdict は両端のフレームにだけ付ける。span 判定（mark()）が
+        # 「渡された frame」だけに付けているのと同じ扱い。中間フレームは
+        # キューに出ていれば別途判定される
+        self.history.append(
+            {
+                "frame": hi_frame,
+                "prev": self.verdicts.get(hi_frame),
+                "added": added,
+                "fp": 0,
+                "extra_verdicts": [[lo_frame, self.verdicts.get(lo_frame)]],
+            }
+        )
+        self.verdicts[hi_frame] = "fixed"
+        self.verdicts[lo_frame] = "fixed"
+        self.save_progress()
+        return added
+
     def _save_corrections(self) -> None:
         """修正一覧をファイルへ書いて、領域を作り直す。
 
@@ -1464,6 +1551,14 @@ class ReviewSession:
             self.verdicts.pop(h["frame"], None)
         else:
             self.verdicts[h["frame"]] = h["prev"]
+        # mark_interval() は両端2フレームぶんの判定を付けるが、history の
+        # "frame" キーは1つしか持てない。もう一方（区間の始点）の判定は
+        # ここで戻す（無ければ何もしない。古い history には無いキー）
+        for f, prev in h.get("extra_verdicts", []):
+            if prev is None:
+                self.verdicts.pop(f, None)
+            else:
+                self.verdicts[f] = prev
         self.save_progress()
         return h
 

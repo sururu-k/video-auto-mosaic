@@ -157,6 +157,14 @@ function progressPercent(p) {
 function requestWidth(videoWidth, screenWidth, dpr) {
   return Math.min(videoWidth, Math.max(480, Math.round(Math.min(screenWidth, 1280) * dpr)));
 }
+function intervalStatus(start, curFrame, endTapPlaced) {
+  if (!start) {
+    return { active: false, onStartFrame: false, banner: "", confirmDisabled: true };
+  }
+  const onStartFrame = curFrame !== null && curFrame === start.frame;
+  const banner = endTapPlaced ? `区間: frame ${start.frame} 〜 frame ${curFrame}。O で確定（Esc でやめる）` : `始点は frame ${start.frame}。終点のコマへ移動してタップし、O で確定（Esc でやめる）`;
+  return { active: true, onStartFrame, banner, confirmDisabled: !endTapPlaced };
+}
 
 // src/shared/geom.ts
 function normPoint(x, y) {
@@ -205,7 +213,7 @@ function drawReviewOverlay(ctx, o) {
   ctx.clearRect(0, 0, o.width, o.height);
   const shrink = o.markMode === "shrink";
   const erase = o.markMode === "erase";
-  if (!o.showBoxes && !o.pending && !shrink && !erase) return;
+  if (!o.showBoxes && !o.pending && !o.startBox && !shrink && !erase) return;
   const lw = Math.max(2, Math.round(o.width / 400));
   if (erase) {
     const boxes = autoBoxes(o.boxes);
@@ -254,6 +262,11 @@ function drawReviewOverlay(ctx, o) {
     ctx.strokeStyle = "#ffffff";
     ctx.strokeRect(o.pending[0], o.pending[1], o.pending[2], o.pending[3]);
     ctx.setLineDash([]);
+  }
+  if (o.startBox) {
+    ctx.lineWidth = lw * 1.5;
+    ctx.strokeStyle = "#5ad1a0";
+    ctx.strokeRect(o.startBox[0], o.startBox[1], o.startBox[2], o.startBox[3]);
   }
 }
 function drawRegionOverlay(ctx, o) {
@@ -349,6 +362,7 @@ export {
   firstUnjudged,
   frameFromClient,
   framePoint,
+  intervalStatus,
   normFromClient,
   normPoint,
   numOr,
