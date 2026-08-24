@@ -918,6 +918,25 @@ def main(argv: list[str] | None = None) -> int:
             print(geometry_problem, file=sys.stderr)
             return 1
 
+    # issue #68: 「probe の申告サイズが ffmpeg の実デコードと食い違う」検査
+    # （issue #32、vid.verify_full_frame_size）は元々パス2の直前（＝パス1の後）
+    # にしか無かった。実素材ではパス1が3.2fpsで約4.8時間かかる
+    # （docs/10-realrun-2026-08-24.md）ため、食い違う入力はその時間を丸ごと
+    # 無駄にしてから初めて止まっていた。上の check_render_geometry と違い、
+    # こちらは ffmpeg に実際に1フレーム デコードさせて突き合わせる別種の検査
+    # （奇数解像度でなくても、回転メタデータの未知パターンや映像ストリーム
+    # 選択のずれなど、計算だけでは検出できない食い違いを拾う）なので、
+    # 統合せずに両方とも probe 直後に置く。パス2側の呼び出しは残す
+    # （パス1の間に入力ファイルが差し替わるなど、状況が変わりうるため）。
+    try:
+        vid.verify_full_frame_size(info, src)
+    except RuntimeError as e:
+        if args.detect_only:
+            print(f"警告: {e} --detect-only のため続行します。", file=sys.stderr)
+        else:
+            print(str(e), file=sys.stderr)
+            return 1
+
     block = args.block or default_block_size(info.long_edge)
 
     if info.rotation and not args.quiet:

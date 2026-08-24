@@ -298,6 +298,24 @@ def computed_detection_frame_size(info: VideoInfo, infer_size: int) -> tuple[int
     return max(div, w), max(div, h)
 
 
+def _measure_png_frame_size(
+    stdout: bytes, stderr: bytes, fail_prefix: str
+) -> tuple[int, int]:
+    """ffmpeg に `-f image2 -c:v png` で吐かせた1枚の PNG の IHDR からサイズを読む。
+
+    measure_detection_frame_size（`-vf` あり）と measure_full_frame_size
+    （`-vf` なし）の唯一の違いはデコードコマンドの `-vf` の有無で、
+    IHDR の解析は完全に同一だった（PR #47 のレビュー指摘）。ここに1つに
+    まとめる。将来どちらかだけ直して片方が古いままになる事故を防ぐ。
+    """
+    pos = stdout.find(b"IHDR")
+    if pos < 0 or len(stdout) < pos + 12:
+        err = stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"{fail_prefix}:\n{err}")
+    w, h = struct.unpack(">II", stdout[pos + 4 : pos + 12])
+    return int(w), int(h)
+
+
 def measure_detection_frame_size(path: str, infer_size: int) -> tuple[int, int]:
     """scale 後のサイズを ffmpeg 自身に1フレーム出させて実測する。
 
@@ -319,15 +337,9 @@ def measure_detection_frame_size(path: str, infer_size: int) -> tuple[int, int]:
         ],
         capture_output=True,
     )
-    data = out.stdout
-    pos = data.find(b"IHDR")
-    if pos < 0 or len(data) < pos + 12:
-        err = out.stderr.decode("utf-8", "replace").strip()
-        raise RuntimeError(
-            f"デコードサイズの実測に失敗しました（{path}）:\n{err}"
-        )
-    w, h = struct.unpack(">II", data[pos + 4 : pos + 12])
-    return int(w), int(h)
+    return _measure_png_frame_size(
+        out.stdout, out.stderr, f"デコードサイズの実測に失敗しました（{path}）"
+    )
 
 
 def detection_frame_size(
@@ -372,19 +384,13 @@ def measure_full_frame_size(path: str) -> tuple[int, int]:
         ],
         capture_output=True,
     )
-    data = out.stdout
-    pos = data.find(b"IHDR")
-    if pos < 0 or len(data) < pos + 12:
-        err = out.stderr.decode("utf-8", "replace").strip()
-        raise RuntimeError(
-            f"パス2のデコードサイズの実測に失敗しました（{path}）:\n{err}"
-        )
-    w, h = struct.unpack(">II", data[pos + 4 : pos + 12])
-    return int(w), int(h)
+    return _measure_png_frame_size(
+        out.stdout, out.stderr, f"パス2のデコードサイズの実測に失敗しました（{path}）"
+    )
 
 
 def verify_full_frame_size(info: VideoInfo, path: str) -> None:
-    """パス2開始前に、probe() の申告サイズと ffmpeg の実デコード出力を突き合わせる。
+    """probe() の申告サイズと ffmpeg の実デコード出力を突き合わせる。
 
     issue #32: `FrameBuffer` の長さ検査（`y_size = width*height` ほか）は
     width と height を入れ替えても値が変わらない対称式なので、probe() と
@@ -392,19 +398,31 @@ def verify_full_frame_size(info: VideoInfo, path: str) -> None:
     転置されて全フレームが斜めに裂けたスクランブル画像になる（issue #1 で
     塞いだ回転メタデータの経路がまさにこれだった）。パス1の
     detection_frame_size() は食い違いを警告して実測値へフォールバックするが、
-    パス2でここが食い違うのはフォールバックする根拠が無い
-    （FrameBuffer をどちらのサイズで作っても、以降の座標系のどこかがずれる）
-    ので、警告ではなく例外で止める。
+    ここが食い違うのはフォールバックする根拠が無い（FrameBuffer をどちらの
+    サイズで作っても、以降の座標系のどこかがずれる）ので、警告ではなく
+    例外で止める。
+
+    issue #68: 呼び出し場所は2か所ある。probe() 直後（cli.py の main()、
+    パス1に入る前）と run_render() の先頭（パス2の reader/writer を開く前）。
+    前者は実素材で3.2fps・約4.8時間かかるパス1を無駄にする前に止めるため、
+    後者はパス1の間に入力ファイルが差し替わるなど状況が変わりうるために
+    残してある。判明済みの発生経路は、回転メタデータの未知パターン・
+    映像ストリームが複数あるコンテナで ffmpeg の既定選択と probe() の選択が
+    ずれる場合・先頭フレームが壊れているファイルなど（PR #47 の独立検証で
+    実測）。
     """
     measured = measure_full_frame_size(path)
     if measured != (info.width, info.height):
         raise RuntimeError(
-            f"パス2: probe の申告サイズ {info.width}x{info.height} が"
+            f"probe の申告サイズ {info.width}x{info.height} が"
             f" ffmpeg の実デコード出力 {measured[0]}x{measured[1]} と"
             "一致しません（issue #32）。FrameBuffer の長さ検査は幅と高さの"
             "入れ替えに対して不変なため、ここで止めないと例外もエラーも"
-            "出ないまま全フレームが斜めに裂けたスクランブル画像として"
-            "書き出されます。"
+            "出ないまま全フレームが斜めに裂けたスクランブル画像がモザイクの"
+            "描画（パス2）から exit 0 で出ます。この入力は今のところ処理できません"
+            "（原因の実例: 回転メタデータの未知パターン、映像ストリームが複数ある"
+            "コンテナでのストリーム選択のずれ、先頭フレームが壊れたファイル）。"
+            "ffprobe -show_streams の出力を添えて調査を依頼してください。"
         )
 
 

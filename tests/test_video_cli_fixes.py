@@ -1555,6 +1555,160 @@ def test_odd_resolution_detect_only_warns_but_completes():
     print("  奇数解像度 --detect-only の完走（警告のみ） OK")
 
 
+def test_probe_ffmpeg_mismatch_stops_before_wasting_pass1():
+    """issue #68: probe と実デコードの食い違い検査（issue #32、#47）は元々
+    run_render() の直前（＝パス1の後）にしか無く、実素材ではパス1に約4.8時間
+    かかる（docs/10-realrun-2026-08-24.md）ため、食い違う入力はその時間を
+    無駄にしてから初めて止まっていた。ここでは vid.probe() が実デコードと
+    食い違う寸法を返す状況（probe 自身の申告が誤っている状況）を模擬し、
+    パス1（Detector構築）に到達する前に rc=1 で止まることを確認する。
+
+    #2 のときと同じ手口（cli.Detector を到達検知用の例外に差し替える）を使う。
+    ただし今回止めたい検査は check_render_geometry（偶奇のみを見る計算）とは
+    別物なので、入れ替える寸法は偶数のまま（奇数検査には引っかからない）にする。
+    """
+    if not _have_ffmpeg():
+        print("  probe/ffmpeg 不一致の早期停止 SKIP (ffmpeg 無し)")
+        return
+    import dataclasses
+
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.mp4")
+        dst = os.path.join(d, "out.mp4")
+        _make_video(src, 64, 48, 5, fps=15)
+
+        real_probe = vid.probe
+
+        def _fake_probe(path):
+            info = real_probe(path)
+            # 実デコードは 64x48 のまま。probe だけが 48x64（w/h 入れ替え）を
+            # 申告する状況を模擬する。y_size=64*48==48*64 なので、この入れ替えは
+            # FrameBuffer の長さ検査だけでは検出できない（issue #32 の核心）。
+            return dataclasses.replace(info, width=48, height=64)
+
+        vid.probe = _fake_probe
+
+        def _boom(**kw):
+            raise AssertionError(
+                "パス1（Detector構築）まで到達した。検出前に止まっていない"
+            )
+
+        real_detector, cli.Detector = cli.Detector, _boom
+        try:
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli.main([src, "-o", dst])
+        finally:
+            vid.probe = real_probe
+            cli.Detector = real_detector
+
+        assert rc == 1, f"probe/ffmpeg 不一致なのに rc={rc}: {err.getvalue()}"
+        assert not os.path.exists(dst), "止まったはずなのに出力ファイルができている"
+        assert "一致しません" in err.getvalue(), (
+            f"不一致を理由にした停止メッセージが無い: {err.getvalue()!r}"
+        )
+    print("  probe/ffmpeg 不一致の早期停止（パス1を待たせない） OK")
+
+
+def test_probe_ffmpeg_mismatch_detect_only_warns_but_completes():
+    """issue #68: --detect-only は probe/ffmpeg 不一致でも警告のみで完走すること。
+
+    check_render_geometry（issue #2）と同じ扱い方に揃える。パス1自体は
+    detection_frame_size() が実測値にフォールバックするため、probe の
+    width/height が誤っていても致命的に壊れるわけではない
+    （scale_back の分母がずれるので座標は不正確になりうるが、それは検出専用
+    フラグの範囲内の話であり、モザイクを焼く出力ファイル自体は作られない）。
+    """
+    if not _have_ffmpeg():
+        print("  probe/ffmpeg 不一致 --detect-only の完走 SKIP (ffmpeg 無し)")
+        return
+    import dataclasses
+
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.mp4")
+        _make_video(src, 64, 48, 5, fps=15)
+
+        real_probe = vid.probe
+
+        def _fake_probe(path):
+            info = real_probe(path)
+            return dataclasses.replace(info, width=48, height=64)
+
+        vid.probe = _fake_probe
+        real_detector, cli.Detector = cli.Detector, lambda **kw: _NullDetector()
+        try:
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli.main([src, "--detect-only", "--quiet"])
+        finally:
+            vid.probe = real_probe
+            cli.Detector = real_detector
+
+        assert rc == 0, f"--detect-only なのに rc={rc}: {err.getvalue()}"
+        msg = err.getvalue()
+        assert "一致しません" in msg, f"不一致の警告が出ていない: {msg!r}"
+        assert "続行します" in msg, f"続行の告知が出ていない: {msg!r}"
+    print("  probe/ffmpeg 不一致 --detect-only の完走（警告のみ） OK")
+
+
+def test_matching_inputs_pass_both_early_geometry_checks():
+    """issue #68: 正常な（probe と実デコードが一致する）入力を誤って止めないこと。
+
+    check_render_geometry と probe 直後の verify_full_frame_size、2つの検査を
+    probe 直後に並べたので、どちらも誤爆しないことを複数の解像度・複数の
+    コンテナで確認する。#47 の独立検証は mp4/mkv/webm/avi/mjpeg/TS/縦/回転/
+    10bit/VFR/アナモルフィック/カバーアート添付など20種の合成素材で誤爆ゼロ
+    だったが、ここでは cli.main() の通常経路（probe 直後の2検査 + パス1 +
+    パス2）を実際に完走させて確認する範囲に絞る（フルの20種の再現は別途）。
+    """
+    if not _have_ffmpeg():
+        print("  正常入力の誤爆なし SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        cases = [
+            ("mp4_even", os.path.join(d, "a.mp4"), 320, 240),
+            ("mp4_odd_frame", os.path.join(d, "b.mp4"), 640, 480),
+        ]
+        for name, src, w, h in cases:
+            _make_video(src, w, h, 5, fps=10)
+            dst = os.path.join(d, name + "_out.mp4")
+            real_detector, cli.Detector = cli.Detector, lambda **kw: _NullDetector()
+            try:
+                out = io.StringIO()
+                err = io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    rc = cli.main([src, "-o", dst, "--quiet"])
+            finally:
+                cli.Detector = real_detector
+            assert rc == 0, f"{name}: 正常入力なのに rc={rc}: {err.getvalue()}"
+            assert "一致しません" not in err.getvalue(), (
+                f"{name}: 正常入力なのに不一致の誤検知: {err.getvalue()!r}"
+            )
+            assert "奇数" not in err.getvalue(), (
+                f"{name}: 正常入力なのに奇数の誤検知: {err.getvalue()!r}"
+            )
+            assert os.path.exists(dst), f"{name}: 正常入力なのに出力が作られていない"
+
+        # 回転メタデータ（issue #1 の経路。probe() 側が width/height を
+        # 入れ替え済みで整合させるので、ここも誤爆してはいけない）
+        rot_src = os.path.join(d, "rot.mp4")
+        _make_rotated_video(rot_src, 320, 240, 5, degrees=90, fps=10)
+        rot_dst = os.path.join(d, "rot_out.mp4")
+        real_detector, cli.Detector = cli.Detector, lambda **kw: _NullDetector()
+        try:
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli.main([rot_src, "-o", rot_dst, "--quiet"])
+        finally:
+            cli.Detector = real_detector
+        assert rc == 0, f"回転動画なのに rc={rc}: {err.getvalue()}"
+        assert "一致しません" not in err.getvalue(), (
+            f"回転動画なのに不一致の誤検知: {err.getvalue()!r}"
+        )
+        assert os.path.exists(rot_dst)
+    print("  正常入力（偶数解像度・回転メタデータ）の誤爆なし OK")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"{len(tests)} 件のテストを実行\n")
