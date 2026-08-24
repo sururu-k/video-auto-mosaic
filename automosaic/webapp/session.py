@@ -19,6 +19,16 @@ from .jobs import Job, count_corrections
 
 # 同時に開いておくセッション数。1人で使う道具なので数本で足りる。
 # 開きっぱなしにすると VideoCapture のぶんだけメモリとハンドルを持つ。
+#
+# 実測（issue #25。4000フレーム、間欠検出、1920x1080相当の座標）:
+# regions 612KB + per_frame 374KB + coverage(str) 4KB ≈ 1MB/セッション
+# （Python オブジェクトぶんのみ。VideoCapture 自体が確保する OS 側の
+# デコーダバッファ/ハンドルは未測定）。issue に書かれた実測 32,000フレーム
+# 規模でも Python オブジェクト側は数MB止まりで、3という本数を決めている
+# 実質のボトルネックは VideoCapture の本数（未測定）とセッション構築の
+# 所要時間（構築は #25 でロックの外に出したので、本数を絞る理由としては
+# 以前より薄くなっている）と見られる。VideoCapture 側を測っていないので、
+# この数字だけでは MAX_OPEN を変える根拠にならない。変えるなら測ってから。
 MAX_OPEN = 3
 
 
@@ -59,23 +69,73 @@ class SessionCache:
         self._items: dict[str, review.ReviewSession] = {}
         self._order: list[str] = []
         self._lock = threading.Lock()
+        # 構築中のジョブID -> 完了通知。get() の中で組む
+        # (実測 5.2秒/32,000フレーム。det.json のパース + temporal.process()
+        # の全フレーム再計算) をこのクラスの _lock の下でやると、無関係な
+        # 他ジョブの get() まで待たされる（issue #25）。構築はロックの外で
+        # 行い、同じジョブへ同時に来た要求は自分では作らず先行者を待つ
+        # （二重に 5 秒級の処理を走らせない・後発が先発の動画ハンドルを
+        # 即座に閉じて捨てる事故を避ける）。
+        self._building: dict[str, threading.Event] = {}
         self.limit = limit
 
     def get(self, job: Job, **overrides) -> review.ReviewSession:
+        while True:
+            with self._lock:
+                s = self._items.get(job.id)
+                if s is not None and not overrides:
+                    self._touch(job.id)
+                    return s
+                ev = self._building.get(job.id)
+                if ev is None:
+                    ev = threading.Event()
+                    self._building[job.id] = ev
+                    mine = True
+                else:
+                    mine = False
+            if mine:
+                break
+            ev.wait()
+            # 出来上がったはず。キャッシュを見直すところからやり直す
+            # （待っていた側の overrides が先行者と違えば、今度は自分が作る番になる）
+
+        try:
+            new_s = session_for_job(job, **overrides)
+        except BaseException:
+            # 構築に失敗しても、待っているスレッドは解放する。ここでは
+            # self._items を触らない（new_s が無い）ので、_items への反映と
+            # _building の解除を分けて2回ロックを取り直すと、その間隙で
+            # 「_items にまだ無い・_building ももう無い」を見た待機スレッドが
+            # 自分も構築側に回ってしまう（TOCTOU。二重構築の実測あり）。
+            # 正常系はこの隙間を作らないよう、下の1回のロックで両方を済ませる
+            with self._lock:
+                self._building.pop(job.id, None)
+                ev.set()
+            raise
+
         with self._lock:
-            s = self._items.get(job.id)
-            if s is not None and not overrides:
-                self._touch(job.id)
-                return s
-            if s is not None:
-                # 設定違いで作り直す。古い方の動画ハンドルは必ず閉じる
-                self._close(job.id)
-            s = session_for_job(job, **overrides)
-            self._items[job.id] = s
-            self._order.append(job.id)
+            # 設定違いで作り直された場合、古い方の動画ハンドルは必ず閉じる。
+            # 構築が終わるまで古いセッションを差し替えないので、構築中も
+            # 他の要求は（overrides が空である限り）引き続き古い方を使える。
+            #
+            # self._items への反映と _building の解除・ev.set() を同じロック
+            # 保持区間でやる。分けると、解除後・反映前の隙間で目覚めた待機
+            # スレッドが「_items にまだ無い」「_building ももう無い」を見て
+            # 自分も構築側に回り、二重構築になる（実測: setswitchinterval
+            # 1e-6 下で500試行中320件、最大6重）。
+            old = self._items.get(job.id)
+            self._items[job.id] = new_s
+            self._touch(job.id)
             while len(self._order) > self.limit:
                 self._close(self._order[0])
-            return s
+            self._building.pop(job.id, None)
+            ev.set()
+        if old is not None and old is not new_s:
+            try:
+                old.reader.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return new_s
 
     def drop(self, job_id: str) -> None:
         with self._lock:

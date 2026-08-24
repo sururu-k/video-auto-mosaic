@@ -531,8 +531,9 @@ def create_app(
         if not 0 <= n < s.n_frames:
             raise _err(404, f"フレーム番号が範囲外です: {n}（0〜{s.n_frames - 1}）")
         fmt = "jpg" if fmt in ("jpg", "jpeg") else "png"
-        with s.lock:
-            got = s.frame_image(n, raw=bool(raw), max_w=max(0, int(w)), fmt=fmt)
+        # s.lock は取らない。recompute() 中でもフレーム画像は出す
+        # （issue #25。review.ReviewSession.lock のコメントを参照）。
+        got = s.frame_image(n, raw=bool(raw), max_w=max(0, int(w)), fmt=fmt)
         if got is None:
             raise _err(404, f"フレーム {n} を読めません")
         body, ctype = got

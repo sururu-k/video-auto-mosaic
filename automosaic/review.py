@@ -938,6 +938,18 @@ class ReviewSession:
     progress_path: str | None = None
 
     reader: FrameReader = field(init=False)
+    # 状態変更（recompute / set_corrections / mark / undo / rebuild_queue）を
+    # 直列化するロック。フレーム画像の取得（frame_image）はこれを取らない
+    # (issue #25)。理由:
+    #   - self.regions / self.stats / self.coverage / self.version は
+    #     recompute() が新しい値を作ってから丸ごと代入で差し替える
+    #     （インプレースで書き換えない）。CPython の属性代入は GIL の下で
+    #     1バイトコードなので、途中の値が読めることはない。読めるのは
+    #     「差し替え前の一貫した値」か「差し替え後の一貫した値」のどちらか。
+    #   - self.block / self.mode はセッション構築後に変わらない。
+    #   - 実際のフレーム読み出しは FrameReader._lock がすでに直列化している
+    #     （同じ VideoCapture を2スレッドから同時に read() させないため）。
+    # 複数フィールドをまたいで一貫性が要る state_payload 等はこのロックの下で読む。
     lock: threading.Lock = field(init=False)
     regions: dict = field(init=False, default_factory=dict)
     stats: dict = field(init=False, default_factory=dict)
@@ -1589,8 +1601,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
             max_w = 0
         fmt = "jpg" if (q.get("fmt") or ["png"])[0] in ("jpg", "jpeg") else "png"
 
-        with s.lock:
-            got = s.frame_image(n, raw=raw, max_w=max(0, max_w), fmt=fmt)
+        # s.lock は取らない。recompute() 中でもフレーム画像は出す
+        # （issue #25。ReviewSession.lock のコメントを参照）。デコード自体は
+        # FrameReader._lock がすでに直列化している。
+        got = s.frame_image(n, raw=raw, max_w=max(0, max_w), fmt=fmt)
         if got is None:
             self._error(404, f"フレーム {n} を読めません")
             return
