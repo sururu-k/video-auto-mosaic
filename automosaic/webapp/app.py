@@ -410,6 +410,58 @@ def create_app(
     # ------------------------------------------------------------------
     # 3. 検査キュー
     # ------------------------------------------------------------------
+    def _report_effective(job: Job) -> dict | None:
+        """report.json から実効設定のフィンガープリントを取り出す。
+
+        無い・壊れている・古い形式（effective / effective_sha256 を持たない）
+        場合は None を返す。呼び出し側はこれを「一致」として扱わないこと。
+        """
+        if not os.path.exists(job.report):
+            return None
+        try:
+            with open(job.report, encoding="utf-8") as f:
+                rep = json.load(f)
+        except (OSError, ValueError):
+            return None
+        eff = rep.get("effective")
+        sha = rep.get("effective_sha256")
+        if not eff or not sha:
+            return None
+        return {"effective": eff, "sha256": sha}
+
+    def _check_effective_settings(job: Job, s) -> None:
+        """レビューの実効設定を、実際に焼いた report.json と突き合わせる。
+
+        issue #16: どちらも警告ゼロ・エラーゼロで食い違っていた（#14, #15）。
+        黙って通さず、食い違いを検出したら絵を返さずに 409 で止める
+        （RULES.md 0: 判断がつかないときは塞ぐ・止める）。
+
+        完成品（job.output）がまだ無いジョブは比較対象が無い。検出だけ済ませて
+        描画前にレビュー/手描きをする通常の使い方を塞がないよう、ここでは
+        何もしない。
+        """
+        if not os.path.exists(job.output):
+            return
+        rep = _report_effective(job)
+        session_eff = s.effective_settings()
+        session_sha = s.effective_sha256()
+        if rep is None:
+            raise _err(
+                409,
+                "完成品はありますが report.json に実効設定の記録がありません"
+                "（古い形式か破損しています）。レビューが焼き込みと同じ設定で"
+                "絵を作っている保証がないため表示できません。"
+                "焼き直すと記録されます。"
+                f" レビュー側の実効設定: {session_eff}",
+            )
+        if rep["sha256"] != session_sha:
+            raise _err(
+                409,
+                "この動画は表示中の設定と違う設定で焼かれています。"
+                "焼き直すか、レビューの設定を焼き込みに合わせてください。"
+                f" 焼き込み: {rep['effective']} / レビュー: {session_eff}",
+            )
+
     def get_session(job: Job):
         # ジョブの settings（焼き込みに使った mode/block/classes/estimate_gaps
         # など）を、そのままレビューにも渡す。ここを空のまま呼ぶと、レビューは
@@ -422,13 +474,15 @@ def create_app(
             # 誤認させるので、レビューを止めて利用者に直させる
             raise _err(400, str(e))
         try:
-            return sessions.get(job, **overrides)
+            s = sessions.get(job, **overrides)
         except FileNotFoundError as e:
             raise _err(400, str(e))
         except SystemExit as e:  # session_from_args は SystemExit で止める
             raise _err(400, str(e))
         except RuntimeError as e:
             raise _err(400, str(e))
+        _check_effective_settings(job, s)
+        return s
 
     @app.get("/api/jobs/{job_id}/state")
     def api_state(job_id: str, light: int = 1):

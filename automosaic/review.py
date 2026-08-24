@@ -47,6 +47,8 @@ from .render import apply_regions, default_block_size
 from .webapp import spans
 from .temporal import (
     TemporalConfig,
+    effective_settings,
+    effective_settings_sha256,
     estimated_only_ranges,
     narrow_without_estimate_gaps,
     process,
@@ -1001,6 +1003,18 @@ class ReviewSession:
         self.recompute()
         self.load_progress()
         self.rebuild_queue()
+
+    # -- 実効設定のフィンガープリント（issue #16） ------------------------
+    def effective_settings(self) -> dict:
+        """このセッションが領域計算に使っている実効設定。
+
+        cli.py が report.json に書くものと同じ形。ここが cli.py 側と
+        1フィールドでも食い違うと、レビューは焼き込みと違う絵を見せている。
+        """
+        return effective_settings(self.cfg, self.classes, self.block, self.mode)
+
+    def effective_sha256(self) -> str:
+        return effective_settings_sha256(self.effective_settings())
 
     # -- 領域の再計算 ----------------------------------------------------
     def recompute(self) -> None:

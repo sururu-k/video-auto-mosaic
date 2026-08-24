@@ -2139,6 +2139,86 @@ def test_session_overrides_transfers_critical_keys():
 
     print("  session_overrides が4キー（margin_scale/margin_cap/frame_step/estimate_gaps）を転送 OK")
 
+def test_effective_settings_mismatch_returns_409_and_report_records_burn():
+    """issue #16: 焼き込みが実際に使った実効設定が report.json に残ること、
+    レビューがそれと食い違ったら /frame /state /queue が絵を返さず 409 で
+    止まること、ただし /api/jobs（一覧・詳細・ダウンロード）は開けたまま
+    であること。
+
+    #15（webapp がジョブ設定をレビューへ渡す）は本 issue の前提だが、
+    別 PR（#43）としてまだ未マージ。そのため現状のレビュー側は常に既定値
+    （margin_scale=1.0 など）で組む。ここでは margin_scale だけを既定と違う
+    値（0.4）で実際に焼く。これは #14 の再現条件そのもの
+    （review 側だけ margin_scale=1.0 に「戻って」いる状態）で、この検査が
+    それを検出できることを実測する。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = upload(srv.base, sample_video())
+        jid = d["id"]
+        job = jobs_mod.Library(lib).get(jid)
+        write_fake_detections(job, d["n_frames"], d["width"], d["height"])
+
+        # 完成品(job.output)がまだ無い間は、report が無くても止めない。
+        # 検出だけ済ませてレビュー/手描きをする普通の使い方を塞がないため
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/state?t={TOKEN}")
+        assert code == 200, (code, body[:300])
+
+        # margin_scale=0.4（既定は 1.0）で実際に焼く
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/start?t={TOKEN}",
+            {"reuse": True, "settings": {"margin_scale": 0.4}},
+        )
+        assert code == 200, r
+        st = wait_finished(srv, jid)
+        assert st == "done", st
+
+        job = jobs_mod.Library(lib).get(jid)
+        assert os.path.exists(job.output), "完成品が無い"
+        with open(job.report, encoding="utf-8") as f:
+            rep = json.load(f)
+        assert rep.get("effective_sha256"), "report.json に effective_sha256 が無い"
+        assert rep["effective"]["cfg"]["margin_scale"] == 0.4, rep["effective"]["cfg"]
+
+        # レビューは常に既定(margin_scale=1.0)で組むので焼き込み(0.4)と食い違う
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/frame?n=0&t={TOKEN}")
+        assert code == 409, (code, body[:300])
+        detail = json.loads(body).get("detail", "")
+        assert "margin_scale" in detail, detail
+
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/state?t={TOKEN}")
+        assert code == 409, (code, body[:300])
+
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/queue?t={TOKEN}")
+        assert code == 409, (code, body[:300])
+
+        # 一覧・詳細・ダウンロードは開けたまま（issue #16 の完了条件:
+        # ジョブ一覧が開けなくなると詰むので /api/jobs は通す）
+        detail_job = get_json(f"{srv.base}/api/jobs/{jid}?t={TOKEN}")
+        assert detail_job["status"] == "done", detail_job
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/download?t={TOKEN}")
+        assert code == 200, (code, body[:300])
+
+        print(
+            "  実効設定の食い違い(#14再現条件)で /frame /state /queue が 409"
+            "（/api/jobs は通る）OK"
+        )
+
+        # report.json が effective / effective_sha256 を持たない
+        # （古い形式・破損）場合も「一致」とみなさず止めること
+        rep.pop("effective", None)
+        rep.pop("effective_sha256", None)
+        with open(job.report, "w", encoding="utf-8") as f:
+            json.dump(rep, f)
+        code, body, _ = request(f"{srv.base}/api/jobs/{jid}/frame?n=0&t={TOKEN}")
+        assert code == 409, (code, body[:300])
+        detail2 = json.loads(body).get("detail", "")
+        assert "記録がありません" in detail2, detail2
+        print("  report.json が effective を持たない（古い形式）場合も 409 OK")
+    finally:
+        srv.close()
+
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

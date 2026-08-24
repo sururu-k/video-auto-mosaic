@@ -22,6 +22,9 @@ docs/01-technical-design.md の設計は「幾何フィルタ -> トラッキン
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import json
 import math
 import sys
 from dataclasses import dataclass, field
@@ -213,6 +216,38 @@ def resolve_classes(spec: str) -> set[str]:
     if spec == "conservative":
         return set(CONSERVATIVE_CLASSES)
     return {c.strip() for c in spec.split(",") if c.strip()}
+
+
+# issue #16: 焼き込み(cli.py)とレビュー(review.py)が「同じ絵」を計算している
+# ことを構造的に確かめるための実効設定フィンガープリント。
+#
+# ここに含めるのは領域計算(process() 以降、render.py が塗る場所と形)に
+# 直接効くものだけ: TemporalConfig の全フィールド、対象クラス、ブロックサイズ、
+# 描画モード。パス1(検出)側の設定(infer_size / conf / tta / provider)は
+# 意図的に含めない。あれは det.json を作るときの性質であって、同じ det.json
+# から領域を計算するこの層の設定ではない。混ぜると検出器の設定を変えるたびに
+# 「食い違い」扱いになり、409 が本来の目的（焼き込みと違う絵を見せない）から
+# 外れて常時発火するノイズになる。
+#
+# 手修正(corrections)もここに含めない。手修正はレビュー中に変わるのが前提
+# （変わるたびに不一致扱いになったら検査そのものができない）。ここが見るのは
+# 「自動計算の元になった設定」であって「その結果できた領域」ではない。
+def effective_settings(
+    cfg: "TemporalConfig", classes, block: int, mode: str
+) -> dict:
+    """焼き込み/レビューが領域計算に使う実効設定をまとめる。"""
+    return {
+        "cfg": dataclasses.asdict(cfg),
+        "classes": sorted(classes),
+        "block": int(block),
+        "mode": str(mode),
+    }
+
+
+def effective_settings_sha256(effective: dict) -> str:
+    """`effective_settings()` の出力を安定ソートした JSON で固定長にする。"""
+    payload = json.dumps(effective, sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def filter_classes(

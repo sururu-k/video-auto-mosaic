@@ -56,8 +56,12 @@ from automosaic.review import (  # noqa: E402
     token_matches,
 )
 from automosaic.detector import CONSERVATIVE_CLASSES, DEFAULT_CLASSES  # noqa: E402
-from automosaic.temporal import TemporalConfig  # noqa: E402
-from automosaic.temporal import resolve_classes  # noqa: E402
+from automosaic.temporal import (  # noqa: E402
+    TemporalConfig,
+    effective_settings,
+    effective_settings_sha256,
+    resolve_classes,
+)
 
 CLS = "MALE_GENITALIA_EXPOSED"
 
@@ -2367,6 +2371,120 @@ def test_review_resolved_classes_match_cli_and_known_default():
         f"  review classes == cli classes == 既知の正解 "
         f"({len(cases)} 通りの --classes 指定) OK"
     )
+
+
+# -- 実効設定フィンガープリント（issue #16） --------------------------------
+
+
+def test_effective_settings_fingerprint_catches_margin_scale_regression():
+    """issue #16 の完了条件: #14 の再現条件（margin_scale だけが食い違う）を
+    作ると、フィンガープリントが実際に落ちる（一致しない）こと。
+
+    #14 は margin_scale の既定値が review.py と cli.py で食い違っていた壊れ方
+    だった（review 側が margin_scale=1.0 に「戻って」いた）。ここでは実際に
+    margin_scale だけを変えた2つの TemporalConfig からフィンガープリントを
+    作り、他のフィールドが完全に同じでも一致しなくなることを確かめる。
+    一致してしまうなら、この検査機構自体が #14 を検出できないことになる。
+    """
+    base = dataclasses.asdict(TemporalConfig())
+    cfg_burned = TemporalConfig(**{**base, "margin_scale": 0.6})  # 実際に焼いた側
+    cfg_reviewed = TemporalConfig(**{**base, "margin_scale": 1.0})  # #14 の壊れ方
+
+    classes = {"MALE_GENITALIA_EXPOSED"}
+    eff_burned = effective_settings(cfg_burned, classes, 40, "black")
+    eff_reviewed = effective_settings(cfg_reviewed, classes, 40, "black")
+    sha_burned = effective_settings_sha256(eff_burned)
+    sha_reviewed = effective_settings_sha256(eff_reviewed)
+
+    assert sha_burned != sha_reviewed, (
+        "margin_scale だけが違う2つの実効設定が同じフィンガープリントになった。"
+        "#14 と同じ壊れ方をこの検査は検出できない"
+    )
+    # 逆に、他のフィールドも含めて完全に同じ入力なら同じフィンガープリントに
+    # なること（誤検出しないことの確認）
+    eff_same = effective_settings(cfg_burned, classes, 40, "black")
+    assert effective_settings_sha256(eff_same) == sha_burned
+    print(
+        "  実効設定フィンガープリント: margin_scale の食い違い(#14相当)を検出 OK"
+        f"（burned={sha_burned[:12]}... / reviewed={sha_reviewed[:12]}...）"
+    )
+
+
+def test_effective_settings_fingerprint_ignores_class_set_order():
+    """クラス集合の順序（set の反復順）でフィンガープリントが変わらないこと。
+
+    変わってしまうと、同じ --classes 指定でもプロセスをまたぐたびに 409 が
+    発火しうる（Python の set 反復順はハッシュシードで変わりうる）。
+    effective_settings() 内で sorted() しているので、集合の構築順序を変えても
+    一致するはずというのを実測で確かめる。
+    """
+    cfg = TemporalConfig()
+    a = effective_settings_sha256(
+        effective_settings(cfg, {"MALE_GENITALIA_EXPOSED", "ANUS_EXPOSED"}, 32, "pixelize")
+    )
+    b = effective_settings_sha256(
+        effective_settings(cfg, {"ANUS_EXPOSED", "MALE_GENITALIA_EXPOSED"}, 32, "pixelize")
+    )
+    assert a == b, "クラス集合の構築順序でフィンガープリントが変わった"
+    print("  実効設定フィンガープリント: クラス集合の順序非依存 OK")
+
+
+def test_review_session_effective_settings_matches_cli_report_for_default_job():
+    """cli.py が report.json に書く effective_sha256 と、review.py の
+    ReviewSession.effective_sha256() が、既定ジョブ相当で一致すること。
+
+    ここが一致しないと、設定を何も変えていない普通のジョブまで 409 になる
+    （過剰に塞ぐ誤検出。RULES.md が禁じる漏れ方向ではないが、道具として使えなくなる）。
+    """
+    if not _have_ffmpeg():
+        print("  session.effective_sha256 == report effective_sha256 SKIP (ffmpeg 無し)")
+        return
+
+    tmp = tempfile.mkdtemp()
+    try:
+        src = os.path.join(tmp, "in.mp4")
+        det = os.path.join(tmp, "det.json")
+        rep = os.path.join(tmp, "report.json")
+        n = 10
+        _make_tiny_video(src, 64, 64, n)
+        with open(det, "w", encoding="utf-8") as f:
+            json.dump(
+                {"n_frames": n, "width": 64, "height": 64,
+                 "complete": True, "detections": {}},
+                f,
+            )
+
+        rc = cli.main(
+            [src, "--detections", det, "--reuse-detections",
+             "--detect-only", "--quiet", "--report", rep]
+        )
+        assert rc == 0, "cli.main が既定ジョブ相当の引数で失敗した"
+        with open(rep, encoding="utf-8") as f:
+            report = json.load(f)
+        assert "effective" in report and "effective_sha256" in report, (
+            "report.json に effective / effective_sha256 が書かれていない"
+        )
+
+        argv = [src, "--detections", det]
+        args = review.build_parser().parse_args(argv)
+        session = review.session_from_args(args, argv)
+        try:
+            session_sha = session.effective_sha256()
+        finally:
+            session.reader.close()
+
+        assert session_sha == report["effective_sha256"], (
+            f"cli 側 report.effective_sha256={report['effective_sha256']} / "
+            f"review 側 session.effective_sha256()={session_sha}\n"
+            f"cli effective={report['effective']}\n"
+            f"review effective={session.effective_settings()}"
+        )
+        print(
+            "  session.effective_sha256() == report.effective_sha256 "
+            f"(既定ジョブ) OK（{session_sha[:16]}...）"
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

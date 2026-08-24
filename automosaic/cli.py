@@ -29,6 +29,8 @@ from . import corrections as corr
 from .render import FrameBuffer, apply_regions, default_block_size
 from .temporal import (
     TemporalConfig,
+    effective_settings,
+    effective_settings_sha256,
     estimated_only_ranges,
     frames_with_mosaic_count,
     narrow_without_estimate_gaps,
@@ -1139,6 +1141,11 @@ def main(argv: list[str] | None = None) -> int:
         motion_cap=args.motion_cap,
         estimated_factor=args.estimated_factor,
     )
+    # issue #16: cfg が確定した直後、実際に領域計算へ渡る値そのものから
+    # フィンガープリントを作る。args から作り直すと、上の絞り込み（narrowed）
+    # で変わった値と食い違う経路が生まれる。cfg 自身から作ればそれは起きない。
+    effective = effective_settings(cfg, classes, block, args.mode)
+    effective_sha256 = effective_settings_sha256(effective)
     regions, stats = process(
         per_frame, n_frames, info.width, info.height, classes, cfg
     )
@@ -1306,6 +1313,8 @@ def main(argv: list[str] | None = None) -> int:
                         for s_, e_, cls, sc in despiked_ranges
                     ],
                     "review_frames": flags,
+                    "effective": effective,
+                    "effective_sha256": effective_sha256,
                 },
                 f,
                 ensure_ascii=False,
