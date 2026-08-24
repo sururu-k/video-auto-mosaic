@@ -569,6 +569,15 @@ def create_app(
         items = payload.get("corrections")
         if not isinstance(items, list):
             raise _err(400, "corrections（配列）が本文にありません")
+        # frame は任意（#24）。呼び出し側が「いま表示しているコマ」を教えて
+        # くれたときだけ、そのコマぶんの regions に絞って返す。省略時は
+        # 従来どおり全フレームぶん（後方互換。review.py の update_payload と同じ）
+        frame_arg: int | None = None
+        if "frame" in payload:
+            try:
+                frame_arg = int(payload["frame"])
+            except (TypeError, ValueError):
+                frame_arg = None
         try:
             with s.lock:
                 s.set_corrections(items)
@@ -576,7 +585,7 @@ def create_app(
                 # 保存しないと、セッションを開き直した瞬間に .progress.json から
                 # 古い履歴が生き返り、次の undo が無関係な修正を末尾から削る
                 s.save_progress()
-                out = s.update_payload()
+                out = s.update_payload(frame_arg)
                 sync_meta(job, s)
         except (KeyError, TypeError, ValueError) as e:
             raise _err(400, f"修正を適用できません: {e}")

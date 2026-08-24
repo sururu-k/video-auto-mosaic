@@ -4,8 +4,8 @@
 // 出どころは以下のとおりで、あちらを直したらここも直す。
 //
 //   automosaic/review.py     ReviewSession.state_payload() / queue_payload()
-//                            / progress_payload() / update_payload() と、
-//                            do_GET / do_POST の各分岐
+//                            / progress_payload() / update_payload()
+//                            / frame_regions_payload() と、do_GET / do_POST の各分岐
 //   automosaic/corrections.py Correction.as_dict()
 //   automosaic/webapp/app.py  /api/jobs 以下すべて
 //   automosaic/webapp/jobs.py Job.summary() / Job.detail()
@@ -181,13 +181,26 @@ export interface CorrectionsPayload {
   corrections: Correction[];
 }
 
-/** POST /api/corrections の戻り。update_payload() */
+/**
+ * POST /api/corrections の戻り。update_payload()。
+ *
+ * 本文に frame を渡すと、regions はそのコマ1つぶんだけになる（#24）。
+ * 渡さなければ従来どおり全フレームぶん（後方互換）。timeline.tsx は
+ * 常に frame を渡すので、キーは1個だけだと思ってよい。
+ */
 export interface UpdatePayload extends RangesPayload {
   ok: true;
   coverage: string;
   regions: Record<string, Region[]>;
   version: number;
   n_corrections: number;
+}
+
+/** GET /api/regions。表示中の1コマぶんだけ矩形を返す軽量版（#24） */
+export interface RegionsResponse {
+  frame: number;
+  version: number;
+  regions: Region[];
 }
 
 // --------------------------------------------------------------------

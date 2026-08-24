@@ -272,6 +272,71 @@ def test_set_corrections_updates_coverage():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# -- #24: 判定1回ごとの領域マップ往復 -------------------------------------
+
+
+def test_update_payload_defaults_to_full_regions():
+    """frame を渡さない update_payload() は、これまでどおり全フレームぶん返す。
+
+    後方互換の確認。webapp/app.py の POST /corrections など、frame を渡さない
+    既存の呼び出し元がここで挙動を変えてはいけない。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        d = s.update_payload()
+        assert d["regions"] == s.regions_payload()
+        print("  update_payload() 既定は全フレームぶん OK（後方互換）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_update_payload_scoped_to_one_frame_is_much_smaller():
+    """frame を渡すと、その1コマぶんの regions だけになること（#24）。
+
+    タイムライン画面（frontend/src/timeline/timeline.tsx）は表示中の1コマしか
+    描かないので、動画全体の領域マップを往復させる理由が無い。修正前は
+    矩形を1個置くたびに動画全体ぶんが返っていた（review.py:1132-1135 のコメントが
+    「1時間の動画で10MBを超える」と書いていた箇所）。coverage・区間情報は
+    frame の有無に関係なく一致すること（規模を削るのは regions だけ）も確かめる。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp, n_frames=2000)
+        full = s.update_payload()
+        scoped = s.update_payload(frame=0)
+        assert set(scoped["regions"].keys()) <= {"0"}, scoped["regions"].keys()
+        assert scoped["coverage"] == full["coverage"]
+        assert scoped["estimated_only_ranges"] == full["estimated_only_ranges"]
+        assert scoped["uncovered_ranges"] == full["uncovered_ranges"]
+        full_len = len(json.dumps(full["regions"], ensure_ascii=False))
+        scoped_len = len(json.dumps(scoped["regions"], ensure_ascii=False))
+        assert scoped_len < full_len / 10, (scoped_len, full_len)
+        print(
+            f"  update_payload(frame=0) は1コマぶんだけ OK"
+            f"（regions {full_len}B -> {scoped_len}B、n_frames=2000）"
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_frame_regions_payload_matches_frame_regions():
+    """frame_regions_payload() が /api/regions（#24）の中身そのものであること。"""
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        d = s.frame_regions_payload(0)
+        assert d["frame"] == 0
+        assert d["version"] == s.version
+        assert d["regions"] == s.frame_regions(0)
+        # 範囲外は端に寄せる（/frame や /api/state と同じ規則）
+        clamped = s.frame_regions_payload(999999)
+        assert clamped["frame"] == s.n_frames - 1
+        print("  frame_regions_payload() OK（範囲外は端に寄せる）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_apply_removes_only_automatic_regions():
     """remove は自動領域だけを落とし、手で足した領域は残すこと。"""
     tmp = tempfile.mkdtemp()
@@ -1607,6 +1672,69 @@ def test_http_false_positive_roundtrip():
         assert d["n_corrections"] == 0 and len(d["regions"]) == 2, d
         assert not s.false_positives, s.false_positives
         print("  HTTP 越しの 誤検知 OK")
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_http_corrections_scoped_to_frame():
+    """POST /api/corrections に frame を渡すと、応答の regions がそのコマぶんだけに
+    絞られること（#24）。渡さなければ従来どおり全フレームぶん（後方互換）。
+    """
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    try:
+        s = make_session(tmp, n_frames=2000)
+        tok = "testtoken1234"
+        httpd, base = _serve(s, tok)
+
+        code, body, _ = _get(f"{base}/api/corrections?t={tok}")
+        cur = json.loads(body)["corrections"]
+        extra = {"frame": 3, "box": [10, 10, 20, 20], "class": CLS, "kind": "add"}
+
+        code, d = _post(
+            f"{base}/api/corrections?t={tok}", {"corrections": cur + [extra], "frame": 3}
+        )
+        assert code == 200, d
+        assert list(d["regions"].keys()) == ["3"], d["regions"].keys()
+
+        code, d2 = _post(f"{base}/api/corrections?t={tok}", {"corrections": cur + [extra]})
+        assert code == 200, d2
+        assert len(d2["regions"]) > 1, "frame 未指定なのに全フレームぶんに戻っていない"
+        print("  POST /api/corrections の frame 指定で regions を絞れる OK（未指定は従来どおり）")
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_http_regions_endpoint_returns_single_frame():
+    """GET /api/regions が1コマぶんの矩形だけを返すこと（#24 のタイムライン用エンドポイント）。
+
+    修正のたびに動画全体の regions を積む代わりに、画面はここへ来て
+    表示中の1コマぶんだけを取り直す。
+    """
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    try:
+        s = make_session(tmp)
+        tok = "testtoken1234"
+        httpd, base = _serve(s, tok)
+
+        code, body, _ = _get(f"{base}/api/regions?n=0&t={tok}")
+        assert code == 200, body
+        d = json.loads(body)
+        assert d["frame"] == 0
+        assert d["regions"] == s.frame_regions(0)
+        assert d["version"] == s.version
+
+        # トークン無しは 403（他の API と揃える。素材が漏れる経路なので必須）
+        code, _, _ = _get(f"{base}/api/regions?n=0")
+        assert code == 403, code
+        print("  GET /api/regions が1コマぶんだけ返す OK")
     finally:
         if httpd:
             httpd.shutdown()
