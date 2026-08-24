@@ -88,8 +88,17 @@ def detect_block_size(
     こと）。焼いた本人に聞く代わりに、出力画素の色が変わる境界の間隔を数える。
 
     横方向の隣接画素差が閾値を超える位置（＝ブロック境界）を全行で拾い、
-    境界間の間隔の最頻値をブロックサイズとする。モザイクが無いフレームを
-    渡すと検出できない（None を返す）。
+    境界間の間隔の最頻値をブロックサイズとする。
+
+    **「モザイクが無いフレームを渡すと検出できない（None を返す）」は誤り。**
+    実素材（1920x1080、crf16）のモザイク無しコントロールで実測したところ、
+    edges が全く出ないことは無く、**むしろ min_gap=4 の下限に張り付いた 4px を
+    自信満々に返した**（実測: 300/300 フレームで 4px、None は 0 件）。自然な
+    肌・布のテクスチャや圧縮ブロックノイズが、4px 間隔のエッジを大量に作る
+    ため。呼び出し側は戻り値が None かどうかでは「モザイクの有無」を判定でき
+    ない。`detect_block_size_over_frames` / このモジュールの CLI が行っている
+    ように、**`render.default_block_size` の理論値との食い違いと、サンプル
+    フレーム間のばらつきを見て警告する**しかない。
     """
     if frame.ndim != 2:
         raise ValueError("gray フレームのみ対応")
@@ -109,13 +118,28 @@ def detect_block_size(
     return int(vals[np.argmax(counts)])
 
 
+def detect_block_size_per_frame(frames: list[np.ndarray]) -> list[int | None]:
+    """各フレームに `detect_block_size` を適用した結果を集約せずそのまま返す。
+
+    `detect_block_size_over_frames` の中央値だけを見ると、フレーム間で値が
+    大きく割れていること（構図次第で外れが混ざっていること）が隠れる。
+    呼び出し側で割れを検出して警告するために、生の値を返す関数を分けた。
+    """
+    return [detect_block_size(f) for f in frames]
+
+
 def detect_block_size_over_frames(frames: list[np.ndarray]) -> int | None:
     """複数フレームで `detect_block_size` を実行し、中央値を返す。
 
     1フレームだけだと構図次第で外れることがあるので、複数フレームの
-    中央値を取ってロバストにする。
+    中央値を取ってロバストにする。**ただし中央値を取っても外れ値の影響が
+    消えるとは限らない**（実測: 1920x1080 の実素材で真のブロックサイズ 20px
+    に対し4サンプル点中3点で中央値が 4px になった。詳細は `detect_block_size`
+    のdocstring）。呼び出し側は返り値を鵜呑みにせず、
+    `detect_block_size_per_frame` でフレームごとの値のばらつきと
+    `render.default_block_size` の理論値との食い違いを確認すること。
     """
-    detected = [b for b in (detect_block_size(f) for f in frames) if b is not None]
+    detected = [b for b in detect_block_size_per_frame(frames) if b is not None]
     if not detected:
         return None
     return int(np.median(detected))
@@ -318,21 +342,45 @@ def collect_needed_frames(
 
     ffmpeg のパイプは前から順にしか読めないので、シークし直すより1回で
     最後まで流して必要な番号だけ保持するほうが単純で確実。
+
+    **戻り値の辞書に必要なフレーム全部を溜め込む。** 呼び出し側が必要フレーム数の
+    少ない用途（`--cell` 自動実測でのサンプル5枚など）に限って使うこと。GT が
+    多い動画全体の評価には使わない（1920x1080 の gray 平面1枚は 2,073,600 バイト。
+    元+出力の2枚を 21,030 フレーム分貯めると 2,073,600 x 2 x 21,030 ≒ 87GB になる
+    計算）。そちらは `iter_needed_frame_pairs` でフレームを溜めずに1枚ずつ
+    処理すること。
     """
     if not frames_needed:
         return {}
-    max_needed = max(frames_needed)
     result: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for si, sframe, oframe in iter_needed_frame_pairs(source_path, output_path, frames_needed):
+        result[si] = (sframe, oframe)
+    return result
+
+
+def iter_needed_frame_pairs(
+    source_path: str,
+    output_path: str,
+    frames_needed: set[int],
+):
+    """必要なフレーム番号の (元, 出力) ペアを1枚ずつ生成する。溜め込まない。
+
+    `collect_needed_frames` は全部を辞書に貯めるので、GT が多い動画では
+    メモリを使い切る（1080p 21,030フレームで 87GB になる計算。上記参照）。
+    こちらは呼び出し側が1枚処理したら手放せるようにジェネレータにしてある。
+    """
+    if not frames_needed:
+        return
+    max_needed = max(frames_needed)
     src_iter = iter_gray_frames(source_path, limit_frames=max_needed + 1)
     out_iter = iter_gray_frames(output_path, limit_frames=max_needed + 1)
     for (si, sframe), (oi, oframe) in zip(src_iter, out_iter):
         if si != oi:
             raise RuntimeError(f"元動画と出力動画のフレーム番号がずれています: {si} != {oi}")
         if si in frames_needed:
-            result[si] = (sframe, oframe)
+            yield si, sframe, oframe
         if si >= max_needed:
             break
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -353,16 +401,14 @@ def evaluate(
     for it in gt:
         by_frame.setdefault(it.frame, []).append(it)
 
-    frames_pixels = collect_needed_frames(source_path, output_path, set(by_frame))
-
+    # フレームを辞書に溜めず、1枚読んだら評価してすぐ手放す（collect_needed_frames
+    # は全部を辞書に貯めるので、GT が多い動画では 1080p 21,030フレームで 87GB になる
+    # 計算（詳細は collect_needed_frames / iter_needed_frame_pairs 参照）。
     per_gt = []
-    missing_frames = []
-    for frame, items in sorted(by_frame.items()):
-        pair = frames_pixels.get(frame)
-        if pair is None:
-            missing_frames.append(frame)
-            continue
-        sframe, oframe = pair
+    seen_frames: set[int] = set()
+    for frame, sframe, oframe in iter_needed_frame_pairs(source_path, output_path, set(by_frame)):
+        seen_frames.add(frame)
+        items = by_frame[frame]
         eligible, collapsed = cell_analysis(sframe, oframe, cell, std_min, ratio_max)
         painted_anywhere = frame_is_painted(collapsed, min_cells)
         for it in items:
@@ -388,6 +434,7 @@ def evaluate(
                 }
             )
 
+    missing_frames = sorted(set(by_frame) - seen_frames)
     n = len(per_gt)
     fully_covered = sum(1 for r in per_gt if r["pixel_coverage"] >= 0.999)
     zero_covered = sum(1 for r in per_gt if r["pixel_coverage"] <= 0.001)
@@ -538,11 +585,36 @@ def main() -> None:
         _, out_samples = zip(
             *collect_needed_frames(args.source, args.output, set(sample_frames)).values()
         ) if sample_frames else ((), ())
-        detected = detect_block_size_over_frames(list(out_samples)) if out_samples else None
+        per_frame = detect_block_size_per_frame(list(out_samples)) if out_samples else []
+        detected_values = [v for v in per_frame if v is not None]
+        detected = int(np.median(detected_values)) if detected_values else None
         fallback = default_block_size(max(info.width, info.height))
         if detected is not None:
             cell = detected
-            print(f"ブロックサイズを出力動画の{len(out_samples)}フレームから実測: {cell}px")
+            print(
+                f"ブロックサイズを出力動画の{len(out_samples)}フレームから実測: {cell}px"
+                f"（フレームごと: {per_frame}）"
+            )
+            # 実測 4px を実際の 1920x1080 素材(真のブロック20px)で確認すると、4点中3点で
+            # サンプル内の値が割れ、割れたケースでは中央値が真値と異なる方に寄っていた
+            # （detect_block_size のdocstring参照）。ここで気付けるようにする。
+            if len(set(detected_values)) > 1:
+                print(
+                    f"警告: サンプルフレーム間で実測ブロックサイズが割れています: {per_frame}。"
+                    f"中央値 {cell}px を採用しましたが、この中央値が真のブロックサイズと"
+                    f"異なる場合がある（実測済み、detect_block_size のdocstring参照）。"
+                    f"--cell で明示指定するか、複数フレームをオーバーレイで目視確認すること。",
+                    file=sys.stderr,
+                )
+            if cell != fallback:
+                print(
+                    f"警告: 実測ブロックサイズ {cell}px が理論値 default_block_size="
+                    f"{fallback}px と一致しません。どちらか一方が誤っている可能性がある"
+                    f"（640x480素材では理論値が誤りだったが、1920x1080素材では実測が"
+                    f"4px に外れ理論値20pxが正しかった実例がある）。--cell で明示指定するか、"
+                    f"目視で確認すること。",
+                    file=sys.stderr,
+                )
         else:
             cell = fallback
             print(
@@ -569,6 +641,13 @@ def main() -> None:
         print("\n[校正] 潰れたセル数の分布")
         print(f"  GT フレーム    : {cal['gt_frame_collapsed_cells']}")
         print(f"  その他(間引き) : {cal['other_frame_collapsed_cells']}")
+        print(
+            "  注意: この分布は cell が実際のブロックサイズと一致しているときだけ意味を持つ。"
+            "cell を外すと非GTフレーム側の潰れたセル数が実際より多く出て、素通し側に誤る"
+            "（docs/12「旧指標・--calibrate・box指標は cell の誤りに対して同じ強さで壊れない」"
+            "参照）。GT/非GT の分離が良く見えても、それが cell の正しさを保証しない。",
+            file=sys.stderr,
+        )
         if args.report:
             with open(args.report, "w", encoding="utf-8") as f:
                 json.dump(cal, f, ensure_ascii=False, indent=1)

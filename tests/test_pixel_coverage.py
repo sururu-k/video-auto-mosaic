@@ -190,6 +190,57 @@ def test_denormalize_yolo():
     print("  YOLO 正規化解除 OK")
 
 
+def test_regression_box_mask_fraction_weights_by_overlap_area():
+    """`box_mask_fraction` はセルとの重なり面積そのもので重み付けする。
+
+    独立検証で見つかった生存変異(MUT6): `covered_area += ow * oh` を
+    `covered_area += cell * cell` に変えると、box にまたがるセルの端が
+    セル全体の面積で数えられ、被覆率が塗り過ぎ側に水増しされる(実測: 実データ
+    で平均62.5%→88.7%、171/433 が1.0を超える)。既存のテストは box を必ず
+    セル格子ぴったりに置いていたのでこの変異を検出できなかった
+    (境界の重なりが常に0か1セル分ぴったりになり、ow*oh も cell*cell も
+    同じ値になっていた)。ここでは格子からずらした box と、一部だけ
+    collapsed なセルを使って区別する。
+    """
+    mask = np.zeros((4, 4), dtype=bool)
+    mask[0, 0] = True  # 左上のセルだけ塗られている。他は全部 False
+    cell = 10
+    # box (5,5)-(25,25) は格子(10刻み)からずれており、左上セル(0,0)-(10,10)とは
+    # (5,5)-(10,10) の 25px^2 だけ重なる。重なる残り8セルは全部 False。
+    box = (5.0, 5.0, 20.0, 20.0)
+    frac = box_mask_fraction(box, mask, cell)
+    expected = (5.0 * 5.0) / (20.0 * 20.0)  # 実際の重なり面積 / box 全体面積 = 0.0625
+    assert abs(frac - expected) < 1e-9, (
+        f"面積重みが overlap 面積になっていない(cell*cell を使っている疑い): "
+        f"{frac} != {expected}"
+    )
+    print(f"  box_mask_fraction がセル全体でなく重なり面積で重み付けされている OK ({frac:.4f})")
+
+
+def test_regression_detect_block_size_picks_mode_not_min_gap():
+    """`detect_block_size` は最頻の gap を取る(最小 gap ではない)。
+
+    独立検証で見つかった生存変異(MUT7): `vals[np.argmax(counts)]`
+    (最頻値)を`arr.min()`(最小gap)に変えると、テクスチャノイズが作る
+    min_gap 下限付近の小さい gap を実際のブロック境界より優先してしまう
+    (実測: v11.mp4 の同一フレームで最小gap=4 / 最頻gap=12)。既存のテストは
+    「一様乱数の全面モザイク」だけを使っており、この場合は最小gapと最頻gapが
+    偶然一致するため区別できなかった。ここではフレームの一部だけをモザイク化
+    し、残りは生のテクスチャノイズのままにして区別する。
+    """
+    rng = np.random.default_rng(0)
+    source = rng.integers(0, 256, size=(120, 120), dtype=np.uint8)
+    output = source.copy()
+    true_block = 12
+    pixelize_plane(output, (0.0, 0.0, 60.0, 60.0), true_block)  # 左上だけ塗る。右下は生テクスチャのまま
+    detected = detect_block_size(output)
+    assert detected == true_block, (
+        f"部分モザイクのフレームでブロックサイズ検出が違う(最小gapを拾っている疑い): "
+        f"{detected} != {true_block}"
+    )
+    print(f"  detect_block_size が部分モザイクのフレームでも最頻値ベースで{true_block}pxを検出 OK")
+
+
 def test_regression_naive_existence_can_diverge_from_pixel_coverage():
     """旧指標(有無)と新指標(画素被覆)が異なる結論を出しうることの再現。
 
