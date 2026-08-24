@@ -704,6 +704,175 @@ def test_undo_restores_corrections_and_verdict():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_mark_interval_interpolates_between_different_boxes():
+    """区間の両端に違う矩形を置くと、複製ではなく補間になること（issue #46）。
+
+    複製（mark()）は前後のフレームに同じ矩形を撒くだけだが、mark_interval()
+    は両端の座標が違えば、あいだの座標もそれに応じて動く。
+
+    自動検出を持たないセッションを使う（`per_frame={}`）。既定のセッション
+    には検出（0-9, 40-49）があり、envelope（RULES.md 0）がそれを包もうと
+    座標を動かすので、ここで見たい「補間か複製か」の違いが埋もれてしまう。
+    envelope 自体は別のテスト（test_mark_interval_envelopes_existing_detection_mid_span）
+    で見る。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp, per_frame={})
+        n = s.mark_interval(
+            frame=10, tap=(0.9, 0.9), start_frame=0, start_tap=(0.1, 0.1),
+            size=(20, 20), start_size=(20, 20), cls=CLS,
+        )
+        assert n == 11, n
+        by_frame = {c.frame: c.box for c in s.corrections.items}
+        assert by_frame[0][0] < by_frame[5][0] < by_frame[10][0], by_frame
+        assert by_frame[0][1] < by_frame[5][1] < by_frame[10][1], by_frame
+        print("  中間フレームの座標が両端の中間になっている（複製ではない）OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_mark_interval_sets_both_endpoint_verdicts_and_undo_restores_both():
+    """区間の両端に verdict が付き、ひとつ戻すで両方の verdict が戻ること。"""
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        n = s.mark_interval(
+            frame=10, tap=(0.5, 0.5), start_frame=5, start_tap=(0.5, 0.5), size=(20, 20),
+        )
+        assert n == 6, n
+        assert s.verdicts[5] == "fixed" and s.verdicts[10] == "fixed", s.verdicts
+        assert len(s.corrections.items) == 6
+        for f in range(5, 11):
+            assert s.coverage[f] == COV_REAL, f
+
+        h = s.undo()
+        assert h["frame"] == 10, h
+        assert not s.corrections.items, "戻したのに修正が残っている"
+        assert 5 not in s.verdicts and 10 not in s.verdicts, s.verdicts
+        print("  区間の両端に verdict が付き、undo で両方戻る OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_mark_interval_accepts_reversed_endpoints():
+    """始点が終点より後ろのフレームでもよい（打った操作順に依らない）。
+
+    envelope の影響を避けるため検出の無いセッションを使う（上のテストと同じ理由）。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp, per_frame={})
+        n = s.mark_interval(
+            frame=5, tap=(0.1, 0.1), start_frame=10, start_tap=(0.9, 0.9), size=(20, 20),
+        )
+        assert n == 6, n
+        assert s.verdicts[5] == "fixed" and s.verdicts[10] == "fixed", s.verdicts
+        by_frame = {c.frame: c.box for c in s.corrections.items}
+        assert by_frame[5][0] < by_frame[10][0], by_frame
+        print("  始点が終点より後ろでも正しく並べ替わる OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_mark_interval_rejects_out_of_range_frame():
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        try:
+            s.mark_interval(
+                frame=5, tap=(0.5, 0.5),
+                start_frame=s.n_frames + 5, start_tap=(0.5, 0.5),
+            )
+            raise AssertionError("範囲外のフレームが通ってしまった")
+        except ValueError as e:
+            print(f"  範囲外フレームを拒否: {e}")
+        assert not s.corrections.items, "拒否したのに修正が残っている"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_mark_interval_envelopes_existing_detection_mid_span():
+    """RULES.md 0: 補間した矩形が既存の検出矩形より小さければ、大きいほうを採る。
+
+    区間の両端をどちらも画面の隅（自動検出とは無関係な位置）に置く。
+    区間の途中の frame8 には make_session() の既定の検出（(200,200,60,60)
+    付近）がある。envelope が効いていなければ、frame8 の add 矩形は隅の
+    小さい矩形のままで、既存の検出とは重ならない。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        auto_cov_before = s.auto_cover_box(8)
+        assert auto_cov_before is not None, "前提が崩れている: frame8 に自動検出が無い"
+
+        s.mark_interval(
+            frame=45, tap=(0.02, 0.02), start_frame=5, start_tap=(0.02, 0.02),
+            size=(10, 10), start_size=(10, 10),
+        )
+        by_frame = {c.frame: c.box for c in s.corrections.items}
+        box8 = by_frame[8]
+        ax, ay, aw, ah = auto_cov_before
+        bx, by, bw, bh = box8
+        assert bx <= ax and by <= ay, (box8, auto_cov_before)
+        assert bx + bw >= ax + aw and by + bh >= ay + ah, (box8, auto_cov_before)
+        # 隅の 10x10 のままなら envelope が効いていない。明確に大きいこと
+        assert bw * bh > 10 * 10 * 4, box8
+        print(f"  frame8 envelope: 自動検出={auto_cov_before} 置いた矩形={box8}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _cell_set(session, frame, grid=4):
+    """そのフレームで塗られているセルの集合（粗いグリッドでの近似）。
+
+    ピクセル単位で比較すると座標の丸めのぶれを拾ってしまうので、4px 格子で
+    見る。矩形を1つでも失えばそのぶん確実にセルが減るので、粗くても
+    「減った/減っていない」の判定には十分。
+    """
+    out = set()
+    for box, _reg in session.regions.get(frame, []):
+        x, y, w, h = box
+        x0, y0 = int(x // grid), int(y // grid)
+        x1, y1 = int((x + w) // grid), int((y + h) // grid)
+        for gx in range(x0, x1 + 1):
+            for gy in range(y0, y1 + 1):
+                out.add((gx, gy))
+    return out
+
+
+def test_mark_interval_never_shrinks_painted_cells_across_all_frames():
+    """RULES.md 0: 区間を埋めた結果、塗られる範囲が減ってはいけない。
+
+    #66 / #58 で「包含しているはず」が実測せずに2回とも外れた
+    （736,126セル / 14,556矩形が失われた）。同じ間違いをしないため、
+    区間追従を複数回・複数の位置に適用する前後で、**全フレーム**の
+    塗られるセルを突き合わせ、1フレームも減っていないことを実測する。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)  # 既定: 0-9, 40-49 に検出あり（envelope の効く区間を含む）
+        before = {f: _cell_set(s, f) for f in range(s.n_frames)}
+        before_total = sum(len(v) for v in before.values())
+
+        # 実際の操作を模して、いろいろな位置・大きさで複数回かける
+        s.mark_interval(frame=25, tap=(0.05, 0.05), start_frame=15, start_tap=(0.95, 0.95), size=(30, 30))
+        s.mark_interval(frame=45, tap=(0.5, 0.5), start_frame=42, start_tap=(0.3, 0.3), size=(15, 15))
+        s.mark_interval(frame=5, tap=(0.1, 0.9), start_frame=2, start_tap=(0.9, 0.1), size=(40, 40))
+
+        after = {f: _cell_set(s, f) for f in range(s.n_frames)}
+        after_total = sum(len(v) for v in after.values())
+
+        shrunk = [f for f in range(s.n_frames) if before[f] - after[f]]
+        print(f"  before_total_cells={before_total} after_total_cells={after_total}")
+        print(f"  frames_with_shrinkage={len(shrunk)}")
+        assert not shrunk, f"塗られるセルが減ったフレームがある: {shrunk}"
+        assert after_total > before_total, "区間を埋めたのに塗布量が増えていない"
+        print("  全フレーム突き合わせ: 塗られるセルは1つも減っていない OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_progress_survives_restart():
     """判定の記録がファイルに残り、開き直しても続きから戻れること。
 

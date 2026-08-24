@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from automosaic.webapp.spans import interval_records  # noqa: E402
+from automosaic.webapp.spans import interval_add_records, interval_records  # noqa: E402
 
 CLS = "MALE_GENITALIA_EXPOSED"
 
@@ -90,6 +90,71 @@ def test_interval_kind_override_add_and_remove():
     recs = interval_records(0, (0, 0, 10, 10), 4, (0, 0, 10, 10), CLS, kind="remove")
     assert all(r.kind == "remove" for r in recs)
     print(f"  kind=remove 上書き確認: {len(recs)} 件")
+
+
+def test_interval_add_records_without_existing_cover_passes_through():
+    """`existing_cover` を渡さなければ `interval_records()` と全く同じ結果。"""
+    lo_box = (100.0, 100.0, 50.0, 50.0)
+    hi_box = (200.0, 100.0, 50.0, 50.0)
+    recs = interval_add_records(10, lo_box, 20, hi_box, CLS, 1920, 1080)
+    plain = interval_records(10, lo_box, 20, hi_box, CLS, kind="add")
+    assert [r.box for r in recs] == [r.box for r in plain], (recs, plain)
+    print(f"  existing_cover 無し: {len(recs)} 件、interval_records と一致")
+
+
+def test_interval_add_records_envelopes_with_existing_detection():
+    """RULES.md 0: 補間した矩形が既存の検出矩形より小さければ、大きいほうを採る。
+
+    区間の両端は小さい矩形（(100,100,20,20) と (120,100,20,20)）で近接している。
+    途中の frame15 にだけ、遠く離れた大きい既存検出（(50,50,200,200)）がある
+    ことにする。envelope 無しなら frame15 の矩形は補間そのまま（小さい・
+    (100,100,20,20) 付近）で、既存の検出とは無関係になる。envelope 有りなら
+    その大きい検出を包む大きさになる。
+    """
+    lo_box = (100.0, 100.0, 20.0, 20.0)
+    hi_box = (120.0, 100.0, 20.0, 20.0)
+    big_cover = {15: (50.0, 50.0, 200.0, 200.0)}
+
+    recs = interval_add_records(
+        10, lo_box, 20, hi_box, CLS, 1920, 1080,
+        existing_cover=lambda f: big_cover.get(f),
+    )
+    by_frame = {r.frame: r.box for r in recs}
+    box15 = by_frame[15]
+    cx, cy, cw, ch = big_cover[15]
+    assert box15[0] <= cx and box15[1] <= cy, (box15, big_cover[15])
+    assert box15[0] + box15[2] >= cx + cw, (box15, big_cover[15])
+    assert box15[1] + box15[3] >= cy + ch, (box15, big_cover[15])
+    # envelope していないフレームは補間そのまま（小さい矩形が勝手に膨らまない）
+    assert by_frame[10] == lo_box, by_frame[10]
+    assert by_frame[20] == hi_box, by_frame[20]
+    print(f"  frame15 envelope: 補間のみだと小さい矩形 -> envelope込み={box15}")
+
+
+def test_interval_add_records_small_existing_detection_does_not_shrink_interp():
+    """既存の検出が補間より小さい場合は、補間の矩形がそのまま勝つこと。
+
+    envelope は「小さいほうを捨てる」処理であって、「補間を既存の検出の
+    大きさに揃える」処理ではない。既存の検出のほうが小さければ、補間の
+    矩形を狭めてはいけない（RULES.md 0: 塗り過ぎ側は許容、漏れる側は不可）。
+    """
+    lo_box = (100.0, 100.0, 100.0, 100.0)
+    hi_box = (300.0, 100.0, 100.0, 100.0)
+    tiny_cover = {15: (150.0, 120.0, 5.0, 5.0)}
+
+    recs = interval_add_records(
+        10, lo_box, 20, hi_box, CLS, 1920, 1080,
+        existing_cover=lambda f: tiny_cover.get(f),
+    )
+    by_frame = {r.frame: r.box for r in recs}
+    plain_by_frame = {
+        r.frame: r.box for r in interval_records(10, lo_box, 20, hi_box, CLS, kind="add")
+    }
+    b15, p15 = by_frame[15], plain_by_frame[15]
+    assert b15[0] <= p15[0] and b15[1] <= p15[1], (b15, p15)
+    assert b15[0] + b15[2] >= p15[0] + p15[2], (b15, p15)
+    assert b15[1] + b15[3] >= p15[1] + p15[3], (b15, p15)
+    print(f"  小さい既存検出は補間を狭めない: 補間={p15} envelope込み={b15}")
 
 
 def measure_edge_drift(span: int, amplitude: float, period: float, size: float):
@@ -188,6 +253,9 @@ def main() -> None:
         test_interval_records_zero_span,
         test_interval_records_rejects_reversed_range,
         test_interval_kind_override_add_and_remove,
+        test_interval_add_records_without_existing_cover_passes_through,
+        test_interval_add_records_envelopes_with_existing_detection,
+        test_interval_add_records_small_existing_detection_does_not_shrink_interp,
         test_measure_edge_drift_span15_amplitude250_period20,
         test_measure_edge_drift_span5_amplitude120_period24,
     ]

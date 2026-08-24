@@ -1457,6 +1457,83 @@ def test_mark_roundtrip_and_undo():
         srv.close()
 
 
+def test_mark_interval_roundtrip_via_webapp():
+    """区間の両端（issue #46）が /mark から通り、あいだが補間されること。
+
+    フロントエンド（review.tsx の I / O キー）が送る形をそのまま模す。
+    start_frame/start_x/start_y が付くと ReviewSession.mark_interval() に
+    回る（review.py:api_mark）。
+
+    区間は 15〜25（write_fake_detections が検出を置く 0-9 / 30-39 の
+    どちらからも離れた帯）を使う。検出の近くだと RULES.md 0 の envelope
+    （既存の自動検出領域を包む安全側寄せ）が効いて、見たい「複製ではなく
+    補間になっている」座標の違いが埋もれてしまう（envelope 自体は
+    tests/test_review.py の test_mark_interval_envelopes_existing_detection_mid_span
+    で別途見ている）。
+    """
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        d = prepared_job(lib, srv)
+        jid = d["id"]
+
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/mark?t={TOKEN}",
+            {
+                "frame": 25, "verdict": "fixed",
+                "x": 0.9, "y": 0.9, "w": 20, "h": 20,
+                "start_frame": 15, "start_x": 0.1, "start_y": 0.1,
+                "start_w": 20, "start_h": 20,
+            },
+        )
+        assert code == 200, r
+        assert r["added"] == 11, r  # frame 15..25
+
+        items = get_json(f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}")["corrections"]
+        assert len(items) == 11, items
+        by_frame = {c["frame"]: c["box"] for c in items}
+        assert set(by_frame) == set(range(15, 26)), sorted(by_frame)
+        # 複製ではなく補間になっていること。webapp の既定設定は bridge_max が
+        # 広く、この動画では 15〜25 のあいだにも自動検出の推定被覆が及ぶため
+        # （write_fake_detections の 0-9/30-39 が bridge で繋がる）、RULES.md 0
+        # の envelope が効いて厳密な単調増加にはならない区間がある。それでも
+        # 「複製（同じ矩形の繰り返し）ではない」ことは、矩形が1種類に潰れて
+        # いないことと、両端がはっきり違うことで確かめる。envelope 自体の
+        # 単調性は tests/test_review.py（自動検出の無いセッション）で見ている
+        boxes = [tuple(c["box"]) for c in items]
+        assert len(set(boxes)) > 1, "全フレーム同じ矩形＝複製になっている"
+        assert by_frame[15] != by_frame[25], by_frame
+        assert by_frame[15][0] <= by_frame[20][0] <= by_frame[25][0], by_frame
+
+        # 両端の判定が付くこと
+        q = get_json(f"{srv.base}/api/jobs/{jid}/queue?all=1&rebuild=1&t={TOKEN}")
+        verdicts = {it["frame"]: it["verdict"] for it in q["items"]}
+        assert verdicts.get(15) == "fixed" and verdicts.get(25) == "fixed", verdicts
+
+        # ひとつ戻すで両端の判定・修正がまとめて消えること
+        code, r = post_json(f"{srv.base}/api/jobs/{jid}/undo?t={TOKEN}", {})
+        assert code == 200 and r["ok"] and r["removed"] == 11, r
+        items = get_json(f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}")["corrections"]
+        assert not items, items
+
+        # 「でかすぎる」に区間指定を使わせない（remove を区間補間で動かす危険を防ぐ。
+        # review.mark_interval のドキュストリング参照）
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/mark?t={TOKEN}",
+            {
+                "frame": 20, "verdict": "toobig",
+                "x": 0.5, "y": 0.5, "w": 20, "h": 20,
+                "start_frame": 15, "start_x": 0.5, "start_y": 0.5,
+            },
+        )
+        assert code == 400, r
+        items = get_json(f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}")["corrections"]
+        assert not items, "拒否したはずなのに修正が残っている"
+        print("  区間の /mark 往復 OK（補間・両端の判定・undo・toobig 拒否）")
+    finally:
+        srv.close()
+
+
 def test_toobig_stacks_remove_and_add_as_pairs():
     """「でかすぎる」が remove と add を隣り合わせの組で積むこと。
 

@@ -136,6 +136,10 @@ export interface QueuePayload {
  * devicePixelRatio の扱いで静かにずれるので、比率だけを送る。
  * pick は「誤検知」で消す自動領域を座標で指す。番号で送ると、
  * 送っている間にキューが組み直されたときに指すものが変わる。
+ *
+ * start_frame / start_x / start_y / start_w / start_h は区間の始点
+ * （issue #46）。frame/x/y/w/h は区間の終点（＝いま見ているコマ）を指す。
+ * 始点を送ると verdict は "fixed" 専用（サーバ側 review.mark_interval）。
  */
 export interface MarkRequest {
   frame: number;
@@ -147,6 +151,11 @@ export interface MarkRequest {
   span?: number;
   class?: string;
   pick?: Box[];
+  start_frame?: number;
+  start_x?: number;
+  start_y?: number;
+  start_w?: number;
+  start_h?: number;
 }
 
 export interface MarkResponse {

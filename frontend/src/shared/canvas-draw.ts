@@ -30,6 +30,12 @@ export interface ReviewOverlayOptions {
   picked: readonly number[];
   /** 置いたがまだ確定していない矩形 */
   pending: Box | null;
+  /**
+   * 区間の始点として置いた矩形（issue #46）。いま見ているコマが始点その
+   * ものであるときにだけ渡す（区間の全長は1コマの絵には映らないので、
+   * 「始点はここだった」がその場で見えるようにする）。
+   */
+  startBox?: Box | null;
 }
 
 /**
@@ -45,7 +51,7 @@ export function drawReviewOverlay(
   ctx.clearRect(0, 0, o.width, o.height);
   const shrink = o.markMode === "shrink";
   const erase = o.markMode === "erase";
-  if (!o.showBoxes && !o.pending && !shrink && !erase) return;
+  if (!o.showBoxes && !o.pending && !o.startBox && !shrink && !erase) return;
   // 端末では画面に対して縮んで表示されるので、線幅は解像度に比例させる
   const lw = Math.max(2, Math.round(o.width / 400));
 
@@ -103,6 +109,12 @@ export function drawReviewOverlay(
     ctx.strokeStyle = "#ffffff";
     ctx.strokeRect(o.pending[0], o.pending[1], o.pending[2], o.pending[3]);
     ctx.setLineDash([]);
+  }
+  if (o.startBox) {
+    // 実線・緑固定。pending（白の破線）や自動領域の色と混同しないようにする
+    ctx.lineWidth = lw * 1.5;
+    ctx.strokeStyle = "#5ad1a0";
+    ctx.strokeRect(o.startBox[0], o.startBox[1], o.startBox[2], o.startBox[3]);
   }
 }
 
