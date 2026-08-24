@@ -358,6 +358,63 @@ def test_bridge_is_not_masked_by_other_object():
     print(f"  他対象に隠れた穴の橋渡し OK (regions_bridged={stats['regions_bridged']})")
 
 
+def test_bridge_globally_runs_before_bridge_by_lineage():
+    """issue #10 の再検証（PR #66）で見つかった退行の回帰テスト。
+
+    `bridge_uncovered()` は `_bridge_globally`（フレーム丸ごと未処理の区間を
+    対象の同定をせず時間的な近さだけで埋める最終防波堤）を先に、
+    `_bridge_by_lineage`（系統単位の橋渡し）を後に呼ぶ必要がある。
+    順序を逆にすると、系統単位の橋渡しが先に region を足してしまい、続く
+    `_bridge_globally` の「フレームが覆われているか」判定が誤って True になって
+    最終防波堤が一切起動しなくなる。系統として復活しない対象（トラックが
+    そこで終わって二度と戻ってこない）は、系統単位の橋渡し候補が無いまま
+    素通しになる（実測: bench3 で 130 矩形・736,126 セルが失われた退行と
+    同じ機構）。
+
+    対象A: frame 0-49 のみ観測され、以後二度と現れない。
+    対象B: frame 0-49 と 60-149 に同じ位置で観測される（間の 50-59 は欠損）。
+    50-59 は A・B どちらの観測も無い、フレーム丸ごと空の区間にしてある。
+
+    「対象Aの位置が覆われているか」を直接 assert すると、正しい実装でも
+    落ちる（防波堤矩形は前後の外接矩形を lerp するので、区間の終盤に近づく
+    ほど対象Bの位置へ寄っていき、対象Aの位置からは離れる）。ここでは代わりに
+    「_bridge_globally が足す lineage=-1 の防波堤矩形が区間の全フレームに
+    存在すること」を見る。順序を逆にした版では、対象Bの系統単位の橋渡し
+    だけでフレームが「覆われた」ことになり、_bridge_globally が一切起動しなく
+    なるため、lineage=-1 の矩形が区間全体から消える
+    （実測: `automosaic/temporal.py` の `bridge_uncovered()` 内で
+    `_bridge_by_lineage` を `_bridge_globally` より先に呼ぶよう入れ替えると、
+    frame 50-59 の矩形数が 2 から 1 に減り、lineage=-1 の矩形が全フレームで
+    消えることを確認済み）。
+    """
+    N = 150
+    dets: dict[int, list[Detection]] = {f: [] for f in range(N)}
+    for f in range(0, 50):
+        dets[f].append(Detection(CLS, 0.8, (0, 0, 80, 80)))       # 対象A（以後復活しない）
+        dets[f].append(Detection(CLS, 0.8, (400, 400, 40, 40)))   # 対象B
+    for f in range(60, N):
+        dets[f].append(Detection(CLS, 0.8, (400, 400, 40, 40)))   # 対象Bのみ復活
+
+    cfg = TemporalConfig(
+        max_gap=5, memory=0, stitch_max_gap=0, bridge_max=150, min_track_len=0
+    )
+    regions, stats = process(dets, N, W, H, {CLS}, cfg)
+
+    assert stats["tracks_stitched"] == 0, "対象A・Bが stitch で繋がってしまっている（前提が崩れている）"
+    assert stats["regions_bridged"] > 0, "橋渡しが一切起動していない"
+
+    for f in range(50, 60):
+        lineages = sorted(r.lineage for _, r in regions[f])
+        assert -1 in lineages, (
+            f"フレーム{f}: 系統をまたぐ最終防波堤(lineage=-1)の矩形が消えている "
+            f"(regions={[(b, r.source, r.lineage) for b, r in regions[f]]})"
+        )
+    print(
+        "  系統として復活しない対象がいても最終防波堤(lineage=-1)が全区間に残る OK "
+        f"(regions_bridged={stats['regions_bridged']})"
+    )
+
+
 def test_estimated_only_is_not_masked_by_other_object():
     """issue #10: 対象Aの「推定のみ」区間が、同じフレームの対象Bの実観測に
     隠れて estimated_only_ranges から消える不具合の回帰テスト。
