@@ -25,6 +25,7 @@ from collections import deque
 
 from . import jobs as jobs_mod
 from . import proxy as proxy_mod
+from .session import _as_bool
 
 # cli.Progress の出力そのもの:
 #   "\rパス1 検出 123/4560 ( 26.9%)   14.2 fps  残り 0:12:34   "
@@ -123,8 +124,11 @@ def build_argv(job: jobs_mod.Job, settings: dict, reuse: bool = False) -> list[s
     for key, flag, cast in SETTINGS_OPTS:
         opt(key, flag, cast)
     for key in SETTINGS_FLAGS:
-        if settings.get(key):
-            argv.append("--" + key.replace("_", "-"))
+        v = settings.get(key)
+        if v is not None and v != "":
+            b = _as_bool(v)
+            if b:
+                argv.append("--" + key.replace("_", "-"))
     return argv
 
 
