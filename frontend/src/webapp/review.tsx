@@ -46,7 +46,7 @@ import type {
   StateLight,
   UndoResponse,
 } from "../shared/api.js";
-import { drawReviewOverlay } from "../shared/canvas-draw.js";
+import { drawQueueTrack, drawReviewOverlay, frameFromTrackX } from "../shared/canvas-draw.js";
 import { normFromClient, scaledSize, tapToBox } from "../shared/geom.js";
 import type { NormPoint } from "../shared/geom.js";
 import {
@@ -141,6 +141,10 @@ function App() {
   const [sheetOpen, setSheetOpen] = useState(false);
 
   const ovRef = useRef<HTMLCanvasElement>(null);
+  const trackRef = useRef<HTMLCanvasElement>(null);
+  // トラックの canvas 幅は画面幅（clientWidth）で決まるので、リサイズを
+  // 見張って引き直す（timeline.tsx の bandRef と同じ理由）
+  const [trackResizeTick, setTrackResizeTick] = useState(0);
 
   const cur = items[idx] ?? null;
   const displayFrame = previewFrame ?? cur?.frame ?? 0;
@@ -216,6 +220,39 @@ function App() {
       startBox,
     });
   }, [state, cur, previewing, optBoxes, markMode, picked, pending, startBox]);
+
+  // トラック（issue #84）。新しく何かを取りに行くのではなく、起動時に
+  // 既に取っている検査キュー（items）だけから作る。QueueItem.boxes が
+  // 空＝そのフレームには塗られたものが無い＝未塗装。reason（"despiked"か
+  // "uncovered"か）の優先度勝ち負けとは無関係に常に正しい（frame_regions()
+  // の結果そのものなので）。canvas-draw.ts の drawQueueTrack 冒頭コメント参照
+  const uncoveredFrames = useMemo(
+    () => items.filter((it) => it.boxes.length === 0).map((it) => it.frame),
+    [items],
+  );
+
+  useEffect(() => {
+    const cv = trackRef.current;
+    const ctx = cv?.getContext("2d");
+    if (!cv || !ctx || !state) return;
+    const w = cv.clientWidth;
+    if (cv.width !== w) cv.width = w;
+    drawQueueTrack(ctx, {
+      width: w,
+      height: cv.height,
+      nFrames: state.n_frames,
+      uncoveredFrames,
+      cur: displayFrame,
+    });
+    // eslint 的には trackResizeTick は使っていないように見えるが、これが
+    // 変わるたびに描き直させるためだけに依存配列へ入れてある
+  }, [state, uncoveredFrames, displayFrame, trackResizeTick]);
+
+  useEffect(() => {
+    const onResize = () => setTrackResizeTick((v) => v + 1);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   function cancelMark() {
     setMarkMode(null);
@@ -576,6 +613,26 @@ function App() {
         </div>
       </div>
       <div id="banner" class={bannerText ? "" : "hidden"}>{bannerText}</div>
+
+      {/* 時間軸のトラック（issue #84）。緑=このキューでは未塗装が見えていない
+          区間、赤=未塗装のキュー標本がある画素、白線=いま見ているフレーム。
+          クリックで時間移動できる（プレビューとして動く。判定は動かない）。
+          拡大縮小・ドラッグ範囲選択・手修正の表示は次の PR に回した */}
+      <div id="track-wrap">
+        <canvas id="track" ref={trackRef} height={34}
+                onClick={(ev) => {
+                  if (!state) return;
+                  const cv = trackRef.current;
+                  if (!cv) return;
+                  const r = cv.getBoundingClientRect();
+                  const f = frameFromTrackX(ev.clientX - r.left, r.width, state.n_frames);
+                  jumpPreviewTo(f);
+                }} />
+        <div class="track-legend">
+          <span><i class="sw sw-none" />未処理（このキューで見えている分）</span>
+          <span><i class="sw sw-real" />それ以外</span>
+        </div>
+      </div>
 
       <div class="pad">
         {/* 判定モード。ここだけで1枚が終わるのが普通の流れ */}

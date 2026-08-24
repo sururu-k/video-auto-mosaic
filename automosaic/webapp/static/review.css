@@ -23,3 +23,13 @@ button.big.dim { background: #23272e; border-color: #3a414c; color: #aeb6c1; }
 
 /* 適用範囲の選択。押されているものだけ色を変える */
 .span-btn.on { background: #3b4b63; border-color: #5a7096; color: #eaf1ff; }
+
+/* 時間軸のトラック（issue #84）。timeline.tsx の #timeline / .legend と
+   同じ色（frontend/src/timeline/timeline.css相当の値をそのまま流用）を使い、
+   別画面で同じ意味の色が変わらないようにする */
+#track-wrap { padding: 6px 14px 4px; background: #1a1c22; border-top: 1px solid var(--line); }
+#track { width: 100%; display: block; cursor: pointer; background: #101216; touch-action: pan-y; }
+.track-legend { display: flex; gap: 16px; margin-top: 5px; color: #98a1ad; font-size: 12px; }
+.track-legend .sw { display: inline-block; width: 11px; height: 11px; margin-right: 5px; border-radius: 2px; }
+.sw-real { background: #3ba55d; }
+.sw-none { background: #d0453e; }

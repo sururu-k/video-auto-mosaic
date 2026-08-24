@@ -228,3 +228,94 @@ export function drawHandOverlay(
     ctx.setLineDash([]);
   }
 }
+
+// ----------------------------------------------------------------------
+// 検査キュー画面のトラック（issue #84）。
+//
+// 検査キュー画面（webapp/review.tsx）は1時間の動画で10MBを超える
+// coverage 文字列や regions 全量を持たない（state を light=1 でしか
+// 取らない。理由はあの画面の冒頭コメント参照）。ここは新しくその
+// どちらも取りに行かない。既に毎回取っている検査キュー（QueueItem[]）
+// だけから作る。
+//
+// QueueItem.boxes は frame_regions(frame) の結果そのもの（automosaic/
+// review.py）で、そのフレームに何も塗られていなければ空配列になる。
+// これは reason（"despiked" か "uncovered" か）の勝ち負けとは独立に
+// 常に正しい――despike で優先度負けして reason が別の値でも、
+// そのフレームに実際に塗られたものが無ければ boxes は空のまま。
+// なので「未塗装かどうか」は reason 文字列ではなく boxes.length で見る。
+//
+// 間引いた1フレームの区間が消えないことの根拠: build_queue() の
+// _sample_range() は、どんなに短い区間（1フレームでも）必ず中央値の
+// 1枚を候補に入れる（それより短くしようがない）。ここが拾わなければ
+// build_queue 自体がそのフレームをキューに一度も出していないということ
+// で、その場合はこの画面のどんな描き方をしても直せない
+// （automosaic/review.py は触らない範囲の外）。
+// ----------------------------------------------------------------------
+
+/**
+ * 各画素（0..width-1）が、未塗装のフレーム標本を1つでも含むかを判定する。
+ *
+ * 「1画素の中に未塗装が1フレームでもあれば、その画素は未塗装ありに倒す」
+ * （RULES.md 0）を素直に実装したもの。frames は昇順でなくてよい
+ * （ここでソートする）。
+ */
+export function uncoveredPixelMask(
+  frames: readonly number[],
+  width: number,
+  nFrames: number,
+): boolean[] {
+  const mask = new Array<boolean>(Math.max(0, width)).fill(false);
+  if (width <= 0 || nFrames <= 0) return mask;
+  const sorted = [...frames].filter((f) => f >= 0 && f < nFrames).sort((a, b) => a - b);
+  let i = 0;
+  for (let px = 0; px < width; px++) {
+    const a = Math.floor((px * nFrames) / width);
+    const b = Math.max(a + 1, Math.floor(((px + 1) * nFrames) / width));
+    while (i < sorted.length && sorted[i]! < a) i++;
+    mask[px] = i < sorted.length && sorted[i]! < b;
+  }
+  return mask;
+}
+
+/** 再生ヘッドが立つ画素。範囲外の cur は端に寄せる（画面から消さない） */
+export function playheadPixel(cur: number, width: number, nFrames: number): number {
+  if (width <= 0) return 0;
+  if (nFrames <= 0) return 0;
+  const c = Math.min(Math.max(cur, 0), nFrames - 1);
+  return Math.min(width - 1, Math.max(0, Math.floor((c * width) / nFrames)));
+}
+
+/** トラック上の x 座標（画素）をフレーム番号にする。クリックでの時間移動に使う */
+export function frameFromTrackX(x: number, width: number, nFrames: number): number {
+  if (width <= 0 || nFrames <= 0) return 0;
+  const f = Math.floor((x / width) * nFrames);
+  return Math.min(nFrames - 1, Math.max(0, f));
+}
+
+export interface QueueTrackOptions {
+  width: number;
+  height: number;
+  nFrames: number;
+  /** 検査キューの項目のうち、そのフレームに塗られたものが無かったフレーム番号 */
+  uncoveredFrames: readonly number[];
+  /** いま見ているフレーム（プレビュー中はプレビュー先） */
+  cur: number;
+}
+
+/** 検査キュー画面のトラック。緑=このキューでは未塗装が見えていない 赤=未塗装の標本あり */
+export function drawQueueTrack(ctx: CanvasRenderingContext2D, o: QueueTrackOptions): void {
+  const { width: w, height: h, nFrames: n } = o;
+  ctx.fillStyle = "#101216";
+  ctx.fillRect(0, 0, w, h);
+  if (w <= 0 || n <= 0) return;
+
+  const mask = uncoveredPixelMask(o.uncoveredFrames, w, n);
+  for (let px = 0; px < w; px++) {
+    ctx.fillStyle = mask[px] ? "#d0453e" : "#3ba55d";
+    ctx.fillRect(px, 0, 1, h);
+  }
+
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(playheadPixel(o.cur, w, n), 0, 2, h);
+}

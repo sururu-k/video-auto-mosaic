@@ -332,6 +332,43 @@ function drawHandOverlay(ctx, o) {
     ctx.setLineDash([]);
   }
 }
+function uncoveredPixelMask(frames, width, nFrames) {
+  const mask = new Array(Math.max(0, width)).fill(false);
+  if (width <= 0 || nFrames <= 0) return mask;
+  const sorted = [...frames].filter((f) => f >= 0 && f < nFrames).sort((a, b) => a - b);
+  let i = 0;
+  for (let px = 0; px < width; px++) {
+    const a = Math.floor(px * nFrames / width);
+    const b = Math.max(a + 1, Math.floor((px + 1) * nFrames / width));
+    while (i < sorted.length && sorted[i] < a) i++;
+    mask[px] = i < sorted.length && sorted[i] < b;
+  }
+  return mask;
+}
+function playheadPixel(cur, width, nFrames) {
+  if (width <= 0) return 0;
+  if (nFrames <= 0) return 0;
+  const c = Math.min(Math.max(cur, 0), nFrames - 1);
+  return Math.min(width - 1, Math.max(0, Math.floor(c * width / nFrames)));
+}
+function frameFromTrackX(x, width, nFrames) {
+  if (width <= 0 || nFrames <= 0) return 0;
+  const f = Math.floor(x / width * nFrames);
+  return Math.min(nFrames - 1, Math.max(0, f));
+}
+function drawQueueTrack(ctx, o) {
+  const { width: w, height: h, nFrames: n } = o;
+  ctx.fillStyle = "#101216";
+  ctx.fillRect(0, 0, w, h);
+  if (w <= 0 || n <= 0) return;
+  const mask = uncoveredPixelMask(o.uncoveredFrames, w, n);
+  for (let px = 0; px < w; px++) {
+    ctx.fillStyle = mask[px] ? "#d0453e" : "#3ba55d";
+    ctx.fillRect(px, 0, 1, h);
+  }
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(playheadPixel(o.cur, w, n), 0, 2, h);
+}
 
 // src/shared/job-logic.ts
 function proxyLabel(status) {
@@ -527,6 +564,7 @@ export {
   correctionsAfterDrop,
   dispatchKey,
   drawHandOverlay,
+  drawQueueTrack,
   drawRegionOverlay,
   drawReviewOverlay,
   drawTimelineBand,
@@ -534,6 +572,7 @@ export {
   eraseVictims,
   firstUnjudged,
   frameFromClient,
+  frameFromTrackX,
   framePoint,
   helpLine,
   helpRows,
@@ -545,6 +584,7 @@ export {
   numOr,
   overlaps,
   pickIndexAt,
+  playheadPixel,
   progressPercent,
   proxyLabel,
   requestWidth,
@@ -553,5 +593,6 @@ export {
   spanOptions,
   tapToBox,
   togglePick,
+  uncoveredPixelMask,
   worstCoverage
 };
