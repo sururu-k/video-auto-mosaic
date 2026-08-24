@@ -862,6 +862,55 @@ def test_rotated_video_pixels_not_scrambled():
             f"（平均差分 {mean_diff:.2f}）。転置スクランブルが再発している疑い"
         )
     print("  回転動画の画素破損チェック OK")
+
+
+def test_render_rejects_probe_ffmpeg_dimension_mismatch():
+    """issue #32: probe() の申告サイズと ffmpeg の実デコード出力が食い違ったとき、
+    パス2が黙って reshape を転置せず、reader/writer を開く前に例外で止まること。
+
+    #1 で塞いだのは回転メタデータという「既知の1経路」だけで、
+    probe と ffmpeg の解釈が別経路でずれる可能性そのものは残っている。
+    FrameBuffer の長さ検査（y_size = width*height、彩度平面も (w//2)*(h//2)）は
+    width と height を入れ替えても値が変わらない対称式なので、単純な長さ比較では
+    この種の食い違いを検出できない。ここでは info.width/height を実際の
+    デコードサイズと入れ替えて渡し、probe と ffmpeg が別経路でずれた状況を
+    直接模擬する（回転メタデータという特定経路に頼らず、この故障クラスそのものを
+    突く）。
+    """
+    if not _have_ffmpeg():
+        print("  probe/ffmpeg サイズ不一致の拒否 SKIP (ffmpeg 無し)")
+        return
+    import dataclasses
+
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.mp4")
+        dst = os.path.join(d, "out.mp4")
+        n_frames = 5
+        _make_video(src, 64, 48, n_frames, fps=15)
+        info = vid.probe(src)
+        assert (info.width, info.height) == (64, 48), "前提が崩れている"
+
+        # probe と ffmpeg が別経路でずれた状況を模擬: width/height を入れ替えて渡す。
+        # y_size=64*48==48*64 なので、この入れ替えは FrameBuffer の長さ検査だけでは
+        # 検出できない（この非対称性こそが issue #32 の核心）。
+        swapped = dataclasses.replace(info, width=48, height=64)
+        try:
+            cli.run_render(src, dst, swapped, {}, n_frames, 8, "black",
+                           18, "veryfast", None, True)
+        except RuntimeError as e:
+            assert "一致しません" in str(e), f"想定と違う例外: {e}"
+        else:
+            raise AssertionError(
+                "probe と ffmpeg のサイズが食い違ったのにパス2が正常終了した"
+                "（斜めに裂けたスクランブル画像が exit 0 で出ている疑い）"
+            )
+        assert not os.path.exists(dst), (
+            "サイズ不一致を検出したのに出力ファイルが残っている"
+            "（reader/writer を開く前に止めれば quarantine すら要らないはず）"
+        )
+    print("  probe/ffmpeg サイズ不一致の拒否 OK")
+
+
 def test_despike_off_by_default_and_reports_when_enabled():
     """issue #9: min_track_len の既定反転の回帰ガード。
 

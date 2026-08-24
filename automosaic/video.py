@@ -351,6 +351,62 @@ def detection_frame_size(
     return measured
 
 
+def measure_full_frame_size(path: str) -> tuple[int, int]:
+    """パス2用。原寸デコードの実際のサイズを ffmpeg 自身に1フレーム出させて実測する。
+
+    open_full_reader と同じ入力・同じデフォルトの自動回転挙動で先頭フレームを
+    デコードし、PNG の IHDR からサイズを読む。probe() が申告する width/height
+    と一致するかどうかは verify_full_frame_size() で突き合わせる。
+    """
+    ffmpeg = _require("ffmpeg")
+    out = subprocess.run(
+        [
+            ffmpeg,
+            "-v", "error",
+            "-i", path,
+            "-frames:v", "1",
+            "-f", "image2",
+            "-c:v", "png",
+            "-",
+        ],
+        capture_output=True,
+    )
+    data = out.stdout
+    pos = data.find(b"IHDR")
+    if pos < 0 or len(data) < pos + 12:
+        err = out.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(
+            f"パス2のデコードサイズの実測に失敗しました（{path}）:\n{err}"
+        )
+    w, h = struct.unpack(">II", data[pos + 4 : pos + 12])
+    return int(w), int(h)
+
+
+def verify_full_frame_size(info: VideoInfo, path: str) -> None:
+    """パス2開始前に、probe() の申告サイズと ffmpeg の実デコード出力を突き合わせる。
+
+    issue #32: `FrameBuffer` の長さ検査（`y_size = width*height` ほか）は
+    width と height を入れ替えても値が変わらない対称式なので、probe() と
+    ffmpeg の実デコードが別経路でずれても検査を素通りし、reshape だけが
+    転置されて全フレームが斜めに裂けたスクランブル画像になる（issue #1 で
+    塞いだ回転メタデータの経路がまさにこれだった）。パス1の
+    detection_frame_size() は食い違いを警告して実測値へフォールバックするが、
+    パス2でここが食い違うのはフォールバックする根拠が無い
+    （FrameBuffer をどちらのサイズで作っても、以降の座標系のどこかがずれる）
+    ので、警告ではなく例外で止める。
+    """
+    measured = measure_full_frame_size(path)
+    if measured != (info.width, info.height):
+        raise RuntimeError(
+            f"パス2: probe の申告サイズ {info.width}x{info.height} が"
+            f" ffmpeg の実デコード出力 {measured[0]}x{measured[1]} と"
+            "一致しません（issue #32）。FrameBuffer の長さ検査は幅と高さの"
+            "入れ替えに対して不変なため、ここで止めないと例外もエラーも"
+            "出ないまま全フレームが斜めに裂けたスクランブル画像として"
+            "書き出されます。"
+        )
+
+
 def open_full_reader(
     path: str, pix_fmt: str, limit_frames: int | None = None
 ) -> subprocess.Popen:
