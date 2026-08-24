@@ -230,6 +230,74 @@ def test_measured_size_matches_pipe():
     print("  実測サイズとパイプ長の一致 OK")
 
 
+def test_detect_scale_capped_at_material_resolution():
+    """issue #37: --tiles のデコード長辺が素材の実解像度を超えて拡大されないこと。
+
+    旧式（max(net_w, net_h) * tiles）は 1080p 素材・tiles=2 で 2560px を要求し、
+    ffmpeg の force_original_aspect_ratio=decrease が箱に収めるために拡大までして
+    2560x1440（面積で素材の1.78倍）を作る。情報は増えず、デコードとタイル推論の
+    コストだけが増える。素材の長辺で頭打ちにすること。
+    """
+    from automosaic.detector import budget_net_size
+
+    mat_w, mat_h = 1920, 1080
+    net_w, net_h = budget_net_size(mat_w, mat_h, 960)
+    assert (net_w, net_h) == (1280, 736), f"想定外の net サイズ: {net_w}x{net_h}"
+
+    for tiles, expect in ((1, 1280), (2, 1920), (3, 1920)):
+        old = max(net_w, net_h) * max(1, tiles)
+        new = cli.compute_detect_scale(net_w, net_h, tiles, mat_w, mat_h)
+        assert new == expect, f"tiles={tiles}: {new} != {expect}"
+        assert new <= max(mat_w, mat_h), (
+            f"tiles={tiles}: 新方式 {new}px が素材の長辺 {max(mat_w, mat_h)}px を超えている"
+        )
+        if tiles >= 2:
+            # 旧式は実際に超過していたことも確認しておく（直す前に壊れていたことの根拠）
+            assert old > max(mat_w, mat_h), (
+                f"tiles={tiles}: 旧式 {old}px が素材の長辺を超えていない"
+                "（この前提が崩れたらこのテストの意味が無い）"
+            )
+
+    # --detect-scale で明示指定した場合は頭打ちを掛けない（利用者の意図的な指定）
+    explicit = cli.compute_detect_scale(net_w, net_h, 2, mat_w, mat_h, override=3000)
+    assert explicit == 3000, f"明示指定が上書きされた: {explicit}"
+    print("  --tiles のデコード長辺が素材解像度で頭打ちになる OK")
+
+
+def test_tiles_decode_not_upscaled_beyond_material_ffmpeg():
+    """上のテストの主張を実際の ffmpeg デコードでも確認する（合成1080p素材）。"""
+    if not _have_ffmpeg():
+        print("  tiles デコードの実測頭打ち SKIP (ffmpeg 無し)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.mp4")
+        _make_video(src, 1920, 1080, 1)
+        info = vid.probe(src)
+
+        old_scale = 2560  # 旧式 max(net_w,net_h)=1280 * tiles=2
+        new_scale = cli.compute_detect_scale(1280, 736, 2, info.width, info.height)
+        assert new_scale == 1920
+
+        old_w, old_h = vid.detection_frame_size(info, old_scale, path=src)
+        new_w, new_h = vid.detection_frame_size(info, new_scale, path=src)
+
+        old_area_ratio = (old_w * old_h) / (info.width * info.height)
+        new_area_ratio = (new_w * new_h) / (info.width * info.height)
+
+        assert old_w > info.width or old_h > info.height, (
+            f"旧式が実測で素材を超えていない: {old_w}x{old_h}"
+        )
+        assert new_w <= info.width and new_h <= info.height, (
+            f"新式が実測で素材を超えている: {new_w}x{new_h}"
+        )
+        assert old_area_ratio > 1.7, f"旧式の面積倍率が想定より小さい: {old_area_ratio:.3f}"
+        assert new_area_ratio == 1.0, f"新式の面積倍率が1.0でない: {new_area_ratio:.3f}"
+    print(
+        f"  実測: 旧式 {old_w}x{old_h}(面積x{old_area_ratio:.2f}) -> "
+        f"新式 {new_w}x{new_h}(面積x{new_area_ratio:.2f}) OK"
+    )
+
+
 class _NullDetector:
     """検出しないスタブ。run_detection のデコード側だけを見る。"""
 
