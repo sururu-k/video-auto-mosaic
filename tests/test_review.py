@@ -2759,6 +2759,46 @@ def test_recompute_cache_invalidates_when_cfg_changes():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_recompute_cache_invalidates_when_cfg_mutated_in_place():
+    """cfg を**その場で**書き換えたときも、キャッシュを使い回さないこと。
+
+    TemporalConfig は frozen でない dataclass なので、フィールドに直接
+    代入できる。フィンガープリントに cfg のオブジェクトをそのまま入れると、
+    保存した側と今の側が同じものを指すため、書き換えても比較が必ず一致し、
+    「設定を変えたのに古い矩形のまま」になる（RULES 0）。
+    値で取り出して比べていればここで気づける。
+
+    dataclasses.replace（新しいオブジェクトを作る）版は
+    test_recompute_cache_invalidates_when_cfg_changes が見ている。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        assert s._process_cache is not None
+
+        orig_process = review.process
+        calls = {"n": 0}
+
+        def counting_process(*a, **kw):
+            calls["n"] += 1
+            return orig_process(*a, **kw)
+
+        review.process = counting_process
+        try:
+            s.cfg.max_gap = s.cfg.max_gap + 1   # 新しい object を作らない
+            s.recompute()
+        finally:
+            review.process = orig_process
+
+        assert calls["n"] == 1, (
+            f"cfg をその場で書き換えたのに process() が {calls['n']} 回しか呼ばれなかった"
+            "（同じオブジェクトを比べているので差が見えていない）"
+        )
+        print("  cfg のその場の書き換えでもキャッシュが正しく無効化される OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_recompute_cache_hit_regions_match_fresh_recompute():
     """キャッシュを使った recompute() の結果が、キャッシュを使わず律儀に
     計算し直した結果と全フレームで1つも食い違わないこと。

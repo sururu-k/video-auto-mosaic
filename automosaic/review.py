@@ -34,7 +34,7 @@ import socket
 import sys
 import threading
 import webbrowser
-from dataclasses import dataclass, field
+from dataclasses import astuple, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -1123,17 +1123,23 @@ class ReviewSession:
         """
         from .corrections import apply as apply_corrections
 
+        # `id(self.per_frame)` と `self.cfg` をそのまま入れてはいけない。
+        # id は解放後に別のオブジェクトへ再利用されるので、per_frame を
+        # 差し替えたときに偶然一致しうる。cfg は frozen でない dataclass
+        # なので、同じオブジェクトを入れると「保存した値」と「今の値」が
+        # 同じものを指し、その場で書き換えられても比較が必ず一致してしまう。
+        # per_frame は参照そのものを持って `is` で見る（参照を持つので
+        # id の再利用も起きない）。cfg は astuple() で値を取り出して比べる。
         fingerprint = (
-            id(self.per_frame),
             self.n_frames,
             self.width,
             self.height,
             frozenset(self.classes),
-            self.cfg,
+            astuple(self.cfg),
         )
         cached = self._process_cache
-        if cached is not None and cached[0] == fingerprint:
-            regions, stats, despiked_ranges = cached[1], dict(cached[2]), cached[3]
+        if cached is not None and cached[0] == fingerprint and cached[1] is self.per_frame:
+            regions, stats, despiked_ranges = cached[2], dict(cached[3]), cached[4]
         else:
             regions, stats = process(
                 self.per_frame, self.n_frames, self.width, self.height, self.classes, self.cfg
@@ -1142,7 +1148,7 @@ class ReviewSession:
             despiked_ranges = stats.pop("_despiked_ranges", [])
             # apply_corrections() は regions を書き換えない（新しい dict/list を
             # 返す）ので、process() の生出力をキャッシュへそのまま持っていて安全。
-            self._process_cache = (fingerprint, regions, dict(stats), despiked_ranges)
+            self._process_cache = (fingerprint, self.per_frame, regions, dict(stats), despiked_ranges)
 
         self.despiked_ranges = despiked_ranges
         self.regions = apply_corrections(regions, self.corrections)
