@@ -1061,18 +1061,25 @@ def test_api_frame_not_blocked_by_correction_recompute():
 
     api_frame は以前 s.lock を取っていたので、手修正の保存中は
     フレーム画像が1本も出なかった（issue #25）。実測の「初回構築 5.2秒」と
-    同じ形（重い計算の最中）を作るため、review.process を一時的に遅くする
-    （遅延の注入自体は PR #45 の TOCTOU 再現と同じ手法。ここでは実際の
-    HTTP 経由の並行アクセスで、固まらないこと・壊れた画像を返さないこと・
-    recompute 完了後は必ず新しい絵になることを確かめる）。
+    同じ形（重い計算の最中）を作るため、遅延を注入する（遅延の注入自体は
+    PR #45 の TOCTOU 再現と同じ手法。ここでは実際の HTTP 経由の並行アクセス
+    で、固まらないこと・壊れた画像を返さないこと・recompute 完了後は必ず
+    新しい絵になることを確かめる）。
+
+    遅延の注入先は review.process ではなく corrections.apply（issue #77 で
+    recompute() が temporal.process() の結果をキャッシュするようになった
+    ため、手修正だけを積む POST /corrections では process() が呼ばれない。
+    apply_corrections() は手修正のたびに必ず呼ばれる後段なので、ここを
+    遅くすれば同じ「recompute 中」の状況を作れる）。
     """
     import cv2
     import numpy as np
     from concurrent.futures import ThreadPoolExecutor
+    from automosaic import corrections as corrections_mod
 
     lib = make_lib()
     srv = Server(lib)
-    orig_process = review_mod.process
+    orig_apply = corrections_mod.apply
     try:
         d = prepared_job(lib, srv)
         jid = d["id"]
@@ -1085,12 +1092,12 @@ def test_api_frame_not_blocked_by_correction_recompute():
         started = threading.Event()
         release = threading.Event()
 
-        def slow_process(*a, **kw):
+        def slow_apply(*a, **kw):
             started.set()
             release.wait(timeout=5)
-            return orig_process(*a, **kw)
+            return orig_apply(*a, **kw)
 
-        review_mod.process = slow_process
+        corrections_mod.apply = slow_apply
         try:
             result = {}
 
@@ -1131,7 +1138,7 @@ def test_api_frame_not_blocked_by_correction_recompute():
             release.set()
             th.join(timeout=10)
         finally:
-            review_mod.process = orig_process
+            corrections_mod.apply = orig_apply
 
         assert result.get("code") == 200, result
         assert all(c == 200 for c in frame_codes), frame_codes
@@ -1152,7 +1159,7 @@ def test_api_frame_not_blocked_by_correction_recompute():
         assert after != before, "recompute 後なのに古い絵のまま"
         print("  recompute 完了後の /frame は新しい領域を反映する OK")
     finally:
-        review_mod.process = orig_process
+        corrections_mod.apply = orig_apply
         srv.close()
 
 
