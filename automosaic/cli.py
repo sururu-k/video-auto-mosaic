@@ -733,6 +733,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="未処理区間の穴埋めを無効にする（素通しフレームが残る）",
     )
+    t.add_argument(
+        "--cut-at",
+        help="トラックを区切るフレーム番号をカンマ区切りで指定（例: 100,250,900）。"
+        "指定フレームをまたいでトラックが生成されず、補間や橋渡しも区切られる",
+    )
 
     r = p.add_argument_group("描画・出力")
     r.add_argument("--block", type=int, default=0, help="モザイクのブロックサイズ px（0で自動）")
@@ -803,6 +808,13 @@ def build_cfg(args) -> TemporalConfig:
     組み立てを2箇所に書くと、フィールドを1個足したときに片方だけ更新し
     忘れる経路ができる。
     """
+    cut_frames: set[int] = set()
+    if hasattr(args, 'cut_at') and args.cut_at:
+        try:
+            cut_frames = {int(s.strip()) for s in args.cut_at.split(',')}
+        except ValueError:
+            pass  # 不正な値は無視（デフォルト空集合のまま）
+
     return TemporalConfig(
         max_gap=args.max_gap,
         memory=args.memory,
@@ -820,6 +832,7 @@ def build_cfg(args) -> TemporalConfig:
         hold_growth=args.hold_growth,
         motion_cap=args.motion_cap,
         estimated_factor=args.estimated_factor,
+        cut_frames=cut_frames,
     )
 
 
