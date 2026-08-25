@@ -506,6 +506,88 @@ def test_build_argv():
     print("  CLI 引数の組み立て OK（途中保存は --resume に振り替える）")
 
 
+def test_boolean_settings_validation_is_shared():
+    """真偽設定を焼き込みとレビューが同じ規則で判定すること（issue #78）。"""
+    lib = jobs_mod.Library(make_lib())
+    job = lib.create("settings.mp4")
+    invalid_values = ("xyz", "2", "-1", [1])
+
+    for key in runner_mod.SETTINGS_FLAGS:
+        for value in invalid_values:
+            try:
+                runner_mod.build_argv(job, {key: value})
+            except ValueError as e:
+                build_error = str(e)
+            else:
+                raise AssertionError(f"build が {key}={value!r} を通した")
+
+            # レビューが使う真偽設定は estimate_gaps だけ。他2つは検出専用なので
+            # session_overrides の対象外だが、焼き込み側では同じ穴を残さない。
+            if key == "estimate_gaps":
+                try:
+                    session_mod.session_overrides({key: value})
+                except ValueError as e:
+                    assert str(e) == build_error, (build_error, str(e))
+                else:
+                    raise AssertionError(f"review が {key}={value!r} を通した")
+
+    known_values = (
+        (True, True), (False, False),
+        (1, True), (0, False), (2, True), (-1, True), (0.0, False),
+        ("true", True), (" TRUE ", True), ("1", True), ("yes", True), ("on", True),
+        ("false", False), (" FALSE ", False), ("0", False), ("no", False), ("off", False),
+    )
+    compared = 0
+    for key in runner_mod.SETTINGS_FLAGS:
+        flag = "--" + key.replace("_", "-")
+        for value, expected in known_values:
+            parsed = runner_mod.parse_setting_bool(key, value)
+            assert parsed is expected, (key, value, parsed)
+            argv = runner_mod.build_argv(job, {key: value})
+            assert (flag in argv) is expected, (key, value, argv)
+            overrides = session_mod.session_overrides({key: value})
+            if key == "estimate_gaps":
+                assert overrides[key] is expected, (key, value, overrides)
+            else:
+                assert key not in overrides, (key, value, overrides)
+            compared += 1
+
+    print(
+        f"  真偽設定: build は不正値 {len(invalid_values) * len(runner_mod.SETTINGS_FLAGS)} 件、"
+        f"review は共通キーの不正値 {len(invalid_values)} 件を拒否、"
+        f"既知値 {compared} 件の判定一致 OK"
+    )
+
+
+def test_start_rejects_invalid_boolean_settings():
+    """判定不能な真偽設定ではサブプロセスを起動せず 400 を返すこと。"""
+    lib_root = make_lib()
+    lib = jobs_mod.Library(lib_root)
+    job = lib.create("invalid-settings.mp4")
+    with open(job.source, "wb") as f:
+        f.write(b"source exists; the process must not start")
+
+    srv = Server(lib_root)
+    try:
+        rejected = 0
+        for key in runner_mod.SETTINGS_FLAGS:
+            for value in ("xyz", "2", "-1", [1]):
+                code, body = post_json(
+                    f"{srv.base}/api/jobs/{job.id}/start?t={TOKEN}",
+                    {"settings": {key: value}},
+                )
+                assert code == 400, (key, value, code, body)
+                assert "判定できない真偽設定" in (body or {}).get("detail", ""), body
+                detail = get_json(f"{srv.base}/api/jobs/{job.id}?t={TOKEN}")
+                assert detail["status"] != jobs_mod.STATUS_RUNNING, detail
+                active = get_json(f"{srv.base}/api/jobs?t={TOKEN}")["active"]
+                assert job.id not in active, active
+                rejected += 1
+        print(f"  HTTP start: 判定不能な真偽設定 {rejected} 件を起動前に 400 で拒否 OK")
+    finally:
+        srv.close()
+
+
 def wait_finished(srv, jid: str, timeout: float = 120.0) -> str:
     """処理が終わるまで待つ。戻り値は最終の status。"""
     end = time.time() + timeout
