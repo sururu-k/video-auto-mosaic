@@ -1834,13 +1834,21 @@ def test_http_frame_not_blocked_by_recompute():
     ReviewHandler._serve_frame は以前 s.lock を取っていたので、
     /api/mark が recompute() で止まっている間は /frame が1本も返らなかった
     （issue #25）。実測の「初回構築 5.2秒」と同じ形（重い計算の最中）を
-    作るため、review.process を一時的に遅くする（遅延の注入自体は PR #45 の
-    TOCTOU 再現と同じ手法）。固まらないこと・壊れた画像を返さないこと・
+    作るため、遅延を注入する（遅延の注入自体は PR #45 の TOCTOU 再現と
+    同じ手法）。固まらないこと・壊れた画像を返さないこと・
     recompute 完了後は必ず新しい絵になることを実際の HTTP で確かめる。
+
+    遅延の注入先は review.process ではなく corrections.apply（issue #77 で
+    recompute() が temporal.process() の結果をキャッシュするようになった
+    ため、手修正だけを積む /api/mark では process() が呼ばれない。
+    apply_corrections() は手修正のたびに必ず呼ばれる後段なので、ここを
+    遅くすれば同じ「recompute 中」の状況を作れる）。
     """
+    from automosaic import corrections as corrections_mod
+
     tmp = tempfile.mkdtemp()
     httpd = None
-    orig_process = review.process
+    orig_apply = corrections_mod.apply
     try:
         path = os.path.join(tmp, "src.avi")
         vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 30.0, (640, 480))
@@ -1868,12 +1876,12 @@ def test_http_frame_not_blocked_by_recompute():
         started = threading.Event()
         release = threading.Event()
 
-        def slow_process(*a, **kw):
+        def slow_apply(*a, **kw):
             started.set()
             release.wait(timeout=5)
-            return orig_process(*a, **kw)
+            return orig_apply(*a, **kw)
 
-        review.process = slow_process
+        corrections_mod.apply = slow_apply
         try:
             result = {}
 
@@ -1908,7 +1916,7 @@ def test_http_frame_not_blocked_by_recompute():
             release.set()
             th.join(timeout=10)
         finally:
-            review.process = orig_process
+            corrections_mod.apply = orig_apply
 
         assert result.get("code") == 200, result
         assert all(c == 200 for c in frame_codes), frame_codes
@@ -1927,7 +1935,7 @@ def test_http_frame_not_blocked_by_recompute():
         assert after != before, "recompute 後なのに古い絵のまま"
         print("  recompute 完了後の /frame は新しい領域を反映する OK")
     finally:
-        review.process = orig_process
+        corrections_mod.apply = orig_apply
         if httpd:
             httpd.shutdown()
             httpd.server_close()
@@ -2652,6 +2660,144 @@ def test_review_session_effective_settings_matches_cli_report_for_default_job():
         print(
             "  session.effective_sha256() == report.effective_sha256 "
             f"(既定ジョブ) OK（{session_sha[:16]}...）"
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# -- #77: recompute() が temporal.process() の結果をキャッシュする -------
+#
+# process()（トラッキング/結合/デスパイク/補間/橋渡し/膨張）は
+# per_frame/classes/cfg/width/height/n_frames だけで決まり、手修正は
+# self.corrections しか動かさない（review.py の recompute() のコメント参照）。
+# 実測（55,303フレーム / 1920x1080、data/library/20260823-234604-9be9）:
+# process() 3.05s -> キャッシュ命中時 0.018s。
+
+
+def _regions_signature(regs):
+    """(box, Region) の列を、Region のインスタンス同一性に頼らず比較できる
+    タプル列にする（Region は order=True でないので sorted() に直接渡せない）。
+    """
+    return sorted((box, reg.cls, reg.source, round(reg.score, 4)) for box, reg in regs)
+
+
+def test_recompute_reuses_process_cache_when_only_corrections_change():
+    """手修正だけを積む一連の操作（set_corrections / mark / undo）では、
+    temporal.process() が2回目以降呼ばれないこと。
+
+    ここが壊れて毎回 process() を呼び直す退行が起きると、55,303フレーム規模
+    で「1修正=1.1秒」の重さに戻る（issue #77 の本題）。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)  # __post_init__ が1回だけ process() を呼ぶ
+
+        orig_process = review.process
+        calls = {"n": 0}
+
+        def counting_process(*a, **kw):
+            calls["n"] += 1
+            return orig_process(*a, **kw)
+
+        review.process = counting_process
+        try:
+            s.set_corrections(
+                [{"frame": 5, "box": [10, 10, 20, 20], "class": CLS, "kind": "add"}]
+            )
+            s.mark(15, "fixed", tap=(0.5, 0.5), size=(20, 20))
+            s.set_corrections(
+                [{"frame": 6, "box": [11, 11, 21, 21], "class": CLS, "kind": "add"}]
+            )
+            s.undo()
+        finally:
+            review.process = orig_process
+
+        assert calls["n"] == 0, (
+            f"手修正だけの操作で temporal.process() が {calls['n']} 回呼ばれた"
+            "（キャッシュが効いていない。1修正ごとに全編再計算する退行）"
+        )
+        print("  手修正だけの操作では process() が再実行されない OK（0回）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_recompute_cache_invalidates_when_cfg_changes():
+    """cfg が変わったら、キャッシュを使い回さず process() を呼び直すこと。
+
+    本来 cfg は構築後どのメソッドも書き換えないが、フィンガープリントの
+    安全側の検査そのものを確かめるため、ここでは直接書き換える。呼び直さ
+    ないと「設定を変えたのに古い矩形のまま」―― 黙って古い結果を見せる
+    壊れ方になる（RULES 0）。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        assert s._process_cache is not None
+        cached_fingerprint = s._process_cache[0]
+
+        orig_process = review.process
+        calls = {"n": 0}
+
+        def counting_process(*a, **kw):
+            calls["n"] += 1
+            return orig_process(*a, **kw)
+
+        review.process = counting_process
+        try:
+            s.cfg = dataclasses.replace(s.cfg, max_gap=s.cfg.max_gap + 1)
+            s.recompute()
+        finally:
+            review.process = orig_process
+
+        assert calls["n"] == 1, (
+            f"cfg を変えたのに process() が {calls['n']} 回しか呼ばれなかった"
+            "（古いキャッシュを黙って使い回している）"
+        )
+        assert s._process_cache[0] != cached_fingerprint
+        print("  cfg の変化でキャッシュが正しく無効化される OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_recompute_cache_hit_regions_match_fresh_recompute():
+    """キャッシュを使った recompute() の結果が、キャッシュを使わず律儀に
+    計算し直した結果と全フレームで1つも食い違わないこと。
+
+    キャッシュのバグは「新しく計算していたら塗られていたのに、キャッシュを
+    使ったら塗られない」という漏れる方向の壊れ方をしうる
+    （PR #66 / #58 で実際に「包含しているはず」が外れた前例がある）。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        s.set_corrections(
+            [
+                {"frame": f, "box": [5 + f, 5 + f, 30, 30], "class": CLS, "kind": "add"}
+                for f in (3, 33, 45, 58)
+            ]
+        )
+        # ここまでで __post_init__ (miss) -> set_corrections (hit) の2回。
+        # キャッシュ命中で作られた regions を退避する
+        assert s._process_cache is not None
+        cache_hit_sig = {f: _regions_signature(s.regions.get(f, [])) for f in range(s.n_frames)}
+
+        # キャッシュを強制的に捨てて、process() から律儀に計算し直させる
+        s._process_cache = None
+        s.recompute()
+        fresh_sig = {f: _regions_signature(s.regions.get(f, [])) for f in range(s.n_frames)}
+
+        mismatched = [f for f in range(s.n_frames) if cache_hit_sig[f] != fresh_sig[f]]
+        assert not mismatched, (
+            f"キャッシュ命中と計算し直しで結果が食い違うフレーム: {mismatched[:10]}"
+        )
+
+        total_hit = sum(len(v) for v in cache_hit_sig.values())
+        total_fresh = sum(len(v) for v in fresh_sig.values())
+        assert total_hit == total_fresh
+        assert total_hit > 0
+        print(
+            f"  キャッシュ命中とキャッシュ無しの結果が全 {s.n_frames} フレームで一致 OK"
+            f"（矩形 {total_hit} 個）"
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -1071,6 +1071,16 @@ class ReviewSession:
     # 区別できないので、否定の例としてここに別建てで持つ。
     false_positives: list = field(init=False, default_factory=list)
 
+    # temporal.process() の結果のキャッシュ（issue #77）。
+    # (per_frame の id, n_frames, width, height, classes, cfg, regions, stats,
+    # despiked_ranges) を持つ。per_frame/classes/cfg/width/height/n_frames は
+    # __post_init__ 以降どのメソッドも書き換えない（手修正は self.corrections
+    # だけを動かす）ので、これらが変わっていない限り process() の出力は
+    # 前回と1バイトも違わない。フィンガープリントが変わっていたら（将来
+    # どこかの変更で書き換えられるようになったら）キャッシュを捨てて律儀に
+    # 計算し直す。「たぶん変わっていない」で済ませない。
+    _process_cache: tuple | None = field(init=False, default=None, repr=False)
+
     def __post_init__(self) -> None:
         self.reader = FrameReader(self.video)
         self.lock = threading.Lock()
@@ -1097,17 +1107,44 @@ class ReviewSession:
     def recompute(self) -> None:
         """検出 + 手修正から最終領域を作り直す。
 
-        手修正のたびに全フレーム回すのは一見無駄だが、process() は座標だけの
-        処理なので数千フレームでも一瞬で終わる。差分更新を書くと
-        「焼き込みと同じ計算」という保証が崩れるので、素直に全部やり直す。
+        `process()`（トラッキング/結合/デスパイク/補間/橋渡し/膨張）は
+        `self.per_frame` / `self.classes` / `self.cfg` /
+        `self.width` / `self.height` / `self.n_frames` だけで決まり、
+        手修正は `self.corrections` にしか触らない（`_save_corrections()` /
+        `set_corrections()` / `undo()` を見ればわかる。process() の入力側の
+        フィールドを書き換えるメソッドはこのクラスに無い）。つまり手修正の
+        前後で process() の出力は1バイトも変わらない。以前は「差分更新は
+        焼き込みと同じ計算という保証が崩れる」という理由で毎回全部やり直して
+        いたが、それは正しい心配ではなかった —— 差分更新をするのではなく、
+        変わらない入力から出た**同一の出力を使い回すだけ**なので、保証は
+        1ミリも緩まない（issue #77）。
+        手修正の適用（apply_corrections）は process() の後段でしか起きない
+        処理なので、ここは毎回やる。
         """
         from .corrections import apply as apply_corrections
 
-        regions, stats = process(
-            self.per_frame, self.n_frames, self.width, self.height, self.classes, self.cfg
+        fingerprint = (
+            id(self.per_frame),
+            self.n_frames,
+            self.width,
+            self.height,
+            frozenset(self.classes),
+            self.cfg,
         )
-        stats.pop("_left_open", None)
-        self.despiked_ranges = stats.pop("_despiked_ranges", [])
+        cached = self._process_cache
+        if cached is not None and cached[0] == fingerprint:
+            regions, stats, despiked_ranges = cached[1], dict(cached[2]), cached[3]
+        else:
+            regions, stats = process(
+                self.per_frame, self.n_frames, self.width, self.height, self.classes, self.cfg
+            )
+            stats.pop("_left_open", None)
+            despiked_ranges = stats.pop("_despiked_ranges", [])
+            # apply_corrections() は regions を書き換えない（新しい dict/list を
+            # 返す）ので、process() の生出力をキャッシュへそのまま持っていて安全。
+            self._process_cache = (fingerprint, regions, dict(stats), despiked_ranges)
+
+        self.despiked_ranges = despiked_ranges
         self.regions = apply_corrections(regions, self.corrections)
         self.stats = stats
 
