@@ -26,6 +26,7 @@ from automosaic.temporal import (  # noqa: E402
     estimated_only_ranges,
     geometric_filter,
     process,
+    review_flags,
 )
 
 CLS = "FEMALE_GENITALIA_EXPOSED"
@@ -681,6 +682,99 @@ def test_module_docstring_matches_implementation():
     assert all(p >= 0 for p in src_pos)
     assert src_pos == sorted(src_pos), "process() の呼び出し順が docstring と違う"
     print("  冒頭 docstring と実装順の一致 OK")
+
+
+def test_review_flags_counts_uncovered():
+    """review_flags が未処理フレームを正しくカウントすること（issue #87）。
+
+    PR #86 で既定キューが despiked と uncovered だけに絞られたため、
+    review_flags() もこの定義に統一する。以前は補間/memory を含む全フレームを
+    カウントしていたが、その結果として review_frames (37,775) と
+    実際のキュー (846) が44倍異なる問題が発生していた。
+    """
+    N = 100
+    # フレーム0-30に検出、40-60は未処理
+    dets: dict[int, list[Detection]] = {}
+    for f in range(30):
+        dets[f] = [Detection(CLS, 0.8, (100, 100, 40, 40))]
+    # 40-60は検出なし（未処理）
+
+    cfg = TemporalConfig(max_gap=3, memory=0, min_track_len=0, bridge_max=0)
+    regions, _ = process(dets, N, W, H, {CLS}, cfg)
+
+    # 未処理区間: [40, 100)
+    left_open = [(40, 100)]
+    flags = review_flags(regions, N, left_open=left_open)
+
+    # review_flags は 40-99 フレームをカウント
+    flagged_frames = sorted(f["frame"] for f in flags)
+    expected = list(range(40, 100))
+    assert flagged_frames == expected, f"expected {expected}, got {flagged_frames}"
+    assert all(f["reasons"] == ["未処理"] for f in flags), "reason が未処理でない"
+    print(f"  未処理フレームのカウント OK ({len(flags)} 件)")
+
+
+def test_review_flags_counts_despiked():
+    """review_flags が despike で捨てた帯を正しくカウントすること（issue #87）。"""
+    N = 100
+    dets: dict[int, list[Detection]] = {}
+    # フレーム10-15に単発かつ低スコアの検出（despike で捨てられる候補）
+    for f in range(10, 16):
+        dets[f] = [Detection(CLS, 0.2, (100, 100, 40, 40))]
+
+    cfg = TemporalConfig(
+        max_gap=1, memory=0, min_track_len=1, despike_conf=0.35, bridge_max=0
+    )
+    regions, stats = process(dets, N, W, H, {CLS}, cfg)
+    despiked = stats.get("_despiked_ranges", [])
+
+    if despiked:
+        flags = review_flags(regions, N, despiked_ranges=despiked)
+        flagged_frames = sorted(f["frame"] for f in flags)
+
+        # despiked_ranges は (start, end, cls, score) の形
+        expected_start = despiked[0][0]
+        expected_end = despiked[0][1]
+        expected = list(range(expected_start, expected_end + 1))
+
+        assert flagged_frames == expected, f"expected {expected}, got {flagged_frames}"
+        assert all(f["reasons"] == ["despiked"] for f in flags), "reason が despiked でない"
+        print(f"  despiked フレームのカウント OK ({len(flags)} 件)")
+    else:
+        print("  despiked フレームのカウント (despike 発動なし、スキップ)")
+
+
+def test_review_flags_counts_both():
+    """review_flags が uncovered と despiked の両方をカウントすること（issue #87）。"""
+    N = 100
+    dets: dict[int, list[Detection]] = {}
+    # フレーム10-15に単発かつ低スコアの検出（despike で捨てられる候補）
+    for f in range(10, 16):
+        dets[f] = [Detection(CLS, 0.2, (100, 100, 40, 40))]
+    # フレーム30-40は検出なし
+
+    cfg = TemporalConfig(
+        max_gap=1, memory=0, min_track_len=1, despike_conf=0.35, bridge_max=0
+    )
+    regions, stats = process(dets, N, W, H, {CLS}, cfg)
+    despiked = stats.get("_despiked_ranges", [])
+
+    # 未処理区間
+    left_open = [(30, 41)]
+
+    flags = review_flags(regions, N, left_open=left_open, despiked_ranges=despiked)
+    flagged_frames = sorted(f["frame"] for f in flags)
+
+    # 期待値: [未処理: 30-40, despiked: 10-15]
+    if despiked:
+        despiked_frames = set(range(despiked[0][0], despiked[0][1] + 1))
+    else:
+        despiked_frames = set()
+    uncovered_frames = set(range(30, 41))
+
+    expected = sorted(despiked_frames | uncovered_frames)
+    assert flagged_frames == expected, f"expected {expected}, got {flagged_frames}"
+    print(f"  uncovered と despiked の両方のカウント OK ({len(flags)} 件)")
 
 
 if __name__ == "__main__":

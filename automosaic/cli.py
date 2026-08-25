@@ -1353,7 +1353,7 @@ def main(argv: list[str] | None = None) -> int:
         if len(est_only) > 15:
             print(f"  ... 他 {len(est_only) - 15} 件")
 
-    flags = review_flags(regions, n_frames)
+    flags = review_flags(regions, n_frames, left_open=left_open, despiked_ranges=despiked_ranges)
     if args.report:
         with open(args.report, "w", encoding="utf-8") as f:
             json.dump(

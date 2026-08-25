@@ -1385,28 +1385,39 @@ def _merge_ranges(
 def review_flags(
     regions_per_frame: dict[int, list[tuple[Box, Region]]],
     n_frames: int,
+    left_open: list[tuple[int, int]] | None = None,
+    despiked_ranges: list[tuple[int, int, str, float]] | None = None,
 ) -> list[dict]:
-    """人手レビューに回すべきフレーム区間を洗い出す。
+    """人手レビューに回すべきフレームを洗い出す。
 
-    「判断できない = 潰す」を実行したうえで、潰した根拠が弱い箇所を記録する。
+    PR #86 で既定キューが despiked と uncovered（未処理）だけに絞られたため、
+    review_flags() もこの定義に統一する（issue #87）。
+
+    left_open: 未処理のまま残った区間の (start, end) リスト（半開区間）。
+               省略時は計算しない（互換性のため）
+    despiked_ranges: despike が捨てた帯の (start, end, cls, score) リスト。
+                     省略時は計算しない
     """
     flags: list[dict] = []
-    prev_area = None
-    for f in range(n_frames):
-        regs = regions_per_frame.get(f, [])
-        reasons = []
 
-        if any(r.source != "detected" for _, r in regs):
-            reasons.append("推定領域（補間/memory）を含む")
-        if regs and max(r.score for _, r in regs) < 0.30:
-            reasons.append("低信頼")
+    # 未処理フレーム（uncovered）
+    if left_open:
+        for start, end in left_open:
+            for f in range(start, end):
+                if f < n_frames:
+                    flags.append({"frame": f, "reasons": ["未処理"]})
 
-        area = sum(b[2] * b[3] for b, _ in regs)
-        if prev_area is not None and regs:
-            if prev_area > 0 and (area > prev_area * 2 or area < prev_area / 2):
-                reasons.append("面積の急変")
-        prev_area = area if regs else prev_area
+    # despiked が捨てた帯
+    if despiked_ranges:
+        for start, end, cls, score in despiked_ranges:
+            for f in range(start, end + 1):
+                if f < n_frames:
+                    # 既にフラグがあれば追加、無ければ新規
+                    existing = next((fl for fl in flags if fl["frame"] == f), None)
+                    if existing:
+                        if "despiked" not in existing["reasons"]:
+                            existing["reasons"].append("despiked")
+                    else:
+                        flags.append({"frame": f, "reasons": ["despiked"]})
 
-        if reasons:
-            flags.append({"frame": f, "reasons": reasons})
     return flags
