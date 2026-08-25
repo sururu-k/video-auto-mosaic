@@ -46,7 +46,16 @@ import type {
   StateLight,
   UndoResponse,
 } from "../shared/api.js";
-import { drawQueueTrack, drawReviewOverlay, frameFromTrackX } from "../shared/canvas-draw.js";
+import {
+  drawOverviewTrack,
+  drawQueueTrack,
+  drawReviewOverlay,
+  fullViewport,
+  followPlayhead,
+  frameFromTrackXInRange,
+  zoomViewport,
+} from "../shared/canvas-draw.js";
+import type { Viewport } from "../shared/canvas-draw.js";
 import { normFromClient, scaledSize, tapToBox } from "../shared/geom.js";
 import type { NormPoint } from "../shared/geom.js";
 import {
@@ -54,12 +63,14 @@ import {
   helpRows,
   REVIEW_INTERVAL_KEYS,
   REVIEW_KEYS,
+  TRACK_ZOOM_KEYS,
 } from "../shared/keymap.js";
 import type { KeyLike } from "../shared/keymap.js";
 import {
   MARK_MODES,
   VERDICT_LABEL,
   autoBoxes,
+  dragToInterval,
   eraseSummary,
   firstUnjudged,
   intervalStatus,
@@ -74,7 +85,10 @@ import type { MarkMode } from "../shared/review-logic.js";
 import { api, errText, link, url } from "../shared/webapp-net.js";
 
 // この画面のキー割り当て全体（一覧表示・? キーで使う）
-const ALL_KEYS = [...REVIEW_KEYS, ...REVIEW_INTERVAL_KEYS];
+const ALL_KEYS = [...REVIEW_KEYS, ...REVIEW_INTERVAL_KEYS, ...TRACK_ZOOM_KEYS];
+// ズーム1段の倍率。+ で長さ半分（2倍拡大）、- で長さ2倍（半分に縮小）
+const ZOOM_IN_FACTOR = 0.5;
+const ZOOM_OUT_FACTOR = 2;
 // Shift+← / Shift+→（大きく飛ぶ）のプレビュー移動幅。固定値（timeline と揃えた）
 const JUMP_STEP = 10;
 
@@ -142,9 +156,18 @@ function App() {
 
   const ovRef = useRef<HTMLCanvasElement>(null);
   const trackRef = useRef<HTMLCanvasElement>(null);
+  const overviewRef = useRef<HTMLCanvasElement>(null);
   // トラックの canvas 幅は画面幅（clientWidth）で決まるので、リサイズを
   // 見張って引き直す（timeline.tsx の bandRef と同じ理由）
   const [trackResizeTick, setTrackResizeTick] = useState(0);
+  // トラックの拡大縮小（issue #84）。null は「まだ全体表示（初期値）」の
+  // 意味で、state 読み込み後の追従エフェクトが fullViewport で埋める
+  const [viewport, setViewport] = useState<Viewport | null>(null);
+  // トラック上のドラッグ（issue #84）。ドラッグ中だけ生きる一時状態で、
+  // 確定した区間は intervalStart（I/O と共通）に積む。ここに残るのは
+  // 「まだ指を離していない」というジェスチャそのものの状態だけ
+  const [dragStartFrame, setDragStartFrame] = useState<number | null>(null);
+  const [dragHoverFrame, setDragHoverFrame] = useState<number | null>(null);
 
   const cur = items[idx] ?? null;
   const displayFrame = previewFrame ?? cur?.frame ?? 0;
@@ -230,11 +253,38 @@ function App() {
     () => items.filter((it) => it.boxes.length === 0).map((it) => it.frame),
     [items],
   );
+  // 手修正した場所（issue #84 その3）。src="x" は review.py の
+  // SOURCE_CODE で手修正を指す唯一の値（api.ts の SourceCode コメント
+  // 参照）。これも /queue の中身だけから作れるので、新しい往復は無い
+  const correctionFrames = useMemo(
+    () => items.filter((it) => it.boxes.some((r) => r[4] === "x")).map((it) => it.frame),
+    [items],
+  );
+
+  // ビューポート（拡大縮小の表示範囲）の初期化と、再生ヘッドへの追従。
+  // state が来る前は何もしない。来たら vp が無ければ全体表示から始め、
+  // 以後は displayFrame がビューポートの外に出るたびに動かす
+  // （中に居るなら followPlayhead が同じ参照を返すので、無駄な再描画は
+  // 起きない）。「拡大したまま移動したら追従する」はこれだけで満たす
+  useEffect(() => {
+    if (!state) return;
+    setViewport((vp) => followPlayhead(vp ?? fullViewport(state.n_frames), displayFrame, state.n_frames));
+  }, [displayFrame, state]);
+
+  const effectiveViewport = state ? (viewport ?? fullViewport(state.n_frames)) : null;
+  // I/O の区間、またはドラッグ中の区間。どちらも「同じ区間」を指すように
+  // 同じ形（frame の始点・終点）でトラックへ渡す（別々の状態を持たない）
+  const trackInterval =
+    intervalStart != null
+      ? { start: intervalStart.frame, end: displayFrame }
+      : dragStartFrame != null && dragHoverFrame != null
+        ? { start: dragStartFrame, end: dragHoverFrame }
+        : null;
 
   useEffect(() => {
     const cv = trackRef.current;
     const ctx = cv?.getContext("2d");
-    if (!cv || !ctx || !state) return;
+    if (!cv || !ctx || !state || !effectiveViewport) return;
     const w = cv.clientWidth;
     if (cv.width !== w) cv.width = w;
     drawQueueTrack(ctx, {
@@ -242,11 +292,34 @@ function App() {
       height: cv.height,
       nFrames: state.n_frames,
       uncoveredFrames,
+      correctionFrames,
       cur: displayFrame,
+      viewStart: effectiveViewport.start,
+      viewEnd: effectiveViewport.end,
+      interval: trackInterval,
     });
     // eslint 的には trackResizeTick は使っていないように見えるが、これが
     // 変わるたびに描き直させるためだけに依存配列へ入れてある
-  }, [state, uncoveredFrames, displayFrame, trackResizeTick]);
+  }, [state, uncoveredFrames, correctionFrames, displayFrame, effectiveViewport, trackInterval, trackResizeTick]);
+
+  // 全体のどこを見ているか（issue #84）。main トラックがどれだけ拡大されて
+  // いても、ここは常に [0, n_frames) 全体を映し、今のビューポートを枠で示す
+  useEffect(() => {
+    const cv = overviewRef.current;
+    const ctx = cv?.getContext("2d");
+    if (!cv || !ctx || !state || !effectiveViewport) return;
+    const w = cv.clientWidth;
+    if (cv.width !== w) cv.width = w;
+    drawOverviewTrack(ctx, {
+      width: w,
+      height: cv.height,
+      nFrames: state.n_frames,
+      uncoveredFrames,
+      cur: displayFrame,
+      viewStart: effectiveViewport.start,
+      viewEnd: effectiveViewport.end,
+    });
+  }, [state, uncoveredFrames, displayFrame, effectiveViewport, trackResizeTick]);
 
   useEffect(() => {
     const onResize = () => setTrackResizeTick((v) => v + 1);
@@ -301,6 +374,78 @@ function App() {
       cancelMark();
     }
     setPreviewFrame(Math.max(0, Math.min(state.n_frames - 1, frame)));
+    setNotice("");
+  }
+
+  // -- トラックの拡大縮小（issue #84） -----------------------------------
+  // 新しく何かを取りに行くことはない。既にある state.n_frames と、いま
+  // 見ているフレーム（displayFrame）だけからビューポートを計算する。
+
+  function zoomTrack(factor: number) {
+    if (!state) return;
+    setViewport((vp) =>
+      zoomViewport(vp ?? fullViewport(state.n_frames), factor, displayFrame, state.n_frames),
+    );
+  }
+  function zoomTrackFit() {
+    if (!state) return;
+    setViewport(fullViewport(state.n_frames));
+  }
+
+  // -- トラック上のドラッグでの範囲選択（issue #84） ----------------------
+  //
+  // 新しい「選択範囲」という状態は持たない。dragToInterval() が I を押す
+  // のと同じ形（intervalStart = { frame }）を返したら、それをそのまま
+  // intervalStart へ積む。ドラッグで選んだ区間と I/O で選んだ区間が
+  // 同じ変数を指すことになる。box の位置（tap）はトラック（時間軸だけの
+  // 1次元）からは分からないので、タップ済みでなければ区間にはしない
+  // （dragToInterval 冒頭のコメント参照）。
+
+  function trackFrameAt(cv: HTMLCanvasElement, clientX: number): number | null {
+    if (!state || !effectiveViewport) return null;
+    const r = cv.getBoundingClientRect();
+    return frameFromTrackXInRange(clientX - r.left, r.width, effectiveViewport.start, effectiveViewport.end);
+  }
+
+  function onTrackPointerDown(ev: PointerEvent) {
+    const cv = trackRef.current;
+    if (!cv) return;
+    const f = trackFrameAt(cv, ev.clientX);
+    if (f === null) return;
+    cv.setPointerCapture?.(ev.pointerId);
+    setDragStartFrame(f);
+    setDragHoverFrame(f);
+  }
+
+  function onTrackPointerMove(ev: PointerEvent) {
+    if (dragStartFrame === null) return;
+    const cv = trackRef.current;
+    if (!cv) return;
+    const f = trackFrameAt(cv, ev.clientX);
+    if (f !== null) setDragHoverFrame(f);
+  }
+
+  function onTrackPointerUp(ev: PointerEvent) {
+    const cv = trackRef.current;
+    const start = dragStartFrame;
+    const endF = (cv && trackFrameAt(cv, ev.clientX)) ?? dragHoverFrame;
+    setDragStartFrame(null);
+    setDragHoverFrame(null);
+    if (start === null || endF === null || !state) return;
+    const d = dragToInterval(start, endF, markMode, !!tap);
+    if (d.intervalStart) {
+      // I を押すのと同じ状態を、ドラッグの起点フレームで作る
+      setIntervalStart({ frame: d.intervalStart.frame, tap: tap!, size: boxSize });
+      setTap(null);
+      setPicked([]);
+    } else if (intervalStart) {
+      // 区間の始点は置いたまま、タップだけ捨てる（goto と同じ規則）
+      setTap(null);
+      setPicked([]);
+    } else {
+      cancelMark();
+    }
+    setPreviewFrame(Math.max(0, Math.min(state.n_frames - 1, d.previewFrame)));
     setNotice("");
   }
 
@@ -539,6 +684,10 @@ function App() {
         goEnd: () => jumpPreviewTo((state?.n_frames ?? 1) - 1),
         queuePrev: () => goto(idx - 1),
         queueNext: () => goto(idx + 1),
+        // トラックの拡大縮小（issue #84）
+        trackZoomIn: () => zoomTrack(ZOOM_IN_FACTOR),
+        trackZoomOut: () => zoomTrack(ZOOM_OUT_FACTOR),
+        trackZoomFit: () => zoomTrackFit(),
         // この画面に連続再生は無い（1枚ずつ判定する画面）
         playToggle: noPlayback,
         shuttleReverse: noPlayback,
@@ -615,22 +764,48 @@ function App() {
       <div id="banner" class={bannerText ? "" : "hidden"}>{bannerText}</div>
 
       {/* 時間軸のトラック（issue #84）。緑=このキューでは未塗装が見えていない
-          区間、赤=未塗装のキュー標本がある画素、白線=いま見ているフレーム。
-          クリックで時間移動できる（プレビューとして動く。判定は動かない）。
-          拡大縮小・ドラッグ範囲選択・手修正の表示は次の PR に回した */}
+          区間、赤=未塗装のキュー標本がある画素、下段の緑=手修正のあるフレーム、
+          薄緑の帯=I/O または今ドラッグ中の区間、白線=いま見ているフレーム。
+          クリックで時間移動、ドラッグで区間選択（I/O と同じ状態を作る）。
+          + / - / 0 は拡大・縮小・全体表示に戻す（キー割り当ては
+          shared/keymap.ts の TRACK_ZOOM_KEYS。ボタンも用意し、キーが無いと
+          できないことを作らない）。下のミニマップは常に全体を映し、
+          今どこを拡大しているかを白枠で示す */}
       <div id="track-wrap">
+        <div class="track-zoom-row">
+          <button id="btn-track-zoom-out" class="track-zoom-btn" onClick={() => zoomTrack(ZOOM_OUT_FACTOR)}>−</button>
+          <span id="track-range" class="dim mono">
+            {state && effectiveViewport
+              ? effectiveViewport.end - effectiveViewport.start >= state.n_frames
+                ? `全体表示（${state.n_frames} フレーム）`
+                : `frame ${effectiveViewport.start} 〜 ${effectiveViewport.end - 1}（${effectiveViewport.end - effectiveViewport.start} / ${state.n_frames}）`
+              : ""}
+          </span>
+          <button id="btn-track-zoom-in" class="track-zoom-btn" onClick={() => zoomTrack(ZOOM_IN_FACTOR)}>＋</button>
+          <button id="btn-track-zoom-fit" class="track-zoom-btn" onClick={zoomTrackFit}>全体表示</button>
+        </div>
         <canvas id="track" ref={trackRef} height={34}
+                onPointerDown={onTrackPointerDown}
+                onPointerMove={onTrackPointerMove}
+                onPointerUp={onTrackPointerUp}
+                onPointerCancel={onTrackPointerUp} />
+        <canvas id="track-overview" ref={overviewRef} height={14}
                 onClick={(ev) => {
-                  if (!state) return;
-                  const cv = trackRef.current;
-                  if (!cv) return;
+                  const cv = overviewRef.current;
+                  if (!state || !cv) return;
                   const r = cv.getBoundingClientRect();
-                  const f = frameFromTrackX(ev.clientX - r.left, r.width, state.n_frames);
+                  // ミニマップは常に全体（0..n_frames）を映すので、拡大中の
+                  // ビューポートではなく [0, n_frames) で変換する。再生ヘッドを
+                  // 動かすだけで、そこへの追従（followPlayhead）がビューポートを
+                  // 自動で連れて行く
+                  const f = frameFromTrackXInRange(ev.clientX - r.left, r.width, 0, state.n_frames);
                   jumpPreviewTo(f);
                 }} />
         <div class="track-legend">
           <span><i class="sw sw-none" />未処理（このキューで見えている分）</span>
           <span><i class="sw sw-real" />それ以外</span>
+          <span><i class="sw sw-fix" />手修正のあるコマ</span>
+          <span><i class="sw sw-ivl" />I/O・ドラッグの区間</span>
         </div>
       </div>
 

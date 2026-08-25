@@ -28,8 +28,17 @@ button.big.dim { background: #23272e; border-color: #3a414c; color: #aeb6c1; }
    同じ色（frontend/src/timeline/timeline.css相当の値をそのまま流用）を使い、
    別画面で同じ意味の色が変わらないようにする */
 #track-wrap { padding: 6px 14px 4px; background: #1a1c22; border-top: 1px solid var(--line); }
-#track { width: 100%; display: block; cursor: pointer; background: #101216; touch-action: pan-y; }
-.track-legend { display: flex; gap: 16px; margin-top: 5px; color: #98a1ad; font-size: 12px; }
+#track { width: 100%; display: block; cursor: pointer; background: #101216; touch-action: none; }
+/* 拡大縮小（issue #84）。マウスホイールでの拡大は付けていないので pan-y
+   のままでもよかったが、ドラッグでの範囲選択を左右どちらの指の動きでも
+   確実に拾うため none にする（縦スクロールはこの帯の上では要らない） */
+#track-overview { width: 100%; display: block; cursor: pointer; background: #101216; margin-top: 3px; touch-action: pan-y; }
+.track-zoom-row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.track-zoom-btn { padding: 2px 10px; min-width: 30px; }
+#track-range { flex: 1; text-align: center; }
+.track-legend { display: flex; gap: 16px; margin-top: 5px; color: #98a1ad; font-size: 12px; flex-wrap: wrap; }
 .track-legend .sw { display: inline-block; width: 11px; height: 11px; margin-right: 5px; border-radius: 2px; }
 .sw-real { background: #3ba55d; }
 .sw-none { background: #d0453e; }
+.sw-fix { background: #5ad1a0; }
+.sw-ivl { background: rgba(90, 209, 160, .6); }

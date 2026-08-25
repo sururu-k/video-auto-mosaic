@@ -165,6 +165,13 @@ function intervalStatus(start, curFrame, endTapPlaced) {
   const banner = endTapPlaced ? `区間: frame ${start.frame} 〜 frame ${curFrame}。O で確定（Esc でやめる）` : `始点は frame ${start.frame}。終点のコマへ移動してタップし、O で確定（Esc でやめる）`;
   return { active: true, onStartFrame, banner, confirmDisabled: !endTapPlaced };
 }
+function dragToInterval(startFrame, endFrame, markMode, hasTap) {
+  const isDrag = startFrame !== endFrame;
+  if (isDrag && markMode === "add" && hasTap) {
+    return { intervalStart: { frame: startFrame }, previewFrame: endFrame };
+  }
+  return { intervalStart: null, previewFrame: endFrame };
+}
 
 // src/shared/geom.ts
 function normPoint(x, y) {
@@ -332,31 +339,112 @@ function drawHandOverlay(ctx, o) {
     ctx.setLineDash([]);
   }
 }
-function uncoveredPixelMask(frames, width, nFrames) {
+function pixelSampleMaskInRange(frames, width, rangeStart, rangeEnd) {
   const mask = new Array(Math.max(0, width)).fill(false);
-  if (width <= 0 || nFrames <= 0) return mask;
-  const sorted = [...frames].filter((f) => f >= 0 && f < nFrames).sort((a, b) => a - b);
+  const n = rangeEnd - rangeStart;
+  if (width <= 0 || n <= 0) return mask;
+  const sorted = [...frames].filter((f) => f >= rangeStart && f < rangeEnd).sort((a, b) => a - b);
   let i = 0;
   for (let px = 0; px < width; px++) {
-    const a = Math.floor(px * nFrames / width);
-    const b = Math.max(a + 1, Math.floor((px + 1) * nFrames / width));
+    const aRel = Math.floor(px * n / width);
+    const bRel = Math.max(aRel + 1, Math.floor((px + 1) * n / width));
+    const a = rangeStart + aRel;
+    const b = rangeStart + bRel;
     while (i < sorted.length && sorted[i] < a) i++;
     mask[px] = i < sorted.length && sorted[i] < b;
   }
   return mask;
 }
-function playheadPixel(cur, width, nFrames) {
+function uncoveredPixelMask(frames, width, nFrames) {
+  return pixelSampleMaskInRange(frames, width, 0, nFrames);
+}
+function playheadPixelInRange(cur, width, rangeStart, rangeEnd) {
   if (width <= 0) return 0;
-  if (nFrames <= 0) return 0;
-  const c = Math.min(Math.max(cur, 0), nFrames - 1);
-  return Math.min(width - 1, Math.max(0, Math.floor(c * width / nFrames)));
+  const n = rangeEnd - rangeStart;
+  if (n <= 0) return 0;
+  const c = Math.min(Math.max(cur, rangeStart), rangeEnd - 1);
+  return Math.min(width - 1, Math.max(0, Math.floor((c - rangeStart) * width / n)));
+}
+function playheadPixel(cur, width, nFrames) {
+  return playheadPixelInRange(cur, width, 0, nFrames);
+}
+function frameFromTrackXInRange(x, width, rangeStart, rangeEnd) {
+  const n = rangeEnd - rangeStart;
+  if (width <= 0 || n <= 0) return rangeStart;
+  const f = rangeStart + Math.floor(x / width * n);
+  return Math.min(rangeEnd - 1, Math.max(rangeStart, f));
 }
 function frameFromTrackX(x, width, nFrames) {
-  if (width <= 0 || nFrames <= 0) return 0;
-  const f = Math.floor(x / width * nFrames);
-  return Math.min(nFrames - 1, Math.max(0, f));
+  return frameFromTrackXInRange(x, width, 0, nFrames);
+}
+function fullViewport(nFrames) {
+  return { start: 0, end: Math.max(0, nFrames) };
+}
+function clampViewportStart(start, len, nFrames) {
+  const maxStart = Math.max(0, nFrames - len);
+  return Math.min(maxStart, Math.max(0, start));
+}
+function zoomLen(curLen, factor, nFrames) {
+  if (nFrames <= 0) return 0;
+  const len = Math.round(curLen * factor);
+  return Math.min(nFrames, Math.max(1, len));
+}
+function zoomViewport(vp, factor, cur, nFrames) {
+  const curLen = vp.end - vp.start;
+  const len = zoomLen(curLen, factor, nFrames);
+  const start = clampViewportStart(cur - Math.floor(len / 2), len, nFrames);
+  return { start, end: start + len };
+}
+function followPlayhead(vp, cur, nFrames) {
+  const len = vp.end - vp.start;
+  if (len <= 0) return vp;
+  if (cur >= vp.start && cur < vp.end) return vp;
+  const start = clampViewportStart(cur - Math.floor(len / 2), len, nFrames);
+  return { start, end: start + len };
+}
+function frameRangeToPixels(a, b, width, viewStart, viewEnd) {
+  if (width <= 0 || viewEnd <= viewStart) return null;
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+  if (hi < viewStart || lo >= viewEnd) return null;
+  const clo = Math.max(lo, viewStart);
+  const chi = Math.min(hi, viewEnd - 1);
+  const n = viewEnd - viewStart;
+  const px0 = Math.floor((clo - viewStart) * width / n);
+  const px1 = Math.max(px0 + 1, Math.floor((chi - viewStart + 1) * width / n));
+  return [Math.max(0, px0), Math.min(width, px1)];
 }
 function drawQueueTrack(ctx, o) {
+  const { width: w, height: h, nFrames: n } = o;
+  ctx.fillStyle = "#101216";
+  ctx.fillRect(0, 0, w, h);
+  if (w <= 0 || n <= 0) return;
+  const start = o.viewStart ?? 0;
+  const end = o.viewEnd ?? n;
+  if (end <= start) return;
+  const mask = pixelSampleMaskInRange(o.uncoveredFrames, w, start, end);
+  for (let px = 0; px < w; px++) {
+    ctx.fillStyle = mask[px] ? "#d0453e" : "#3ba55d";
+    ctx.fillRect(px, 0, 1, h);
+  }
+  if (o.correctionFrames?.length) {
+    const cmask = pixelSampleMaskInRange(o.correctionFrames, w, start, end);
+    ctx.fillStyle = "#5ad1a0";
+    for (let px = 0; px < w; px++) {
+      if (cmask[px]) ctx.fillRect(px, Math.max(0, h - 6), 1, Math.min(6, h));
+    }
+  }
+  if (o.interval) {
+    const rng = frameRangeToPixels(o.interval.start, o.interval.end ?? o.interval.start, w, start, end);
+    if (rng) {
+      ctx.fillStyle = "rgba(90, 209, 160, .35)";
+      ctx.fillRect(rng[0], 0, rng[1] - rng[0], h);
+    }
+  }
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(playheadPixelInRange(o.cur, w, start, end), 0, 2, h);
+}
+function drawOverviewTrack(ctx, o) {
   const { width: w, height: h, nFrames: n } = o;
   ctx.fillStyle = "#101216";
   ctx.fillRect(0, 0, w, h);
@@ -366,8 +454,15 @@ function drawQueueTrack(ctx, o) {
     ctx.fillStyle = mask[px] ? "#d0453e" : "#3ba55d";
     ctx.fillRect(px, 0, 1, h);
   }
+  const rng = frameRangeToPixels(o.viewStart, o.viewEnd - 1, w, 0, n);
+  if (rng) {
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1;
+    const rw = Math.max(1, rng[1] - rng[0] - 1);
+    ctx.strokeRect(rng[0] + 0.5, 0.5, rw, Math.max(1, h - 1));
+  }
   ctx.fillStyle = "#ffffff";
-  ctx.fillRect(playheadPixel(o.cur, w, n), 0, 2, h);
+  ctx.fillRect(playheadPixel(o.cur, w, n), 0, 1, h);
 }
 
 // src/shared/job-logic.ts
@@ -489,6 +584,14 @@ var REVIEW_KEYS = [
   RV_QUEUE_PREV,
   RV_QUEUE_NEXT
 ];
+var TRACK_ZOOM_IN = bind("trackZoomIn", ["=", "+"], "+", "トラックを拡大");
+var TRACK_ZOOM_OUT = bind("trackZoomOut", ["-", "_"], "-", "トラックを縮小");
+var TRACK_ZOOM_FIT = bind("trackZoomFit", ["0"], "0", "トラックの拡大を戻す（全体表示）");
+var TRACK_ZOOM_KEYS = [
+  TRACK_ZOOM_IN,
+  TRACK_ZOOM_OUT,
+  TRACK_ZOOM_FIT
+];
 var RV_INTERVAL_START = bind("intervalStart", ["i", "I"], "I", "区間の始点を置く");
 var RV_INTERVAL_END = bind("intervalEnd", ["o", "O"], "O", "区間の終点（確定）");
 var REVIEW_INTERVAL_KEYS = [RV_INTERVAL_START, RV_INTERVAL_END];
@@ -559,11 +662,18 @@ export {
   TL_NEXT_ESTIMATED,
   TL_SIZE_BIGGER,
   TL_SIZE_SMALLER,
+  TRACK_ZOOM_FIT,
+  TRACK_ZOOM_IN,
+  TRACK_ZOOM_KEYS,
+  TRACK_ZOOM_OUT,
   VERDICT_LABEL,
   autoBoxes,
+  clampViewportStart,
   correctionsAfterDrop,
   dispatchKey,
+  dragToInterval,
   drawHandOverlay,
+  drawOverviewTrack,
   drawQueueTrack,
   drawRegionOverlay,
   drawReviewOverlay,
@@ -571,9 +681,13 @@ export {
   eraseSummary,
   eraseVictims,
   firstUnjudged,
+  followPlayhead,
   frameFromClient,
   frameFromTrackX,
+  frameFromTrackXInRange,
   framePoint,
+  frameRangeToPixels,
+  fullViewport,
   helpLine,
   helpRows,
   intervalStatus,
@@ -584,7 +698,9 @@ export {
   numOr,
   overlaps,
   pickIndexAt,
+  pixelSampleMaskInRange,
   playheadPixel,
+  playheadPixelInRange,
   progressPercent,
   proxyLabel,
   requestWidth,
@@ -594,5 +710,7 @@ export {
   tapToBox,
   togglePick,
   uncoveredPixelMask,
-  worstCoverage
+  worstCoverage,
+  zoomLen,
+  zoomViewport
 };
