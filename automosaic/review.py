@@ -2402,6 +2402,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--block", type=int, default=cd["--block"], help="モザイクのブロックサイズ px（0で自動）"
     )
     p.add_argument("--mode", default=cd["--mode"], choices=["pixelize", "black"])
+    p.add_argument(
+        "--mosaic-offset",
+        type=str,
+        default=cd.get("--mosaic-offset", "0,0"),
+        help="モザイク描画位置のオフセット (dx,dy)。元の位置も塗ったまま",
+    )
     t = p.add_argument_group("時間方向（cli と同じ既定値）")
     t.add_argument("--classes", default=cd["--classes"])
     t.add_argument("--max-gap", type=int, default=cd["--max-gap"])
@@ -2503,6 +2509,17 @@ def session_from_args(args, argv: list[str] | None = None) -> ReviewSession:
         narrow_without_estimate_gaps(args, given)
 
     classes = resolve_classes(args.classes)
+
+    # mosaic_offset をパース
+    mosaic_offset = (0.0, 0.0)
+    if hasattr(args, "mosaic_offset") and args.mosaic_offset:
+        try:
+            parts = args.mosaic_offset.split(",")
+            if len(parts) == 2:
+                mosaic_offset = (float(parts[0]), float(parts[1]))
+        except (ValueError, IndexError):
+            pass  # デフォルト値を使用
+
     cfg = TemporalConfig(
         max_gap=args.max_gap,
         memory=args.memory,
@@ -2520,6 +2537,7 @@ def session_from_args(args, argv: list[str] | None = None) -> ReviewSession:
         hold_growth=args.hold_growth,
         motion_cap=args.motion_cap,
         estimated_factor=args.estimated_factor,
+        mosaic_offset=mosaic_offset,
     )
 
     corrections = CorrectionSet.load(args.corrections)

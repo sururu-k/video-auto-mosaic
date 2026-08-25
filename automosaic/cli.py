@@ -733,17 +733,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="未処理区間の穴埋めを無効にする（素通しフレームが残る）",
     )
-    t.add_argument(
-        "--cut-at",
-        help="トラックを区切るフレーム番号をカンマ区切りで指定（例: 100,250,900）。"
-        "指定フレームをまたいでトラックが生成されず、補間や橋渡しも区切られる",
-    )
 
     r = p.add_argument_group("描画・出力")
     r.add_argument("--block", type=int, default=0, help="モザイクのブロックサイズ px（0で自動）")
     r.add_argument("--mode", default="pixelize", choices=["pixelize", "black"])
     r.add_argument("--crf", type=int, default=16, help="x264 CRF。16〜18 が視覚的に無劣化")
     r.add_argument("--preset", default="slow", help="x264 preset")
+    r.add_argument(
+        "--mosaic-offset",
+        type=str,
+        default="0,0",
+        help="モザイク描画位置のオフセット (dx,dy)。元の位置も塗ったまま",
+    )
 
     m = p.add_argument_group("運用")
     m.add_argument("--detections", help="検出結果 JSON の保存先／再利用元")
@@ -808,12 +809,15 @@ def build_cfg(args) -> TemporalConfig:
     組み立てを2箇所に書くと、フィールドを1個足したときに片方だけ更新し
     忘れる経路ができる。
     """
-    cut_frames: set[int] = set()
-    if hasattr(args, 'cut_at') and args.cut_at:
+    # mosaic_offset をパース
+    mosaic_offset = (0.0, 0.0)
+    if hasattr(args, "mosaic_offset") and args.mosaic_offset:
         try:
-            cut_frames = {int(s.strip()) for s in args.cut_at.split(',')}
-        except ValueError:
-            pass  # 不正な値は無視（デフォルト空集合のまま）
+            parts = args.mosaic_offset.split(",")
+            if len(parts) == 2:
+                mosaic_offset = (float(parts[0]), float(parts[1]))
+        except (ValueError, IndexError):
+            pass  # デフォルト値を使用
 
     return TemporalConfig(
         max_gap=args.max_gap,
@@ -832,7 +836,7 @@ def build_cfg(args) -> TemporalConfig:
         hold_growth=args.hold_growth,
         motion_cap=args.motion_cap,
         estimated_factor=args.estimated_factor,
-        cut_frames=cut_frames,
+        mosaic_offset=mosaic_offset,
     )
 
 

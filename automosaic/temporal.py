@@ -143,7 +143,7 @@ class TemporalConfig:
     hold_cap: float = 48.0           # 不確かさ由来のマージンの上限 px
     bridge_max: int = 150      # 前後が覆われている未処理区間を埋める最大長（0で無効）
     frame_step: int = 1        # 検出を何フレームおきに行ったか（マージンとgapに反映）
-    cut_frames: set[int] = field(default_factory=set)  # トラックを区切るフレーム番号の集合
+    mosaic_offset: tuple[float, float] = (0.0, 0.0)  # (dx, dy) モザイク描画位置のオフセット。元の位置も塗ったまま
 
     @property
     def effective_max_gap(self) -> int:
@@ -237,12 +237,8 @@ def effective_settings(
     cfg: "TemporalConfig", classes, block: int, mode: str
 ) -> dict:
     """焼き込み/レビューが領域計算に使う実効設定をまとめる。"""
-    cfg_dict = dataclasses.asdict(cfg)
-    # cut_frames は set なので JSON シリアライズ時に list に変換する
-    if "cut_frames" in cfg_dict and isinstance(cfg_dict["cut_frames"], set):
-        cfg_dict["cut_frames"] = sorted(cfg_dict["cut_frames"])
     return {
-        "cfg": cfg_dict,
+        "cfg": dataclasses.asdict(cfg),
         "classes": sorted(classes),
         "block": int(block),
         "mode": str(mode),
@@ -390,11 +386,7 @@ def build_tracks(
         dets = per_frame.get(f, [])
 
         # 期限切れのトラックを active から外す
-        # 同時に、トラックが切れ目をまたぐ場合も除外する
-        active = [
-            (t, lf, lb) for (t, lf, lb) in active
-            if f - lf <= cfg.effective_max_gap and not any(lf < cut_f < f for cut_f in cfg.cut_frames)
-        ]
+        active = [(t, lf, lb) for (t, lf, lb) in active if f - lf <= cfg.effective_max_gap]
 
         matched_det: set[int] = set()
 
@@ -511,9 +503,6 @@ def stitch_tracks(
                     continue
                 gap = b.first - a.last
                 if gap <= 0 or gap > cfg.stitch_max_gap:
-                    continue
-                # 隔たりの中に切れ目がなければつなぐ
-                if any(a.last < cut_f < b.first for cut_f in cfg.cut_frames):
                     continue
 
                 box_a = a.obs[a.last][0]
@@ -670,9 +659,6 @@ def densify(
             gap = b - a
             if gap <= 1:
                 continue
-            # 観測間に切れ目がある場合は補間しない
-            if any(a < cut_f < b for cut_f in cfg.cut_frames):
-                continue
             box_a, score_a = t.obs[a]
             box_b, score_b = t.obs[b]
             va = _velocity_at(t, frames, i, look_back=True)
@@ -717,9 +703,6 @@ def densify(
             vx_short, vy_short = _velocity_at(t, frames, 0, look_back=False)
             vx_long, vy_long = _endpoint_velocity(t, frames, at_start=True)
             for f in range(max(0, frames[0] - mem_before), frames[0]):
-                # トラック開始フレームと f の間に切れ目がある場合はスキップ
-                if any(f < cut_f < frames[0] for cut_f in cfg.cut_frames):
-                    continue
                 d = frames[0] - f
                 envelope = _union_box(
                     [
@@ -744,9 +727,6 @@ def densify(
             vx_short, vy_short = _velocity_at(t, frames, len(frames) - 1, look_back=True)
             vx_long, vy_long = _endpoint_velocity(t, frames, at_start=False)
             for f in range(frames[-1] + 1, min(n_frames, frames[-1] + mem_after + 1)):
-                # トラック終了フレームと f の間に切れ目がある場合はスキップ
-                if any(frames[-1] < cut_f < f for cut_f in cfg.cut_frames):
-                    continue
                 d = f - frames[-1]
                 envelope = _union_box(
                     [
@@ -894,10 +874,6 @@ def _bridge_by_lineage(per_frame: dict[int, list[Region]], n_frames: int, cfg: T
             if cfg.bridge_max <= 0 or (end - start) > cfg.bridge_max:
                 continue
 
-            # 未処理区間がいずれかの切れ目をまたぐ場合は埋めない
-            if any(start <= cut_f < end for cut_f in cfg.cut_frames):
-                continue
-
             before = frames_map.get(start - 1, [])
             after = frames_map.get(end, [])
             if not before or not after:
@@ -956,11 +932,6 @@ def _bridge_globally(
             left_open.append((start, end))
             continue
         if cfg.bridge_max <= 0 or (end - start) > cfg.bridge_max:
-            left_open.append((start, end))
-            continue
-
-        # 未処理区間がいずれかの切れ目をまたぐ場合は埋めない
-        if any(start <= cut_f < end for cut_f in cfg.cut_frames):
             left_open.append((start, end))
             continue
 
@@ -1116,6 +1087,18 @@ def expand(
     return (nx, ny, nw, nh)
 
 
+def apply_offset(box: Box, offset: tuple[float, float], frame_w: int, frame_h: int) -> Box:
+    """矩形にオフセットを適用する。フレーム外に出ないようクランプ。"""
+    x, y, w, h = box
+    dx, dy = offset
+    ox = max(0.0, min(x + dx, frame_w - 1))
+    oy = max(0.0, min(y + dy, frame_h - 1))
+    # オフセ後ット後の矩形がフレーム外に出ないようにサイズを制限
+    ow = min(w, frame_w - ox)
+    oh = min(h, frame_h - oy)
+    return (ox, oy, ow, oh)
+
+
 def process(
     per_frame_dets: dict[int, list[Detection]],
     n_frames: int,
@@ -1152,9 +1135,17 @@ def process(
     median_speed = speed_values[len(speed_values) // 2] if speed_values else 0.0
 
     out: dict[int, list[tuple[Box, Region]]] = {}
+    has_offset = cfg.mosaic_offset != (0.0, 0.0)
     for f in range(n_frames):
         regions = dense.get(f, [])
-        out[f] = [(expand(r, frame_w, frame_h, cfg), r) for r in regions]
+        items = [(expand(r, frame_w, frame_h, cfg), r) for r in regions]
+        # オフセットが指定されていれば、オフセット版も追加
+        # 元の位置も塗ったまま（RULES 0: 塗り過ぎ側は許容）
+        if has_offset:
+            for box, r in items:
+                offset_box = apply_offset(box, cfg.mosaic_offset, frame_w, frame_h)
+                items.append((offset_box, r))
+        out[f] = items
 
     covered = sum(1 for f in range(n_frames) if out[f])
     detected_frames = sum(1 for f in range(n_frames) if filtered.get(f))
