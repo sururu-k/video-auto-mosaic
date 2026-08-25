@@ -2510,15 +2510,14 @@ def session_from_args(args, argv: list[str] | None = None) -> ReviewSession:
 
     classes = resolve_classes(args.classes)
 
-    # mosaic_offset をパース
+    # mosaic_offset をパース（cli.py の parse_mosaic_offset() を import して使う）
+    from . import cli as _cli
     mosaic_offset = (0.0, 0.0)
-    if hasattr(args, "mosaic_offset") and args.mosaic_offset:
+    if hasattr(args, "mosaic_offset"):
         try:
-            parts = args.mosaic_offset.split(",")
-            if len(parts) == 2:
-                mosaic_offset = (float(parts[0]), float(parts[1]))
-        except (ValueError, IndexError):
-            pass  # デフォルト値を使用
+            mosaic_offset = _cli.parse_mosaic_offset(args.mosaic_offset)
+        except ValueError as e:
+            raise SystemExit(str(e))
 
     cfg = TemporalConfig(
         max_gap=args.max_gap,

@@ -802,6 +802,22 @@ def explicit_options(argv: list[str] | None) -> set[str]:
     return {k for k, v in vars(parsed).items() if v is not None}
 
 
+def parse_mosaic_offset(offset_str: str | None) -> tuple[float, float]:
+    """mosaic_offset 文字列をパースして tuple に変換。
+
+    形式: "dx,dy" (例: "0,120")
+    """
+    if not offset_str or offset_str == "0,0":
+        return (0.0, 0.0)
+    parts = offset_str.split(",")
+    if len(parts) != 2:
+        raise ValueError(f"--mosaic-offset の形式が不正です。'dx,dy' 形式を指定してください: {offset_str}")
+    try:
+        return (float(parts[0]), float(parts[1]))
+    except ValueError as e:
+        raise ValueError(f"--mosaic-offset を解析できません。数値を指定してください: {offset_str}") from e
+
+
 def build_cfg(args) -> TemporalConfig:
     """絞り込み済みの args から TemporalConfig を組む。
 
@@ -811,13 +827,11 @@ def build_cfg(args) -> TemporalConfig:
     """
     # mosaic_offset をパース
     mosaic_offset = (0.0, 0.0)
-    if hasattr(args, "mosaic_offset") and args.mosaic_offset:
+    if hasattr(args, "mosaic_offset"):
         try:
-            parts = args.mosaic_offset.split(",")
-            if len(parts) == 2:
-                mosaic_offset = (float(parts[0]), float(parts[1]))
-        except (ValueError, IndexError):
-            pass  # デフォルト値を使用
+            mosaic_offset = parse_mosaic_offset(args.mosaic_offset)
+        except ValueError as e:
+            build_parser().error(str(e))
 
     return TemporalConfig(
         max_gap=args.max_gap,

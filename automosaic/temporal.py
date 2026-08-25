@@ -1142,9 +1142,7 @@ def process(
         # オフセットが指定されていれば、オフセット版も追加
         # 元の位置も塗ったまま（RULES 0: 塗り過ぎ側は許容）
         if has_offset:
-            for box, r in items:
-                offset_box = apply_offset(box, cfg.mosaic_offset, frame_w, frame_h)
-                items.append((offset_box, r))
+            items = items + [(apply_offset(box, cfg.mosaic_offset, frame_w, frame_h), r) for box, r in items]
         out[f] = items
 
     covered = sum(1 for f in range(n_frames) if out[f])
