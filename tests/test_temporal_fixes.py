@@ -709,6 +709,17 @@ def test_cut_frames_prevents_track_spanning():
     assert all(len(regions_no_cut.get(f, [])) > 0 for f in range(0, 21))
     assert all(len(regions_with_cut.get(f, [])) > 0 for f in range(0, 21))
 
+    # 観測のあるフレームの被覆だけを見ても、トラックが繋がったかは分からない。
+    # 隙間（21-29）が補間で埋まるかどうかで見る。gap は 10 で max_gap=12 より
+    # 小さいので、切れ目が無ければ同じトラックになって densify が埋める。
+    filled_no_cut = sum(1 for f in range(21, 30) if len(regions_no_cut.get(f, [])) > 0)
+    filled_with_cut = sum(1 for f in range(21, 30) if len(regions_with_cut.get(f, [])) > 0)
+    assert filled_no_cut == 9, f"切れ目なしなら隙間が埋まるはず: {filled_no_cut}/9"
+    assert filled_with_cut == 0, (
+        f"切れ目をまたいで補間されている: {filled_with_cut}/9"
+        "（build_tracks が切れ目を見ていない）"
+    )
+
     # どちらでも 30-50 は覆われている
     assert all(len(regions_no_cut.get(f, [])) > 0 for f in range(30, 51))
     assert all(len(regions_with_cut.get(f, [])) > 0 for f in range(30, 51))
