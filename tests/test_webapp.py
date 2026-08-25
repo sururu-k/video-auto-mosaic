@@ -207,6 +207,197 @@ def test_job_id_is_reserved_under_race():
     print("  同時に 50 件引いても一意 OK")
 
 
+def test_meta_save_retries_while_reader_temporarily_locks_file():
+    """Windows の読み手が meta.json を掴む短い間だけ待って保存する。"""
+    lib = jobs_mod.Library(make_lib())
+    job = lib.create("locked.mp4")
+    ready = threading.Event()
+    released = threading.Event()
+    first_permission_error = threading.Event()
+    reader_errors = []
+
+    def read_while_locked():
+        try:
+            if os.name == "nt":
+                # Python の通常の open() が使う共有モードは実装依存なので、
+                # Windows API で共有なしの読み取りハンドルを明示的に作る。
+                import ctypes
+
+                create_file = ctypes.windll.kernel32.CreateFileW
+                create_file.argtypes = [
+                    ctypes.c_wchar_p,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_void_p,
+                ]
+                create_file.restype = ctypes.c_void_p
+                close_handle = ctypes.windll.kernel32.CloseHandle
+                close_handle.argtypes = [ctypes.c_void_p]
+                close_handle.restype = ctypes.c_int
+                handle = create_file(
+                    job.path("meta.json"),
+                    0x80000000,  # GENERIC_READ
+                    0,           # 他の読み書き・削除を共有しない
+                    None,
+                    3,           # OPEN_EXISTING
+                    0x80,        # FILE_ATTRIBUTE_NORMAL
+                    None,
+                )
+                invalid = ctypes.c_void_p(-1).value
+                if handle in (None, invalid):
+                    raise ctypes.WinError()
+                try:
+                    ready.set()
+                    if not first_permission_error.wait(timeout=2):
+                        raise AssertionError("保存側の PermissionError を観測できない")
+                finally:
+                    close_handle(handle)
+            else:
+                # POSIX は開いた読み取りファイルの置き換えを許すため、読み手は
+                # 実在させたうえで下のラッパーが共有違反を再現する。
+                with open(job.path("meta.json"), encoding="utf-8"):
+                    ready.set()
+                    if not first_permission_error.wait(timeout=2):
+                        raise AssertionError("保存側の PermissionError を観測できない")
+        except BaseException as e:  # スレッド内の失敗も本体へ返す
+            reader_errors.append(e)
+            ready.set()
+        finally:
+            released.set()
+
+    original_replace = jobs_mod.os.replace
+    permission_errors = []
+
+    def observed_replace(src, dst):
+        if os.name != "nt" and not released.is_set():
+            e = PermissionError("simulated sharing violation")
+            permission_errors.append(e)
+            first_permission_error.set()
+            raise e
+        try:
+            return original_replace(src, dst)
+        except PermissionError as e:
+            permission_errors.append(e)
+            first_permission_error.set()
+            raise
+
+    jobs_mod.os.replace = observed_replace
+    thread = threading.Thread(target=read_while_locked)
+    thread.start()
+    try:
+        assert ready.wait(timeout=2), "読み取りロックを取得できない"
+        assert not reader_errors, reader_errors
+        job.meta["lock_retry_marker"] = "saved"
+        job.save()
+    finally:
+        jobs_mod.os.replace = original_replace
+        thread.join(timeout=2)
+
+    assert not thread.is_alive(), "読み取りスレッドが終了しない"
+    assert not reader_errors, reader_errors
+    assert permission_errors, "保存時の PermissionError を再現できていない"
+    assert lib.get(job.id).meta["lock_retry_marker"] == "saved"
+    print(f"  一時ロックを {len(permission_errors)} 回再試行して保存 OK")
+
+
+def test_meta_save_raises_after_permission_retry_is_exhausted():
+    """共有違反が解消しなければ、成功扱いにせず最後の例外を返す。"""
+    lib = jobs_mod.Library(make_lib())
+    job = lib.create("persistently-locked.mp4")
+    job.meta["must_not_reach_disk"] = True
+    original_replace = jobs_mod.os.replace
+    attempts = []
+
+    def always_locked(src, dst):
+        attempts.append((src, dst))
+        raise PermissionError("persistent sharing violation")
+
+    jobs_mod.os.replace = always_locked
+    try:
+        try:
+            job.save()
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("再試行上限後の PermissionError を握り潰した")
+    finally:
+        jobs_mod.os.replace = original_replace
+
+    assert len(attempts) == jobs_mod.META_REPLACE_ATTEMPTS
+    assert "must_not_reach_disk" not in lib.get(job.id).meta
+    leftovers = [
+        name for name in os.listdir(job.dir)
+        if name.startswith("meta.json.") and name.endswith(".tmp")
+    ]
+    assert not leftovers, f"失敗した保存の一時ファイルが残った: {leftovers}"
+    print(f"  {len(attempts)} 回で打ち切り・例外伝播・一時ファイル掃除 OK")
+
+
+def test_meta_save_cleans_temporary_file_when_json_write_fails():
+    """JSON を最後まで書けなくても、一意な一時ファイルを残さないこと。"""
+    lib = jobs_mod.Library(make_lib())
+    job = lib.create("invalid-json.mp4")
+    job.meta["not_json_serializable"] = object()
+
+    try:
+        job.save()
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("JSON にできない meta を保存できたことにした")
+
+    assert "not_json_serializable" not in lib.get(job.id).meta
+    leftovers = [
+        name for name in os.listdir(job.dir)
+        if name.startswith("meta.json.") and name.endswith(".tmp")
+    ]
+    assert not leftovers, f"書き込み失敗の一時ファイルが残った: {leftovers}"
+    print("  JSON 書き込み失敗でも元の meta を維持・一時ファイル掃除 OK")
+
+
+def test_parallel_meta_saves_use_distinct_temporary_files():
+    """同時保存が固定名の一時ファイルを奪い合わないこと。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    lib = jobs_mod.Library(make_lib())
+    first = lib.create("parallel.mp4")
+    second = lib.get(first.id)
+    first.meta["parallel_writer"] = "first"
+    second.meta["parallel_writer"] = "second"
+    barrier = threading.Barrier(2)
+    sources = []
+    sources_lock = threading.Lock()
+    original_replace_meta = jobs_mod._replace_meta_file
+
+    def replace_together(src, dst):
+        with sources_lock:
+            sources.append(src)
+        barrier.wait(timeout=2)
+        original_replace_meta(src, dst)
+
+    jobs_mod._replace_meta_file = replace_together
+    try:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futures = [ex.submit(first.save), ex.submit(second.save)]
+            for future in futures:
+                future.result(timeout=5)
+    finally:
+        jobs_mod._replace_meta_file = original_replace_meta
+
+    assert len(sources) == 2
+    assert len(set(sources)) == 2, f"同じ一時ファイルを共有した: {sources}"
+    assert lib.get(first.id).meta["parallel_writer"] in {"first", "second"}
+    leftovers = [
+        name for name in os.listdir(first.dir)
+        if name.startswith("meta.json.") and name.endswith(".tmp")
+    ]
+    assert not leftovers, f"並行保存の一時ファイルが残った: {leftovers}"
+    print("  並行する 2 保存が別々の一時ファイルを使用 OK")
+
+
 def test_library_rejects_bad_id():
     lib = jobs_mod.Library(make_lib())
     for bad in ("..", "../etc", "abc", "20260823-999999", ""):
