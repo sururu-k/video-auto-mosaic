@@ -237,8 +237,12 @@ def effective_settings(
     cfg: "TemporalConfig", classes, block: int, mode: str
 ) -> dict:
     """焼き込み/レビューが領域計算に使う実効設定をまとめる。"""
+    cfg_dict = dataclasses.asdict(cfg)
+    # cut_frames は set なので JSON シリアライズ時に list に変換する
+    if "cut_frames" in cfg_dict and isinstance(cfg_dict["cut_frames"], set):
+        cfg_dict["cut_frames"] = sorted(cfg_dict["cut_frames"])
     return {
-        "cfg": dataclasses.asdict(cfg),
+        "cfg": cfg_dict,
         "classes": sorted(classes),
         "block": int(block),
         "mode": str(mode),
