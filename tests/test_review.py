@@ -2799,6 +2799,48 @@ def test_recompute_cache_invalidates_when_cfg_mutated_in_place():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_recompute_cache_invalidates_when_per_frame_replaced():
+    """per_frame を差し替えたら、キャッシュを使い回さないこと。
+
+    per_frame は検出結果そのもので、これが変われば塗る場所が変わる。
+    以前は `id(self.per_frame)` で見ていたが、id は解放されたオブジェクトの
+    アドレスが再利用されると別のものに同じ値が付く。差し替えた検出結果が
+    たまたま同じアドレスに載ると、古い矩形を黙って使い回す
+    ―― 塗られるべき場所が塗られない向きの壊れ方になる（RULES 0）。
+    参照そのものを持って `is` で見ていれば、再利用も起きないし差し替えも
+    確実に分かる。
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        assert s._process_cache is not None
+
+        orig_process = review.process
+        calls = {"n": 0}
+
+        def counting_process(*a, **kw):
+            calls["n"] += 1
+            return orig_process(*a, **kw)
+
+        review.process = counting_process
+        try:
+            # 中身が同じでも別のオブジェクトなら計算し直すこと。
+            # 「中身が同じなら使い回してよい」は、中身を毎回すべて比べる
+            # ことになり（実素材の det.json は 20MB）キャッシュの意味が無い。
+            s.per_frame = dict(s.per_frame)
+            s.recompute()
+        finally:
+            review.process = orig_process
+
+        assert calls["n"] == 1, (
+            f"per_frame を差し替えたのに process() が {calls['n']} 回しか呼ばれなかった"
+            "（古いキャッシュを黙って使い回している）"
+        )
+        print("  per_frame の差し替えでキャッシュが正しく無効化される OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_recompute_cache_hit_regions_match_fresh_recompute():
     """キャッシュを使った recompute() の結果が、キャッシュを使わず律儀に
     計算し直した結果と全フレームで1つも食い違わないこと。
