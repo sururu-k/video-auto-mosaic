@@ -386,7 +386,12 @@ class JobRunner:
         self.job.meta["n_estimated_only_ranges"] = len(
             rep.get("estimated_only_ranges") or []
         )
-        self.job.meta["n_review_frames"] = len(rep.get("review_frames") or [])
+        # 旧名 review_frames で書かれた report.json（issue #87 の改名より前に
+        # 焼いたジョブ）も読む。読めないと黙って 0 が書かれる
+        flags = rep.get("weak_evidence_frames")
+        if flags is None:
+            flags = rep.get("review_frames")
+        self.job.meta["n_weak_evidence_frames"] = len(flags or [])
 
     # -- 送出用 -----------------------------------------------------------
     def snapshot(self, since: int = 0) -> dict:

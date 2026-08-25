@@ -26,6 +26,7 @@ from automosaic.temporal import (  # noqa: E402
     estimated_only_ranges,
     geometric_filter,
     process,
+    Region,
 )
 
 CLS = "FEMALE_GENITALIA_EXPOSED"
@@ -881,6 +882,54 @@ def test_cut_frames_empty_matches_original():
         )
 
     print("  空集合 cut_frames で元と完全一致 OK")
+
+def test_weak_evidence_frames_detects_weak_reasons():
+    """weak_evidence_frames が弱い根拠を検出すること。
+
+    推定領域 / 低信頼 / 面積の急変を検出し、いずれも無い場合は空リストを返す。
+    """
+    # フレーム0: 検出済み、高信頼（0.5）-> 根拠なし
+    r0_detected = Region(box=(10, 20, 100, 100), cls=CLS, source="detected", score=0.5)
+
+    # フレーム1: 推定領域あり -> 推定領域の理由が付く
+    r1_estimated = Region(box=(10, 20, 100, 100), cls=CLS, source="interpolated", score=0.5)
+
+    # フレーム2: 低信頼（0.2 < 0.30） -> 低信頼の理由が付く
+    r2_lowconf = Region(box=(10, 20, 100, 100), cls=CLS, source="detected", score=0.2)
+
+    # フレーム3,4: 面積が2倍以上に変わる -> 面積の急変の理由が付く
+    r3_area = Region(box=(10, 20, 100, 100), cls=CLS, source="detected", score=0.5)
+    r4_area = Region(box=(10, 20, 100, 100), cls=CLS, source="detected", score=0.5)
+
+    regions_per_frame = {
+        0: [((10, 20, 100, 100), r0_detected)],  # area = 10000
+        1: [((10, 20, 100, 100), r1_estimated)],  # area = 10000
+        2: [((10, 20, 100, 100), r2_lowconf)],   # area = 10000
+        3: [((10, 20, 100, 100), r3_area)],      # area = 10000
+        4: [((10, 20, 200, 200), r4_area)],      # area = 40000
+    }
+
+    flags = temporal.weak_evidence_frames(regions_per_frame, 5)
+
+    # フレーム0は根拠なし -> 記録されない
+    assert not any(f["frame"] == 0 for f in flags), "フレーム0は根拠がないので記録されないはず"
+
+    # フレーム1は推定領域 -> 記録される
+    f1 = next((f for f in flags if f["frame"] == 1), None)
+    assert f1 is not None, "フレーム1は記録されるはず"
+    assert any("推定領域" in r for r in f1["reasons"]), "フレーム1に推定領域の理由が付くはず"
+
+    # フレーム2は低信頼 -> 記録される
+    f2 = next((f for f in flags if f["frame"] == 2), None)
+    assert f2 is not None, "フレーム2は記録されるはず"
+    assert any("低信頼" in r for r in f2["reasons"]), "フレーム2に低信頼の理由が付くはず"
+
+    # フレーム4は面積の急変 -> 記録される
+    f4 = next((f for f in flags if f["frame"] == 4), None)
+    assert f4 is not None, "フレーム4は記録されるはず"
+    assert any("面積の急変" in r for r in f4["reasons"]), "フレーム4に面積の急変の理由が付くはず"
+
+    print("  weak_evidence_frames が弱い根拠を検出する OK")
 
 
 if __name__ == "__main__":
