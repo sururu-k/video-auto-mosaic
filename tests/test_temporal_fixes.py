@@ -683,6 +683,195 @@ def test_module_docstring_matches_implementation():
     print("  冒頭 docstring と実装順の一致 OK")
 
 
+def test_cut_frames_prevents_track_spanning():
+    """切れ目を指定したときにトラックが切れ目をまたがないこと（issue #92）。
+
+    フレーム 0-20 に検出1、フレーム 30-50 に検出2 を配置し、同じクラス・位置。
+    通常は max_gap=12 を超えるので分断されるが、もし gap が小さければ繋がる。
+    フレーム 25 に切れ目を指定すれば、0-20 と 30-50 は絶対に繋がらない。
+    """
+    dets: dict[int, list[Detection]] = {f: [] for f in range(60)}
+    box = (100, 100, 50, 50)
+    for f in range(0, 21):
+        dets[f] = [Detection(CLS, 0.9, box)]
+    for f in range(30, 51):
+        dets[f] = [Detection(CLS, 0.9, box)]
+
+    cfg_no_cut = TemporalConfig(max_gap=12, memory=0, memory_before=0, bridge_max=0, stitch_max_gap=0)
+    cfg_with_cut = TemporalConfig(
+        max_gap=12, memory=0, memory_before=0, bridge_max=0, stitch_max_gap=0, cut_frames={25}
+    )
+
+    regions_no_cut, _ = process(dets, 60, W, H, {CLS}, cfg_no_cut)
+    regions_with_cut, _ = process(dets, 60, W, H, {CLS}, cfg_with_cut)
+
+    # どちらでも 0-20 は覆われている（観測がある）
+    assert all(len(regions_no_cut.get(f, [])) > 0 for f in range(0, 21))
+    assert all(len(regions_with_cut.get(f, [])) > 0 for f in range(0, 21))
+
+    # どちらでも 30-50 は覆われている
+    assert all(len(regions_no_cut.get(f, [])) > 0 for f in range(30, 51))
+    assert all(len(regions_with_cut.get(f, [])) > 0 for f in range(30, 51))
+
+    # 21-29 は観測がない。通常（no_cut）では補間や橋渡しで埋まるかもしれない。
+    # with_cut では切れ目があるので、21-29 は埋まらない。
+    covered_no_cut = sum(1 for f in range(21, 30) if len(regions_no_cut.get(f, [])) > 0)
+    covered_with_cut = sum(1 for f in range(21, 30) if len(regions_with_cut.get(f, [])) > 0)
+
+    assert covered_with_cut == 0, (
+        f"切れ目を指定しても区間 21-29 が {covered_with_cut} フレーム埋まっている"
+    )
+    print(f"  切れ目がトラック生成を区切る OK （no_cut: 21-29 で {covered_no_cut} フレーム、with_cut: 0 フレーム）")
+
+
+def test_cut_frames_prevents_stitching():
+    """切れ目を指定したときに stitch_tracks が切れ目をまたぐ結合をしないこと。
+
+    フレーム 10-15 にトラック1、フレーム 25-30 にトラック2 を配置。
+    同じクラス・位置で、gap=10 は stitch_max_gap=20 以内なので、通常は結合される。
+    フレーム 20 に切れ目を指定すれば、2つのトラックは結合されない。
+    """
+    dets: dict[int, list[Detection]] = {f: [] for f in range(40)}
+    box = (100, 100, 50, 50)
+    for f in [10, 11, 12, 13, 14, 15]:
+        dets[f] = [Detection(CLS, 0.9, box)]
+    for f in [25, 26, 27, 28, 29, 30]:
+        dets[f] = [Detection(CLS, 0.9, box)]
+
+    cfg_no_cut = TemporalConfig(
+        max_gap=1, memory=0, memory_before=0, bridge_max=0, stitch_max_gap=20
+    )
+    cfg_with_cut = TemporalConfig(
+        max_gap=1, memory=0, memory_before=0, bridge_max=0, stitch_max_gap=20, cut_frames={20}
+    )
+
+    regions_no_cut, stats_no_cut = process(dets, 40, W, H, {CLS}, cfg_no_cut)
+    regions_with_cut, stats_with_cut = process(dets, 40, W, H, {CLS}, cfg_with_cut)
+
+    # no_cut では 2 つのトラックが結合される可能性がある
+    # with_cut では結合されない
+    assert stats_with_cut["tracks_stitched"] == 0, (
+        f"切れ目を指定しても {stats_with_cut['tracks_stitched']} トラックが結合されている"
+    )
+    print(f"  切れ目が結合を防止する OK （no_cut: {stats_no_cut['tracks_stitched']} stitched, with_cut: 0）")
+
+
+def test_cut_frames_prevents_interpolation():
+    """切れ目を指定したときに densify が切れ目をまたいで補間しないこと。
+
+    フレーム 10 と 30 に検出を配置。gap=20 で補間される。
+    フレーム 20 に切れ目を指定すれば、11-29 は補間されず、観測がない区間は素通しになる。
+    """
+    dets: dict[int, list[Detection]] = {f: [] for f in range(40)}
+    box = (100, 100, 50, 50)
+    dets[10] = [Detection(CLS, 0.9, box)]
+    dets[30] = [Detection(CLS, 0.9, box)]
+
+    cfg_no_cut = TemporalConfig(
+        max_gap=25, memory=0, memory_before=0, bridge_max=0, stitch_max_gap=0
+    )
+    cfg_with_cut = TemporalConfig(
+        max_gap=25, memory=0, memory_before=0, bridge_max=0, stitch_max_gap=0, cut_frames={20}
+    )
+
+    regions_no_cut, stats_no_cut = process(dets, 40, W, H, {CLS}, cfg_no_cut)
+    regions_with_cut, stats_with_cut = process(dets, 40, W, H, {CLS}, cfg_with_cut)
+
+    # フレーム 11-19 (切れ目前) と 21-29 (切れ目後) の補間
+    interp_before_cut = sum(1 for f in range(11, 20) if len(regions_with_cut.get(f, [])) > 0)
+    interp_after_cut = sum(1 for f in range(21, 30) if len(regions_with_cut.get(f, [])) > 0)
+
+    # フレーム 10 から切れ目 20 までは補間可能だが、切れ目で止まるはず
+    assert interp_before_cut == 0, (
+        f"切れ目を指定しても 11-19 が {interp_before_cut} フレーム補間されている"
+    )
+    assert interp_after_cut == 0, (
+        f"切れ目を指定しても 21-29 が {interp_after_cut} フレーム補間されている"
+    )
+    print(f"  切れ目が補間を防止する OK （no_cut: {stats_no_cut['regions_interpolated']} interpolated, with_cut: 0）")
+
+
+def test_cut_frames_prevents_bridging():
+    """切れ目を指定したときに bridge_uncovered が切れ目をまたいで埋めないこと。
+
+    フレーム 0-10 に検出、フレーム 40-50 に検出を配置。
+    通常は 11-39 が前後の根拠で橋渡しされる（bridge_max=40）。
+    フレーム 25 に切れ目を指定すれば、11-24 と 26-39 に分かれ、
+    各区間は bridge_max=40 を超えないが、切れ目をまたがないので埋まらない。
+    """
+    dets: dict[int, list[Detection]] = {f: [] for f in range(60)}
+    box = (100, 100, 50, 50)
+    for f in range(0, 11):
+        dets[f] = [Detection(CLS, 0.9, box)]
+    for f in range(40, 51):
+        dets[f] = [Detection(CLS, 0.9, box)]
+
+    cfg_no_cut = TemporalConfig(
+        max_gap=1, memory=0, memory_before=0, bridge_max=40, stitch_max_gap=0
+    )
+    cfg_with_cut = TemporalConfig(
+        max_gap=1, memory=0, memory_before=0, bridge_max=40, stitch_max_gap=0, cut_frames={25}
+    )
+
+    regions_no_cut, stats_no_cut = process(dets, 60, W, H, {CLS}, cfg_no_cut)
+    regions_with_cut, stats_with_cut = process(dets, 60, W, H, {CLS}, cfg_with_cut)
+
+    # 11-39 の中間区間の被覆
+    bridged_with_cut = sum(1 for f in range(11, 40) if len(regions_with_cut.get(f, [])) > 0)
+
+    # 切れ目前 (11-24) と 切れ目後 (26-39) に分かれるので、どちらも bridge_max 内だが
+    # 切れ目をまたがないので埋まらない
+    assert bridged_with_cut == 0, (
+        f"切れ目を指定しても 11-39 が {bridged_with_cut} フレーム橋渡しされている"
+    )
+    print(f"  切れ目が橋渡しを防止する OK （no_cut: {stats_no_cut['frames_bridged']} bridged, with_cut: 0）")
+
+
+def test_cut_frames_empty_matches_original():
+    """空集合の cut_frames を指定したときに、指定なしのときと同じ結果になること。
+
+    これが最も重要なテスト。修正前後で被覆が変わってはいけない。
+    """
+    # 複雑な検出パターンを生成（トラック複数、結合、補間、橋渡しが全部起こる設定）
+    dets: dict[int, list[Detection]] = {f: [] for f in range(100)}
+    box1 = (50, 50, 60, 60)
+    box2 = (300, 300, 80, 80)
+
+    # トラック1: 0-15（観測）-> 20-30（gap）-> 35-50（観測、結合の対象）
+    for f in range(0, 16):
+        dets[f].append(Detection(CLS, 0.9, box1))
+    for f in range(35, 51):
+        dets[f].append(Detection(CLS, 0.9, box1))
+
+    # トラック2: 60-70（観測）-> gap -> 80-90（観測）
+    for f in range(60, 71):
+        dets[f].append(Detection(CLS, 0.9, box2))
+    for f in range(80, 91):
+        dets[f].append(Detection(CLS, 0.9, box2))
+
+    cfg_original = TemporalConfig()
+    cfg_with_empty_cut = TemporalConfig(cut_frames=set())
+
+    regions_orig, stats_orig = process(dets, 100, W, H, {CLS}, cfg_original)
+    regions_empty, stats_empty = process(dets, 100, W, H, {CLS}, cfg_with_empty_cut)
+
+    # 全フレームの被覆が完全に一致すること
+    for f in range(100):
+        orig_boxes = sorted([b for b, _ in regions_orig.get(f, [])])
+        empty_boxes = sorted([b for b, _ in regions_empty.get(f, [])])
+        assert orig_boxes == empty_boxes, (
+            f"フレーム {f}: 被覆が異なる (original={len(orig_boxes)}, empty={len(empty_boxes)})"
+        )
+
+    # 統計が完全に一致すること
+    for key in ["frames_with_mosaic", "regions_interpolated", "regions_from_memory", "frames_bridged"]:
+        assert stats_orig[key] == stats_empty[key], (
+            f"統計 {key} が異なる (original={stats_orig[key]}, empty={stats_empty[key]})"
+        )
+
+    print("  空集合 cut_frames で元と完全一致 OK")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"{len(tests)} 件のテストを実行\n")

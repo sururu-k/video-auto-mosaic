@@ -143,6 +143,7 @@ class TemporalConfig:
     hold_cap: float = 48.0           # 不確かさ由来のマージンの上限 px
     bridge_max: int = 150      # 前後が覆われている未処理区間を埋める最大長（0で無効）
     frame_step: int = 1        # 検出を何フレームおきに行ったか（マージンとgapに反映）
+    cut_frames: set[int] = field(default_factory=set)  # トラックを区切るフレーム番号の集合
 
     @property
     def effective_max_gap(self) -> int:
@@ -385,7 +386,11 @@ def build_tracks(
         dets = per_frame.get(f, [])
 
         # 期限切れのトラックを active から外す
-        active = [(t, lf, lb) for (t, lf, lb) in active if f - lf <= cfg.effective_max_gap]
+        # 同時に、トラックが切れ目をまたぐ場合も除外する
+        active = [
+            (t, lf, lb) for (t, lf, lb) in active
+            if f - lf <= cfg.effective_max_gap and not any(lf < cut_f < f for cut_f in cfg.cut_frames)
+        ]
 
         matched_det: set[int] = set()
 
@@ -502,6 +507,9 @@ def stitch_tracks(
                     continue
                 gap = b.first - a.last
                 if gap <= 0 or gap > cfg.stitch_max_gap:
+                    continue
+                # 隔たりの中に切れ目がなければつなぐ
+                if any(a.last < cut_f < b.first for cut_f in cfg.cut_frames):
                     continue
 
                 box_a = a.obs[a.last][0]
@@ -658,6 +666,9 @@ def densify(
             gap = b - a
             if gap <= 1:
                 continue
+            # 観測間に切れ目がある場合は補間しない
+            if any(a < cut_f < b for cut_f in cfg.cut_frames):
+                continue
             box_a, score_a = t.obs[a]
             box_b, score_b = t.obs[b]
             va = _velocity_at(t, frames, i, look_back=True)
@@ -702,6 +713,9 @@ def densify(
             vx_short, vy_short = _velocity_at(t, frames, 0, look_back=False)
             vx_long, vy_long = _endpoint_velocity(t, frames, at_start=True)
             for f in range(max(0, frames[0] - mem_before), frames[0]):
+                # トラック開始フレームと f の間に切れ目がある場合はスキップ
+                if any(f < cut_f < frames[0] for cut_f in cfg.cut_frames):
+                    continue
                 d = frames[0] - f
                 envelope = _union_box(
                     [
@@ -726,6 +740,9 @@ def densify(
             vx_short, vy_short = _velocity_at(t, frames, len(frames) - 1, look_back=True)
             vx_long, vy_long = _endpoint_velocity(t, frames, at_start=False)
             for f in range(frames[-1] + 1, min(n_frames, frames[-1] + mem_after + 1)):
+                # トラック終了フレームと f の間に切れ目がある場合はスキップ
+                if any(frames[-1] < cut_f < f for cut_f in cfg.cut_frames):
+                    continue
                 d = f - frames[-1]
                 envelope = _union_box(
                     [
@@ -873,6 +890,10 @@ def _bridge_by_lineage(per_frame: dict[int, list[Region]], n_frames: int, cfg: T
             if cfg.bridge_max <= 0 or (end - start) > cfg.bridge_max:
                 continue
 
+            # 未処理区間がいずれかの切れ目をまたぐ場合は埋めない
+            if any(start <= cut_f < end for cut_f in cfg.cut_frames):
+                continue
+
             before = frames_map.get(start - 1, [])
             after = frames_map.get(end, [])
             if not before or not after:
@@ -931,6 +952,11 @@ def _bridge_globally(
             left_open.append((start, end))
             continue
         if cfg.bridge_max <= 0 or (end - start) > cfg.bridge_max:
+            left_open.append((start, end))
+            continue
+
+        # 未処理区間がいずれかの切れ目をまたぐ場合は埋めない
+        if any(start <= cut_f < end for cut_f in cfg.cut_frames):
             left_open.append((start, end))
             continue
 
