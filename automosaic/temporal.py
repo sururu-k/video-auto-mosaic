@@ -1412,7 +1412,7 @@ def _merge_ranges(
     return out
 
 
-def review_flags(
+def weak_evidence_frames(
     regions_per_frame: dict[int, list[tuple[Box, Region]]],
     n_frames: int,
 ) -> list[dict]:

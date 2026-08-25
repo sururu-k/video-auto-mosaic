@@ -901,7 +901,7 @@ def _sample_range(start: int, end: int, step: int, max_items: int | None = None)
 def anomaly_frames(regions: dict, n_frames: int) -> tuple[list[int], list[int]]:
     """面積が急変したフレームと、低信頼のフレーム。
 
-    temporal.review_flags と同じ基準。あちらは全区間の一覧を作る用途で、
+    temporal.weak_evidence_frames と同じ基準。あちらは全区間の一覧を作る用途で、
     こちらはキューに載せる候補が要るだけなのでフレーム番号だけ返す。
     """
     area_jump: list[int] = []

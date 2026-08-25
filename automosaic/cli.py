@@ -36,7 +36,7 @@ from .temporal import (
     narrow_without_estimate_gaps,
     process,
     resolve_classes,
-    review_flags,
+    weak_evidence_frames,
     uncovered_ranges,
 )
 from . import video as vid
@@ -1366,7 +1366,7 @@ def main(argv: list[str] | None = None) -> int:
         if len(est_only) > 15:
             print(f"  ... 他 {len(est_only) - 15} 件")
 
-    flags = review_flags(regions, n_frames)
+    flags = weak_evidence_frames(regions, n_frames)
     if args.report:
         with open(args.report, "w", encoding="utf-8") as f:
             json.dump(
@@ -1404,7 +1404,7 @@ def main(argv: list[str] | None = None) -> int:
                         }
                         for s_, e_, cls, sc in despiked_ranges
                     ],
-                    "review_frames": flags,
+                    "weak_evidence_frames": flags,
                     "effective": effective,
                     "effective_sha256": effective_sha256,
                 },
