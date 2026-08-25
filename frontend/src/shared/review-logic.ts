@@ -341,3 +341,43 @@ export function intervalStatus(
     : `始点は frame ${start.frame}。終点のコマへ移動してタップし、O で確定（Esc でやめる）`;
   return { active: true, onStartFrame, banner, confirmDisabled: !endTapPlaced };
 }
+
+export interface DragIntervalResult {
+  /** I を押したのと同じ形（frame だけ）。ドラッグが区間選択にならない
+   * ケースでは null（＝ただのスクラブとして previewFrame だけ動かす） */
+  intervalStart: IntervalStart | null;
+  /** ドラッグの終点。previewFrame をここへ合わせる */
+  previewFrame: number;
+}
+
+/**
+ * トラック上のドラッグ（issue #84）を、キーボード I/O と同じ区間状態にする。
+ *
+ * **新しい「選択範囲」という状態は作らない。** I が作るのと同じ
+ * `IntervalStart`（frame だけを持つ）を返し、画面側（review.tsx）はこれを
+ * そのまま `intervalStart` state へ積む。ドラッグで選んだ区間と I/O で
+ * 選んだ区間が同じ変数を指すことで、「2つの別々の状態を持たない」を守る。
+ *
+ * box の位置（tap）はトラック（時間軸だけの1次元）からは分からない。
+ * I が「タップ済みの位置を、いま居るフレームの始点にする」操作である
+ * のに合わせ、ドラッグも「タップ済みでなければ区間にしない」を守る
+ * （タップが無いまま区間を作ると、確定時にどの位置を塗るのか誰も
+ * 決めていないことになる）。タップが無ければ、ドラッグはただの
+ * スクラブ（終点へ移動するだけ）として扱う。
+ *
+ * 始点と終点が同じフレームなら「ドラッグ」ではなく「クリック」なので、
+ * 区間にはしない（クリック1回で区間の始点が生まれると、時間移動のつもり
+ * が区間操作に化ける事故になる）。
+ */
+export function dragToInterval(
+  startFrame: number,
+  endFrame: number,
+  markMode: MarkMode | null,
+  hasTap: boolean,
+): DragIntervalResult {
+  const isDrag = startFrame !== endFrame;
+  if (isDrag && markMode === "add" && hasTap) {
+    return { intervalStart: { frame: startFrame }, previewFrame: endFrame };
+  }
+  return { intervalStart: null, previewFrame: endFrame };
+}

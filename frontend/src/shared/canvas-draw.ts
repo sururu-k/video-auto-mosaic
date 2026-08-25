@@ -254,43 +254,185 @@ export function drawHandOverlay(
 // ----------------------------------------------------------------------
 
 /**
- * 各画素（0..width-1）が、未塗装のフレーム標本を1つでも含むかを判定する。
+ * 各画素（0..width-1）が、[rangeStart, rangeEnd) のフレーム標本を1つでも
+ * 含むかを判定する。
  *
  * 「1画素の中に未塗装が1フレームでもあれば、その画素は未塗装ありに倒す」
  * （RULES.md 0）を素直に実装したもの。frames は昇順でなくてよい
- * （ここでソートする）。
+ * （ここでソートする）。`uncoveredPixelMask` はこれの [0, nFrames) 版。
+ *
+ * 拡大縮小（issue #84）で表示範囲が [0, nFrames) でなくなっても、この
+ * 判定式そのものは変わらない――px を画素の外側から数えるか、
+ * rangeStart だけ範囲をずらして数えるかの違いでしかない。全体表示
+ * （fullViewport）で通す既存のテストが rangeStart=0 の特殊形として
+ * そのまま効き続けることを、ここで一体化して保証する。
  */
-export function uncoveredPixelMask(
+export function pixelSampleMaskInRange(
   frames: readonly number[],
   width: number,
-  nFrames: number,
+  rangeStart: number,
+  rangeEnd: number,
 ): boolean[] {
   const mask = new Array<boolean>(Math.max(0, width)).fill(false);
-  if (width <= 0 || nFrames <= 0) return mask;
-  const sorted = [...frames].filter((f) => f >= 0 && f < nFrames).sort((a, b) => a - b);
+  const n = rangeEnd - rangeStart;
+  if (width <= 0 || n <= 0) return mask;
+  const sorted = [...frames]
+    .filter((f) => f >= rangeStart && f < rangeEnd)
+    .sort((a, b) => a - b);
   let i = 0;
   for (let px = 0; px < width; px++) {
-    const a = Math.floor((px * nFrames) / width);
-    const b = Math.max(a + 1, Math.floor(((px + 1) * nFrames) / width));
+    const aRel = Math.floor((px * n) / width);
+    const bRel = Math.max(aRel + 1, Math.floor(((px + 1) * n) / width));
+    const a = rangeStart + aRel;
+    const b = rangeStart + bRel;
     while (i < sorted.length && sorted[i]! < a) i++;
     mask[px] = i < sorted.length && sorted[i]! < b;
   }
   return mask;
 }
 
+/** `pixelSampleMaskInRange` の [0, nFrames) 版（既存呼び出し元向け） */
+export function uncoveredPixelMask(
+  frames: readonly number[],
+  width: number,
+  nFrames: number,
+): boolean[] {
+  return pixelSampleMaskInRange(frames, width, 0, nFrames);
+}
+
+/** 再生ヘッドが立つ画素。範囲外の cur は [rangeStart, rangeEnd) の端に寄せる（消さない） */
+export function playheadPixelInRange(
+  cur: number,
+  width: number,
+  rangeStart: number,
+  rangeEnd: number,
+): number {
+  if (width <= 0) return 0;
+  const n = rangeEnd - rangeStart;
+  if (n <= 0) return 0;
+  const c = Math.min(Math.max(cur, rangeStart), rangeEnd - 1);
+  return Math.min(width - 1, Math.max(0, Math.floor(((c - rangeStart) * width) / n)));
+}
+
 /** 再生ヘッドが立つ画素。範囲外の cur は端に寄せる（画面から消さない） */
 export function playheadPixel(cur: number, width: number, nFrames: number): number {
-  if (width <= 0) return 0;
-  if (nFrames <= 0) return 0;
-  const c = Math.min(Math.max(cur, 0), nFrames - 1);
-  return Math.min(width - 1, Math.max(0, Math.floor((c * width) / nFrames)));
+  return playheadPixelInRange(cur, width, 0, nFrames);
+}
+
+/** トラック上の x 座標（画素）を [rangeStart, rangeEnd) の中のフレーム番号にする */
+export function frameFromTrackXInRange(
+  x: number,
+  width: number,
+  rangeStart: number,
+  rangeEnd: number,
+): number {
+  const n = rangeEnd - rangeStart;
+  if (width <= 0 || n <= 0) return rangeStart;
+  const f = rangeStart + Math.floor((x / width) * n);
+  return Math.min(rangeEnd - 1, Math.max(rangeStart, f));
 }
 
 /** トラック上の x 座標（画素）をフレーム番号にする。クリックでの時間移動に使う */
 export function frameFromTrackX(x: number, width: number, nFrames: number): number {
-  if (width <= 0 || nFrames <= 0) return 0;
-  const f = Math.floor((x / width) * nFrames);
-  return Math.min(nFrames - 1, Math.max(0, f));
+  return frameFromTrackXInRange(x, width, 0, nFrames);
+}
+
+// ----------------------------------------------------------------------
+// 拡大縮小（issue #84）。
+//
+// トラックが表示しているフレーム範囲を Viewport（[start, end)）として持つ。
+// 「拡大する」は Viewport を狭めること、「縮小する」は広げること、
+// 「全体表示」は [0, nFrames) に戻すこと。
+//
+// 再生ヘッドが Viewport の外に出たら追従させる（followPlayhead）。
+// ズーム操作自体も再生ヘッドを中心に据える（zoomViewport）ので、
+// 「拡大したまま移動したら追従する」「拡大縮小しても再生ヘッドが
+// 画面から消えない」の両方をこの2関数だけで満たす。
+// ----------------------------------------------------------------------
+
+export interface Viewport {
+  /** 表示しているフレーム範囲の先頭（含む） */
+  start: number;
+  /** 表示しているフレーム範囲の末尾（含まない） */
+  end: number;
+}
+
+/** 全体表示のビューポート。ズームの初期値・「0」キーでの復帰先 */
+export function fullViewport(nFrames: number): Viewport {
+  return { start: 0, end: Math.max(0, nFrames) };
+}
+
+/** ビューポートの長さ len を保ったまま、start を [0, nFrames-len] にクランプする */
+export function clampViewportStart(start: number, len: number, nFrames: number): number {
+  const maxStart = Math.max(0, nFrames - len);
+  return Math.min(maxStart, Math.max(0, start));
+}
+
+/**
+ * ズーム後のビューポートの長さ（フレーム数）。factor<1 で拡大（狭くなる）、
+ * factor>1 で縮小（広くなる）。1フレーム未満にも nFrames 超にもしない
+ * （0にすると全画素が「範囲外」になり、画面から何もかも消える）。
+ */
+export function zoomLen(curLen: number, factor: number, nFrames: number): number {
+  if (nFrames <= 0) return 0;
+  const len = Math.round(curLen * factor);
+  return Math.min(nFrames, Math.max(1, len));
+}
+
+/**
+ * 中心を cur（再生ヘッド）に据えてズームする。
+ *
+ * 相対位置を保つ（カーソル位置を固定してズームする）実装もあるが、
+ * ここでは常に「再生ヘッドが画面の中心に来る」に倒す。理由は
+ * RULES.md 0「再生ヘッドが常に見えること」を最も壊れにくい形で満たす
+ * ため――相対位置保持だと、画面の端に近い位置で連続してズームしたとき
+ * 再生ヘッドが画面外に押し出される組み合わせが作れる。中心固定なら
+ * クランプが効く限り必ず画面内に残る。
+ */
+export function zoomViewport(vp: Viewport, factor: number, cur: number, nFrames: number): Viewport {
+  const curLen = vp.end - vp.start;
+  const len = zoomLen(curLen, factor, nFrames);
+  const start = clampViewportStart(cur - Math.floor(len / 2), len, nFrames);
+  return { start, end: start + len };
+}
+
+/**
+ * 再生ヘッドがビューポートの外に出たら、ビューポートを動かして追従させる。
+ * 中に居るなら動かさない（動くたびに視点まで動くと、拡大しているときほど
+ * 酔う。じっとしていられる範囲はじっとさせる）。
+ */
+export function followPlayhead(vp: Viewport, cur: number, nFrames: number): Viewport {
+  const len = vp.end - vp.start;
+  if (len <= 0) return vp;
+  if (cur >= vp.start && cur < vp.end) return vp;
+  const start = clampViewportStart(cur - Math.floor(len / 2), len, nFrames);
+  return { start, end: start + len };
+}
+
+/**
+ * フレーム範囲 [a, b]（順不同）を、[viewStart, viewEnd) の中でのピクセル
+ * 範囲 [px0, px1) にする。完全に画面外なら null。1フレームぶんの範囲でも
+ * 必ず1px以上を返す（frameFromTrackXInRange 系と同じ「短い区間でも消えない」
+ * 前提をここでも保つ）。手修正の帯・I/O区間の帯・ミニマップの現在地枠、
+ * いずれもこれ1つで描く。
+ */
+export function frameRangeToPixels(
+  a: number,
+  b: number,
+  width: number,
+  viewStart: number,
+  viewEnd: number,
+): [number, number] | null {
+  if (width <= 0 || viewEnd <= viewStart) return null;
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+  if (hi < viewStart || lo >= viewEnd) return null;
+  const clo = Math.max(lo, viewStart);
+  const chi = Math.min(hi, viewEnd - 1);
+  const n = viewEnd - viewStart;
+  const px0 = Math.floor(((clo - viewStart) * width) / n);
+  const px1 = Math.max(px0 + 1, Math.floor(((chi - viewStart + 1) * width) / n));
+  return [Math.max(0, px0), Math.min(width, px1)];
 }
 
 export interface QueueTrackOptions {
@@ -301,10 +443,68 @@ export interface QueueTrackOptions {
   uncoveredFrames: readonly number[];
   /** いま見ているフレーム（プレビュー中はプレビュー先） */
   cur: number;
+  /** 表示するフレーム範囲。省略時は全体（[0, nFrames)、これまでどおり） */
+  viewStart?: number;
+  viewEnd?: number;
+  /** 手修正（src="x"）のあるフレーム。省略時は描かない */
+  correctionFrames?: readonly number[];
+  /** I/O で置いている区間（issue #46）。終点未確定なら end は null */
+  interval?: { start: number; end: number | null } | null;
 }
 
 /** 検査キュー画面のトラック。緑=このキューでは未塗装が見えていない 赤=未塗装の標本あり */
 export function drawQueueTrack(ctx: CanvasRenderingContext2D, o: QueueTrackOptions): void {
+  const { width: w, height: h, nFrames: n } = o;
+  ctx.fillStyle = "#101216";
+  ctx.fillRect(0, 0, w, h);
+  if (w <= 0 || n <= 0) return;
+  const start = o.viewStart ?? 0;
+  const end = o.viewEnd ?? n;
+  if (end <= start) return;
+
+  const mask = pixelSampleMaskInRange(o.uncoveredFrames, w, start, end);
+  for (let px = 0; px < w; px++) {
+    ctx.fillStyle = mask[px] ? "#d0453e" : "#3ba55d";
+    ctx.fillRect(px, 0, 1, h);
+  }
+
+  if (o.correctionFrames?.length) {
+    const cmask = pixelSampleMaskInRange(o.correctionFrames, w, start, end);
+    ctx.fillStyle = "#5ad1a0";
+    for (let px = 0; px < w; px++) {
+      if (cmask[px]) ctx.fillRect(px, Math.max(0, h - 6), 1, Math.min(6, h));
+    }
+  }
+
+  if (o.interval) {
+    const rng = frameRangeToPixels(o.interval.start, o.interval.end ?? o.interval.start, w, start, end);
+    if (rng) {
+      ctx.fillStyle = "rgba(90, 209, 160, .35)";
+      ctx.fillRect(rng[0], 0, rng[1] - rng[0], h);
+    }
+  }
+
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(playheadPixelInRange(o.cur, w, start, end), 0, 2, h);
+}
+
+export interface OverviewTrackOptions {
+  width: number;
+  height: number;
+  nFrames: number;
+  uncoveredFrames: readonly number[];
+  cur: number;
+  /** いま main トラックが表示している範囲。ここを枠で示す */
+  viewStart: number;
+  viewEnd: number;
+}
+
+/**
+ * 全体のどこを見ているかを示すミニマップ（issue #84）。常に [0, nFrames)
+ * 全体を描き、その上に現在のビューポートを白枠で重ねる。main トラックが
+ * どれだけ拡大されていても、ここだけは常に全体を映す。
+ */
+export function drawOverviewTrack(ctx: CanvasRenderingContext2D, o: OverviewTrackOptions): void {
   const { width: w, height: h, nFrames: n } = o;
   ctx.fillStyle = "#101216";
   ctx.fillRect(0, 0, w, h);
@@ -316,6 +516,14 @@ export function drawQueueTrack(ctx: CanvasRenderingContext2D, o: QueueTrackOptio
     ctx.fillRect(px, 0, 1, h);
   }
 
+  const rng = frameRangeToPixels(o.viewStart, o.viewEnd - 1, w, 0, n);
+  if (rng) {
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1;
+    const rw = Math.max(1, rng[1] - rng[0] - 1);
+    ctx.strokeRect(rng[0] + 0.5, 0.5, rw, Math.max(1, h - 1));
+  }
+
   ctx.fillStyle = "#ffffff";
-  ctx.fillRect(playheadPixel(o.cur, w, n), 0, 2, h);
+  ctx.fillRect(playheadPixel(o.cur, w, n), 0, 1, h);
 }

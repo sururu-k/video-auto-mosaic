@@ -222,6 +222,23 @@ export const REVIEW_KEYS: readonly KeyBinding[] = [
   RV_QUEUE_NEXT,
 ];
 
+// ----------------------------------------------------------------------
+// トラックの拡大縮小（issue #84）。時間軸のトラックを持つ画面ならどれでも
+// 同じキーにする（画面ごとに switch(ev.key) を書かない、という issue #79
+// の方針をそのまま延長）。数字キー 1〜5 は review の判定に予約済み、
+// [ / ] は timeline が矩形の拡大縮小に使っているので、それらと衝突しない
+// +/- （テンキー無しでも押せる = と _ も同じキーとして拾う）と、
+// 全体表示へ戻す 0 を割り当てる。
+// ----------------------------------------------------------------------
+export const TRACK_ZOOM_IN = bind("trackZoomIn", ["=", "+"], "+", "トラックを拡大");
+export const TRACK_ZOOM_OUT = bind("trackZoomOut", ["-", "_"], "-", "トラックを縮小");
+export const TRACK_ZOOM_FIT = bind("trackZoomFit", ["0"], "0", "トラックの拡大を戻す（全体表示）");
+export const TRACK_ZOOM_KEYS: readonly KeyBinding[] = [
+  TRACK_ZOOM_IN,
+  TRACK_ZOOM_OUT,
+  TRACK_ZOOM_FIT,
+];
+
 // 区間追従（issue #46）。webapp/review.tsx にはあるが review/app.tsx には
 // まだ移植していない機能（issue #79 の完了条件は「両方が新しいキーマップを
 // 使うこと」であって「両方が同じ機能を持つこと」ではない。移植するかどうか
