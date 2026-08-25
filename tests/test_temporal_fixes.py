@@ -889,17 +889,17 @@ def test_weak_evidence_frames_detects_weak_reasons():
     推定領域 / 低信頼 / 面積の急変を検出し、いずれも無い場合は空リストを返す。
     """
     # フレーム0: 検出済み、高信頼（0.5）-> 根拠なし
-    r0_detected = Region(source="detected", score=0.5, category="sexual")
+    r0_detected = Region(box=(10, 20, 100, 100), cls=CLS, source="detected", score=0.5)
 
     # フレーム1: 推定領域あり -> 推定領域の理由が付く
-    r1_estimated = Region(source="interpolated", score=0.5, category="sexual")
+    r1_estimated = Region(box=(10, 20, 100, 100), cls=CLS, source="interpolated", score=0.5)
 
     # フレーム2: 低信頼（0.2 < 0.30） -> 低信頼の理由が付く
-    r2_lowconf = Region(source="detected", score=0.2, category="sexual")
+    r2_lowconf = Region(box=(10, 20, 100, 100), cls=CLS, source="detected", score=0.2)
 
     # フレーム3,4: 面積が2倍以上に変わる -> 面積の急変の理由が付く
-    r3_area = Region(source="detected", score=0.5, category="sexual")
-    r4_area = Region(source="detected", score=0.5, category="sexual")
+    r3_area = Region(box=(10, 20, 100, 100), cls=CLS, source="detected", score=0.5)
+    r4_area = Region(box=(10, 20, 100, 100), cls=CLS, source="detected", score=0.5)
 
     regions_per_frame = {
         0: [((10, 20, 100, 100), r0_detected)],  # area = 10000
