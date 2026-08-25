@@ -386,7 +386,7 @@ class JobRunner:
         self.job.meta["n_estimated_only_ranges"] = len(
             rep.get("estimated_only_ranges") or []
         )
-        self.job.meta["n_review_frames"] = len(rep.get("review_frames") or [])
+        self.job.meta["n_weak_evidence_frames"] = len(rep.get("weak_evidence_frames") or [])
 
     # -- 送出用 -----------------------------------------------------------
     def snapshot(self, since: int = 0) -> dict:

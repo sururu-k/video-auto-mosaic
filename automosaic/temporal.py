@@ -143,6 +143,7 @@ class TemporalConfig:
     hold_cap: float = 48.0           # 不確かさ由来のマージンの上限 px
     bridge_max: int = 150      # 前後が覆われている未処理区間を埋める最大長（0で無効）
     frame_step: int = 1        # 検出を何フレームおきに行ったか（マージンとgapに反映）
+    mosaic_offset: tuple[float, float] = (0.0, 0.0)  # (dx, dy) モザイク描画位置のオフセット。元の位置も塗ったまま
 
     @property
     def effective_max_gap(self) -> int:
@@ -1086,6 +1087,18 @@ def expand(
     return (nx, ny, nw, nh)
 
 
+def apply_offset(box: Box, offset: tuple[float, float], frame_w: int, frame_h: int) -> Box:
+    """矩形にオフセットを適用する。フレーム外に出ないようクランプ。"""
+    x, y, w, h = box
+    dx, dy = offset
+    ox = max(0.0, min(x + dx, frame_w - 1))
+    oy = max(0.0, min(y + dy, frame_h - 1))
+    # オフセ後ット後の矩形がフレーム外に出ないようにサイズを制限
+    ow = min(w, frame_w - ox)
+    oh = min(h, frame_h - oy)
+    return (ox, oy, ow, oh)
+
+
 def process(
     per_frame_dets: dict[int, list[Detection]],
     n_frames: int,
@@ -1122,9 +1135,17 @@ def process(
     median_speed = speed_values[len(speed_values) // 2] if speed_values else 0.0
 
     out: dict[int, list[tuple[Box, Region]]] = {}
+    has_offset = cfg.mosaic_offset != (0.0, 0.0)
     for f in range(n_frames):
         regions = dense.get(f, [])
-        out[f] = [(expand(r, frame_w, frame_h, cfg), r) for r in regions]
+        items = [(expand(r, frame_w, frame_h, cfg), r) for r in regions]
+        # オフセットが指定されていれば、オフセット版も追加
+        # 元の位置も塗ったまま（RULES 0: 塗り過ぎ側は許容）
+        if has_offset:
+            for box, r in items:
+                offset_box = apply_offset(box, cfg.mosaic_offset, frame_w, frame_h)
+                items.append((offset_box, r))
+        out[f] = items
 
     covered = sum(1 for f in range(n_frames) if out[f])
     detected_frames = sum(1 for f in range(n_frames) if filtered.get(f))
@@ -1382,7 +1403,7 @@ def _merge_ranges(
     return out
 
 
-def review_flags(
+def weak_evidence_frames(
     regions_per_frame: dict[int, list[tuple[Box, Region]]],
     n_frames: int,
 ) -> list[dict]:

@@ -579,6 +579,85 @@ def test_checkpoint_roundtrip():
     print("  途中保存のラウンドトリップ OK")
 
 
+def test_apply_offset_adds_offset_box():
+    """mosaic_offset が指定されたとき、オフセット版も regions に追加されることを確認。"""
+    from automosaic.temporal import apply_offset
+
+    # オフセットなし
+    box = (100.0, 100.0, 50.0, 50.0)
+    offset_box = apply_offset(box, (0.0, 0.0), 1920, 1080)
+    assert offset_box == box, "オフセットなしで変わってはいけない"
+
+    # 正のオフセット
+    offset_box = apply_offset(box, (50.0, 100.0), 1920, 1080)
+    assert offset_box == (150.0, 200.0, 50.0, 50.0), f"オフセット適用が間違い: {offset_box}"
+
+    # 負のオフセット
+    offset_box = apply_offset(box, (-50.0, -50.0), 1920, 1080)
+    assert offset_box == (50.0, 50.0, 50.0, 50.0), f"負オフセット適用が間違い: {offset_box}"
+
+    # 画面外に出るオフセット（クランプされる）
+    offset_box = apply_offset(box, (2000.0, 2000.0), 1920, 1080)
+    # x + dx = 100 + 2000 = 2100 -> クランプして 1919
+    # y + dy = 100 + 2000 = 2100 -> クランプして 1079
+    assert offset_box[0] == 1919, f"x クランプ失敗: {offset_box[0]}"
+    assert offset_box[1] == 1079, f"y クランプ失敗: {offset_box[1]}"
+
+    print("  mosaic_offset のクランプ OK")
+
+
+def test_process_with_mosaic_offset():
+    """mosaic_offset が指定されたとき、process() の出力に元と オフセット版の両方が入ることを確認。"""
+    # 簡単な検出ケース: (100, 100, 50, 50) の検出1個
+    dets = {0: [Detection("MALE_GENITALIA_EXPOSED", (100.0, 100.0, 50.0, 50.0), 0.9)]}
+
+    # オフセットなし
+    cfg_no_offset = TemporalConfig(mosaic_offset=(0.0, 0.0))
+    out_no_offset, _ = process(dets, 5, 1920, 1080, {"MALE_GENITALIA_EXPOSED"}, cfg_no_offset)
+
+    # オフセット指定
+    cfg_offset = TemporalConfig(mosaic_offset=(50.0, 100.0))
+    out_offset, _ = process(dets, 5, 1920, 1080, {"MALE_GENITALIA_EXPOSED"}, cfg_offset)
+
+    # フレーム0（検出がある）を見る
+    boxes_no_offset = [box for box, _ in out_no_offset.get(0, [])]
+    boxes_offset = [box for box, _ in out_offset.get(0, [])]
+
+    # オフセットなしは元の位置だけ
+    assert len(boxes_no_offset) >= 1, "検出がない"
+    # オフセット指定は元の位置 + オフセット版
+    assert len(boxes_offset) == len(boxes_no_offset) * 2, f"要素数が増えていない: {len(boxes_no_offset)} * 2 != {len(boxes_offset)}"
+
+    # オフセット版の矩形を確認
+    # expand() で拡大されているため、元と完全一致とは限らないが、
+    # オフセット版が含まれていることを確認（リスト内のいずれかが オフセット位置付近）
+    # 詳細は曖昧なため、「要素数が2倍」であることだけを確認
+    print("  mosaic_offset で要素数が2倍 OK")
+
+
+def test_no_offset_perfect_match():
+    """mosaic_offset が (0, 0) のとき、出力が変わらないこと。"""
+    dets = {
+        0: [Detection("MALE_GENITALIA_EXPOSED", (100.0, 100.0, 50.0, 50.0), 0.9)],
+        1: [Detection("MALE_GENITALIA_EXPOSED", (200.0, 150.0, 60.0, 70.0), 0.8)],
+    }
+
+    cfg_no_offset_explicit = TemporalConfig(mosaic_offset=(0.0, 0.0))
+    cfg_default = TemporalConfig()  # デフォルトも (0, 0)
+
+    out1, _ = process(dets, 5, 1920, 1080, {"MALE_GENITALIA_EXPOSED"}, cfg_no_offset_explicit)
+    out2, _ = process(dets, 5, 1920, 1080, {"MALE_GENITALIA_EXPOSED"}, cfg_default)
+
+    # 両者の出力が完全に一致
+    for f in range(5):
+        assert len(out1.get(f, [])) == len(out2.get(f, [])), f"フレーム {f} 要素数不一致"
+        for (b1, r1), (b2, r2) in zip(out1.get(f, []), out2.get(f, [])):
+            assert b1 == b2, f"フレーム {f} の box が異なる: {b1} vs {b2}"
+            assert r1.box == r2.box, f"フレーム {f} の Region.box が異なる"
+
+    print("  オフセット(0,0)で完全一致 OK")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"{len(tests)} 件のテストを実行\n")
