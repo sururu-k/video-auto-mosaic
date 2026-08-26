@@ -2,19 +2,42 @@
 //
 //   node tests/test_frontend.mjs
 //
-// 見ているのは frontend/build/logic.mjs。DOM にもフレームワークにも
-// 依存しない部分だけを束ねたもので、npm が無くても回る（ビルド結果を
-// リポジトリに入れてある）。画面部品は Preact に載っているが、
+// 最初に全フロント成果物がソースと一致するか検査する。この検査には
+// frontend/node_modules が必要で、無ければ成功扱いにせず npm ci を案内する。
+// その後に frontend/build/logic.mjs を読み、DOM にもフレームワークにも
+// 依存しない画面ロジックを直接動かす。画面部品は Preact に載っているが、
 // 「押した結果として何が選ばれ、確定ボタンに何が出るか」はこちらにある。
 //
 // 誤検知モードを重点的に見ているのは、消す方向の操作だからで、
 // 「押した覚えのないものが消える」が起きると気づけないため。
 
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
+import { generatedTextMatches, isCanonicalRemoteUrl } from "../frontend/build-check.mjs";
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPO = path.resolve(HERE, "..");
 const LOGIC = path.resolve(HERE, "..", "frontend", "build", "logic.mjs");
+const BUILD = path.resolve(HERE, "..", "frontend", "build.mjs");
+
+const checked = spawnSync(process.execPath, [BUILD, "--check"], {
+  cwd: REPO,
+  encoding: "utf8",
+});
+const missingBase = spawnSync(process.execPath, [BUILD, "--check"], {
+  cwd: REPO,
+  encoding: "utf8",
+  env: { ...process.env, AUTOMOSAIC_FRONTEND_BASE_REF: "refs/heads/issue-75-missing-base" },
+});
+if (checked.stdout) process.stdout.write(checked.stdout);
+if (checked.stderr) process.stderr.write(checked.stderr);
+if (checked.error) {
+  console.error("フロント成果物の同期検査を開始できませんでした:", checked.error.message);
+  process.exit(2);
+}
+if (checked.status !== 0) process.exit(checked.status ?? 2);
 
 const L = await import("file://" + LOGIC.replace(/\\/g, "/"));
 
@@ -31,6 +54,17 @@ function ok(cond, msg) {
 }
 function section(name) {
   console.log("\n" + name);
+}
+
+section("ビルド成果物の同期検査");
+{
+  ok(generatedTextMatches("one\ntwo\n", "one\r\ntwo\r\n"), "CRLF/LF だけの差は同一とみなす");
+  ok(!generatedTextMatches("one\ntwo\n", "one\nchanged\n"), "内容の差は改行差として隠さない");
+  ok(missingBase.status !== 0 && (missingBase.stderr ?? "").includes("比較基準"), "master の比較基準が無ければ検査済みにしない");
+  ok(isCanonicalRemoteUrl("https://github.com/sururu-k/video-auto-mosaic.git"), "canonical の HTTPS remote を識別する");
+  ok(isCanonicalRemoteUrl("git@github.com:sururu-k/video-auto-mosaic.git"), "canonical の SSH remote を識別する");
+  ok(!isCanonicalRemoteUrl("https://github.com/example/video-auto-mosaic.git"), "fork の remote を canonical とみなさない");
+  ok(!isCanonicalRemoteUrl("https://notgithub.com/sururu-k/video-auto-mosaic.git"), "似たホスト名を canonical とみなさない");
 }
 
 // 動画は 640x480、既定の矩形は 64x64 とする
