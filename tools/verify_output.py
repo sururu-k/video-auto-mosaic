@@ -46,23 +46,25 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # automosaic/cli.py の既定 --model / --conf と同じ値。値を変えたら両方直す。
 PROD_MODEL_BASENAME = "640m.onnx"
 PROD_CONF = 0.06
+KNOWN_NUDENET_MODEL_BASENAMES = frozenset({"320n.onnx", "480m.onnx", PROD_MODEL_BASENAME})
 
 
 def structural_warning(mode: str, model_path: str) -> str | None:
     """この実行が「独立した第二の意見」になっていないなら警告文を返す。None なら該当なし。
 
-    source モードで本番と同じ重みを使う限り、検出器自身が盲目な場所は
-    もう一度検出しても同じく盲目になる。conf・infer-size・TTA をどう変えても、
-    重みが同じなら盲点の本質は動かない（docs/05: 実測 source モード 0/2 件、
+    source モードで本番と同じ NudeNet 系列の重みを使う限り、検出器自身が盲目な
+    場所はもう一度検出しても同じく盲目になる。conf・infer-size・TTA をどう変えても、
+    系列が同じなら盲点の本質は動かない（docs/05: 実測 source モード 0/2 件、
     「検出器を自分自身では検証できない」という循環）。
     """
     if mode != "source":
         return None
-    if os.path.basename(model_path) != PROD_MODEL_BASENAME:
+    model_basename = os.path.basename(model_path)
+    if model_basename.lower() not in KNOWN_NUDENET_MODEL_BASENAMES:
         return None
     return (
-        f"[警告] 検証モデルが本番既定と同じ重み ({PROD_MODEL_BASENAME}) です。\n"
-        "  conf/infer-size/TTA をどう変えても、同じ重みが盲目な場所は\n"
+        f"[警告] 検証モデルが本番と同じ NudeNet 系列の重み ({model_basename}) です。\n"
+        "  conf/infer-size/TTA をどう変えても、同じ系列が盲目な場所は\n"
         "  再検出でも同じく盲目になります（docs/05: source モード実測 0/2 件、\n"
         "  「検出器を自分自身では検証できない」という循環）。\n"
         "  ここで 0 件が出ても「漏れが無い証拠」にはなりません。「この検証が\n"
