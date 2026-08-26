@@ -6,6 +6,7 @@
   "description": "automosaic のレビュー UI / Web アプリのフロントエンド。TypeScript を esbuild で束ねて automosaic/ 以下へ直に出す",
   "scripts": {
     "build": "node build.mjs",
+    "check-build": "node build.mjs --check",
     "watch": "node build.mjs --watch",
     "typecheck": "tsc --noEmit"
   },
