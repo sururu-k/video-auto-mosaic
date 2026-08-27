@@ -156,7 +156,10 @@ def create_app(
 
     def page(name: str) -> HTMLResponse:
         with open(os.path.join(STATIC_DIR, name), encoding="utf-8") as f:
-            return HTMLResponse(f.read())
+            return HTMLResponse(
+                f.read(),
+                headers={"Cache-Control": "no-store"},
+            )
 
     # ------------------------------------------------------------------
     # 画面
@@ -193,7 +196,15 @@ def create_app(
         if not _inside(STATIC_DIR, path) or not os.path.isfile(path):
             raise _err(404, "not found")
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
-        return FileResponse(path, media_type=ctype)
+        # FileResponse は送信時に ETag を後付けするため、ここでは内容を
+        # Response に載せて返す。static/ は小さな UI 資材だけであり、古い
+        # JavaScript を条件付き要求で再利用する余地を残さない（issue #6）。
+        with open(path, "rb") as f:
+            return Response(
+                content=f.read(),
+                media_type=ctype,
+                headers={"Cache-Control": "no-store"},
+            )
 
     # ------------------------------------------------------------------
     # 1. ジョブの受け皿
@@ -547,6 +558,7 @@ def create_app(
         job = get_job(job_id)
         s = get_session(job)
         with s.lock:
+            s.sync_corrections_from_disk()
             d = s.state_payload(bool(light))
         d["job"] = job.summary()
         # issue #16: report.json に effective が無く meta.argv から復元した
@@ -568,6 +580,8 @@ def create_app(
         job = get_job(job_id)
         s = get_session(job)
         with s.lock:
+            if s.sync_corrections_from_disk():
+                rebuild = 1
             if step is not None:
                 s.queue_step = max(1, int(step))
                 rebuild = 1
@@ -715,16 +729,21 @@ def create_app(
         return Response(content=body, media_type=ctype, headers=headers)
 
     @app.get("/api/jobs/{job_id}/corrections")
-    def api_get_corrections(job_id: str):
+    def api_get_corrections(job_id: str, state: int = 0):
         job = get_job(job_id)
         s = get_session(job)
         with s.lock:
-            return {
+            s.sync_corrections_from_disk()
+            out = {
                 "video": s.corrections.video,
                 "width": s.corrections.width,
                 "height": s.corrections.height,
                 "corrections": [c.as_dict() for c in s.corrections.items],
+                "corrections_sha256": s.corrections_sha256(),
             }
+            if state:
+                out["state"] = s.state_payload(False)
+            return out
 
     @app.post("/api/jobs/{job_id}/corrections")
     def api_set_corrections(job_id: str, payload: dict):
@@ -736,6 +755,12 @@ def create_app(
         items = payload.get("corrections")
         if not isinstance(items, list):
             raise _err(400, "corrections（配列）が本文にありません")
+        base_sha256 = payload.get("base_sha256")
+        if not isinstance(base_sha256, str) or len(base_sha256) != 64:
+            raise _err(
+                400,
+                "base_sha256 がありません。修正一覧を再読み込みしてから送信してください",
+            )
         # frame は任意（#24）。呼び出し側が「いま表示しているコマ」を教えて
         # くれたときだけ、そのコマぶんの regions に絞って返す。省略時は
         # 従来どおり全フレームぶん（後方互換。review.py の update_payload と同じ）
@@ -747,7 +772,7 @@ def create_app(
                 frame_arg = None
         try:
             with s.lock:
-                s.set_corrections(items)
+                s.set_corrections(items, expected_sha256=base_sha256)
                 # set_corrections は履歴を捨てるが、捨てたことを保存しない。
                 # 保存しないと、セッションを開き直した瞬間に .progress.json から
                 # 古い履歴が生き返り、次の undo が無関係な修正を末尾から削る
