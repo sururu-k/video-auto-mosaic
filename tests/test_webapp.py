@@ -2365,6 +2365,83 @@ def test_effective_settings_restore_refuses_contradictory_argv():
         srv.close()
 
 
+def test_web_build_version_is_fixed_at_server_start():
+    """issue #80: 画面とサーバが同じ Web ビルドを使っているか照合できること。
+
+    サーバ側の値は起動時に固定する。リクエストのたびにディスク上の manifest を
+    読む実装では、サーバを立てたまま git pull した直後に新しい値へ追従してしまい、
+    メモリ上の古い API を新しい画面と同じ版だと誤認するため。
+    """
+    from automosaic.webapp import app as app_mod
+
+    lib = make_lib()
+    srv = Server(lib)
+    try:
+        code, body, headers = request(f"{srv.base}/api/version?t={TOKEN}")
+        assert code == 200, (
+            "新しい画面がサーバの版を確認する入口が無い: "
+            f"GET /api/version -> {code} {body[:200]!r}"
+        )
+        cache_control = headers.get("Cache-Control") or headers.get("cache-control")
+        assert cache_control == "no-store", headers
+        first = json.loads(body)
+
+        manifest_path = os.path.join(
+            os.path.dirname(app_mod.__file__), "static", "build.json"
+        )
+        with open(manifest_path, encoding="utf-8") as f:
+            expected = json.load(f)["web_build_id"]
+        assert first == {"web_build_id": expected}, first
+
+        # git pull 後にディスク上の manifest が変わった状況を、ローダーの
+        # 戻り値だけ差し替えて再現する。既に起動済みの app は古い値を返し続け、
+        # 新しい画面側が不一致を検知できなければならない。
+        original_loader = app_mod._load_web_build_id
+        app_mod._load_web_build_id = lambda: "f" * 64
+        try:
+            second = get_json(f"{srv.base}/api/version?t={TOKEN}")
+            assert second == first, (
+                "起動済みサーバの版がディスク側へ追従した。"
+                "これでは古い API を検知できない: "
+                f"{first!r} -> {second!r}"
+            )
+        finally:
+            app_mod._load_web_build_id = original_loader
+        print(
+            f"  Web ビルド版を起動時に固定し /api/version で返す OK（{expected[:12]}）"
+        )
+    finally:
+        srv.close()
+
+
+def test_web_build_manifest_fails_closed():
+    """issue #80: 版が無い・壊れている状態を「一致」として起動しないこと。"""
+    from automosaic.webapp import app as app_mod
+
+    original = app_mod.WEB_BUILD_MANIFEST
+    with tempfile.TemporaryDirectory() as d:
+        missing = os.path.join(d, "missing.json")
+        bad_json = os.path.join(d, "bad.json")
+        bad_id = os.path.join(d, "bad-id.json")
+        with open(bad_json, "w", encoding="utf-8") as f:
+            f.write("{")
+        with open(bad_id, "w", encoding="utf-8") as f:
+            json.dump({"web_build_id": "same"}, f)
+
+        try:
+            for path in (missing, bad_json, bad_id):
+                app_mod.WEB_BUILD_MANIFEST = path
+                try:
+                    app_mod._load_web_build_id()
+                except RuntimeError as e:
+                    assert "build manifest" in str(e), str(e)
+                else:
+                    raise AssertionError(f"壊れた Web ビルド版を受理した: {path}")
+        finally:
+            app_mod.WEB_BUILD_MANIFEST = original
+    print("  Web ビルド版の欠落・壊れたJSON・不正IDをすべて拒否 OK")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"{len(tests)} 件のテストを実行\n")
