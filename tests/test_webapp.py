@@ -153,6 +153,16 @@ def post_json(url: str, obj, headers=None):
     return code, (json.loads(body) if body else None)
 
 
+def correction_payload(base: str, job_id: str, corrections: list, **extra) -> dict:
+    """現在の一覧ハッシュを添えた、全件置換用の本文を作る。"""
+    current = get_json(f"{base}/api/jobs/{job_id}/corrections?t={TOKEN}")
+    return {
+        "corrections": corrections,
+        "base_sha256": current["corrections_sha256"],
+        **extra,
+    }
+
+
 def upload(base: str, path: str, name: str = "sample.mp4") -> dict:
     """PUT で素材を丸ごと送る。画面側と同じ経路。"""
     with open(path, "rb") as f:
@@ -260,6 +270,20 @@ def test_static_traversal_blocked():
         code, _, _ = request(f"{srv.base}/static/style.css?t={TOKEN}")
         assert code == 200
         print("  static の外を読ませない OK")
+    finally:
+        srv.close()
+
+
+def test_pages_and_static_assets_are_not_cached():
+    """古い画面や JavaScript をブラウザに残さない。"""
+    srv = Server(make_lib())
+    try:
+        for path in ("/", "/static/review.js"):
+            code, _, headers = request(f"{srv.base}{path}?t={TOKEN}")
+            assert code == 200, (path, code)
+            assert headers.get("cache-control") == "no-store", (path, dict(headers))
+            assert headers.get("etag") is None, (path, headers.get("etag"))
+        print("  HTML と静的 JavaScript は no-store・ETag 無し OK")
     finally:
         srv.close()
 
@@ -1104,9 +1128,18 @@ def test_api_frame_not_blocked_by_correction_recompute():
             def do_post():
                 code, r = post_json(
                     f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}",
-                    {"corrections": [
-                        {"frame": 20, "box": [40, 40, 80, 80], "class": CLS, "kind": "add"}
-                    ]},
+                    correction_payload(
+                        srv.base,
+                        jid,
+                        [
+                            {
+                                "frame": 20,
+                                "box": [40, 40, 80, 80],
+                                "class": CLS,
+                                "kind": "add",
+                            }
+                        ],
+                    ),
                 )
                 result["code"] = code
                 result["body"] = r
@@ -1548,8 +1581,8 @@ def test_toobig_stacks_remove_and_add_as_pairs():
     correctionsAfterDrop）は、この並びを見て組を割らないようにしている。
     積み方が変わればあちらが黙って壊れるので、ここで並びを固定しておく。
 
-    末尾の add だけを落とすと remove が残り、そのフレームは自動領域も
-    手修正も無い完全な素通しになる。それも合わせて示す。
+    末尾の add だけを落とす一覧は、サーバ側で拒否しなければ自動領域も
+    手修正も無い完全な素通しになる。クライアントを信用せず 400 で止める。
     """
     lib = make_lib()
     srv = Server(lib)
@@ -1565,28 +1598,149 @@ def test_toobig_stacks_remove_and_add_as_pairs():
             {"frame": f, "verdict": "toobig", "x": 0.5, "y": 0.5, "w": 30, "h": 30, "span": 1},
         )
         assert code == 200, r
-        items = get_json(f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}")["corrections"]
+        current = get_json(f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}")
+        items = current["corrections"]
+        base_sha256 = current["corrections_sha256"]
+        snapshot = get_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?state=1&t={TOKEN}"
+        )
+        assert snapshot["state"]["n_corrections"] == len(items), snapshot["state"]
+        assert any(
+            region[4] == "x" for region in snapshot["state"]["regions"][str(f)]
+        ), snapshot["state"]
         want = []
         for n in range(f - 1, f + 2):
             want += [(n, "remove"), (n, "add")]
         assert [(c["frame"], c["kind"]) for c in items] == want, items
 
-        # 末尾1件だけ落とすと素通しになる（画面側が組で落とすべき理由）
-        post_json(
-            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}", {"corrections": items[:-1]}
+        # remove の class だけを変えて元の組とは別物に見せ、無関係な add を
+        # 相方にする迂回も拒否する。remove の適用は class を見ないため、
+        # これを通すと実際の打ち消し効果だけが残る。
+        changed_remove = {**items[-2], "class": "ANUS_EXPOSED"}
+        unrelated_add = {**items[-1], "box": [0, 0, 5, 5]}
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}",
+            {
+                "corrections": [*items[:-2], changed_remove, unrelated_add],
+                "base_sha256": base_sha256,
+            },
         )
+        assert code == 400 and "remove の新規追加・内容変更" in r.get("detail", ""), r
+        unchanged = get_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}"
+        )["corrections"]
+        assert unchanged == items, "remove 改変を拒否したのに一覧が変わった"
+
+        # curl や古いクライアント相当。末尾の add だけを落とす一覧は拒否する
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}",
+            {"corrections": items[:-1], "base_sha256": base_sha256},
+        )
+        assert code == 400, r
+        assert "素通し" in r.get("detail", ""), r
         st = get_json(f"{srv.base}/api/jobs/{jid}/state?light=0&t={TOKEN}")
-        assert not st["regions"].get(str(f + 1)), "remove だけ残っても素通しにならない?"
+        assert st["regions"].get(str(f + 1)), "拒否したのに素通しになった"
+        after_reject = get_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}"
+        )["corrections"]
+        assert after_reject == items, "拒否したのに修正一覧が書き換わった"
 
         # 組で落とせば自動領域が戻る
-        post_json(
-            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}", {"corrections": items[:-2]}
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}",
+            {"corrections": items[:-2], "base_sha256": base_sha256},
         )
+        assert code == 200, r
         st = get_json(f"{srv.base}/api/jobs/{jid}/state?light=0&t={TOKEN}")
         assert st["regions"].get(str(f + 1)), "組で落としたのに素通しのまま"
-        print("  でかすぎる が remove+add を組で積むこと OK（組を割ると素通し）")
+
+        # もう一方の古い画面が、削除前の一覧から add だけ落として送っても
+        # base_sha256 が一致しないので remove を復活できない。
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}",
+            {"corrections": items[:-1], "base_sha256": base_sha256},
+        )
+        assert code == 400 and "別の画面" in r.get("detail", ""), r
+        after_stale = get_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}"
+        )["corrections"]
+        assert after_stale == items[:-2], "古い画面が remove 単体を復活させた"
+
+        # 無関係な add の追記自体は正当。ただし、その add を既存ペアの
+        # remove と本来の add の間へ移し、相方をすり替える要求は拒否する。
+        current = get_json(f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}")
+        other_add = {**current["corrections"][1], "box": [100, 100, 5, 5]}
+        with_other = [*current["corrections"], other_add]
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}",
+            {
+                "corrections": with_other,
+                "base_sha256": current["corrections_sha256"],
+            },
+        )
+        assert code == 200, r
+        reordered = [
+            current["corrections"][0],
+            other_add,
+            *current["corrections"][1:],
+        ]
+        code, rejected = post_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}",
+            {
+                "corrections": reordered,
+                "base_sha256": r["corrections_sha256"],
+            },
+        )
+        assert code == 400 and "素通し" in rejected.get("detail", ""), rejected
+        after_reorder = get_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}"
+        )["corrections"]
+        assert after_reorder == with_other, "組のすり替えを拒否したのに一覧が変わった"
+        print("  組割れ・組すり替え・古い一覧は 400、組ごとの取り消しは 200 OK")
     finally:
         srv.close()
+
+
+def test_state_syncs_corrections_written_by_other_server():
+    """別サーバが保存した correction を /state がディスクから取り込むこと。"""
+    lib = make_lib()
+    first = Server(lib)
+    second = Server(lib)
+    try:
+        d = prepared_job(lib, first)
+        jid = d["id"]
+        before = get_json(
+            f"{second.base}/api/jobs/{jid}/state?light=0&t={TOKEN}"
+        )
+        assert before["n_corrections"] == 0, before
+
+        current = get_json(
+            f"{first.base}/api/jobs/{jid}/corrections?t={TOKEN}"
+        )
+        added = {
+            "frame": 20,
+            "box": [100, 100, 20, 20],
+            "class": "MALE_GENITALIA_EXPOSED",
+            "kind": "add",
+        }
+        code, result = post_json(
+            f"{first.base}/api/jobs/{jid}/corrections?t={TOKEN}",
+            {
+                "corrections": [added],
+                "base_sha256": current["corrections_sha256"],
+            },
+        )
+        assert code == 200, result
+
+        after = get_json(
+            f"{second.base}/api/jobs/{jid}/state?light=0&t={TOKEN}"
+        )
+        assert after["n_corrections"] == 1, after
+        assert any(r[4] == "x" for r in after["regions"]["20"]), after["regions"]["20"]
+        print("  別サーバが保存した修正を /state がディスクから同期 OK")
+    finally:
+        second.close()
+        first.close()
 
 
 def test_false_positive_via_webapp_mark_matches_review_session():
@@ -1729,9 +1883,11 @@ def test_corrections_replace():
         jid = d["id"]
         code, r = post_json(
             f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}",
-            {"corrections": [
-                {"frame": 4, "box": [10, 10, 30, 30], "class": CLS, "kind": "add"}
-            ]},
+            correction_payload(
+                srv.base,
+                jid,
+                [{"frame": 4, "box": [10, 10, 30, 30], "class": CLS, "kind": "add"}],
+            ),
         )
         assert code == 200 and r["n_corrections"] == 1, r
         got = get_json(f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}")
@@ -1857,9 +2013,16 @@ def test_corrections_payload_must_be_a_list():
             assert code == 400, f"{bad} を通した: {code} {r}"
         assert len(CorrectionSet.load(job.corrections).items) == 1, "本文が壊れているのに消えた"
 
-        # 空配列を明示で送ったときだけ全消しになる
         code, r = post_json(
             f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}", {"corrections": []}
+        )
+        assert code == 400 and "base_sha256" in r.get("detail", ""), r
+        assert len(CorrectionSet.load(job.corrections).items) == 1, "古い画面で全消しできた"
+
+        # 空配列を明示で送ったときだけ全消しになる
+        code, r = post_json(
+            f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}",
+            correction_payload(srv.base, jid, []),
         )
         assert code == 200 and r["n_corrections"] == 0, r
         print("  corrections キーの無い本文を拒否 OK（明示の空配列だけ通る）")
@@ -1887,9 +2050,11 @@ def test_undo_history_does_not_come_back():
             )
         post_json(
             f"{srv.base}/api/jobs/{jid}/corrections?t={TOKEN}",
-            {"corrections": [
-                {"frame": 20, "box": [10, 10, 30, 30], "class": CLS, "kind": "add"}
-            ]},
+            correction_payload(
+                srv.base,
+                jid,
+                [{"frame": 20, "box": [10, 10, 30, 30], "class": CLS, "kind": "add"}],
+            ),
         )
     finally:
         srv.close()
