@@ -4,6 +4,11 @@
 // 中身は同じで、各画面のバンドルに畳み込んである。
 
 import type { JobStatus } from "./api.js";
+import { webBuildProblem, withMatchingWebBuild } from "./web-build.js";
+import { WEB_BUILD_ID } from "automosaic:web-build-id";
+
+/** build.mjs が source hash をここへ埋め込む。手書きの版番号は持たない。 */
+export { WEB_BUILD_ID };
 
 // トークンは URL から拾う。サーバが Cookie にも移すので素の URL でも通るが、
 // Cookie を消している端末でも動くように毎回付け直す。
@@ -25,6 +30,60 @@ export function link(path: string): string {
   return url(path);
 }
 
+function showWebBuildProblem(message: string): void {
+  document.body.textContent = "";
+  const main = document.createElement("main");
+  const card = document.createElement("div");
+  card.className = "card";
+  const heading = document.createElement("h2");
+  heading.textContent = "サーバの再起動が必要です";
+  const detail = document.createElement("p");
+  detail.className = "warn";
+  detail.textContent = message;
+  card.append(heading, detail);
+  main.append(card);
+  document.body.append(main);
+}
+
+async function checkWebBuild(): Promise<string | null> {
+  try {
+    const headers: Record<string, string> = {};
+    if (TOKEN) headers["X-Review-Token"] = TOKEN;
+    const res = await fetch(url("/api/version"), {
+      headers,
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    if (!res.ok) {
+      return webBuildProblem(WEB_BUILD_ID, null) + `（版確認 HTTP ${res.status}）`;
+    }
+    const payload = (await res.json()) as { web_build_id?: unknown };
+    return webBuildProblem(WEB_BUILD_ID, payload.web_build_id);
+  } catch (e) {
+    const why = e instanceof Error ? e.message : String(e);
+    return webBuildProblem(WEB_BUILD_ID, null) + `（版確認に失敗: ${why}）`;
+  }
+}
+
+// issue #80: App が描画される前から入力を止める。index の直接 XHR も、
+// review/draw の window キー操作も、この検査が終わるまで操作対象にしない。
+// api() 側も同じ Promise を待つので、inert を迂回してイベントが発火しても
+// 不一致のサーバへ変更要求は送られない。
+document.documentElement.inert = true;
+const WEB_BUILD_GATE = checkWebBuild().then((problem) => {
+  if (problem) {
+    showWebBuildProblem(problem);
+  } else {
+    document.documentElement.inert = false;
+  }
+  return problem;
+});
+
+/** fetch 以外（進捗表示つき XHR など）も同じ fail-closed gate を通す。 */
+export function withCurrentWebBuild<T>(operation: () => T | Promise<T>): Promise<T> {
+  return withMatchingWebBuild(WEB_BUILD_GATE, operation);
+}
+
 export interface ApiOptions extends Omit<RequestInit, "body"> {
   /** これを渡すと POST + JSON で送る */
   json?: unknown;
@@ -32,29 +91,31 @@ export interface ApiOptions extends Omit<RequestInit, "body"> {
 }
 
 export async function api<T>(path: string, opts?: ApiOptions): Promise<T> {
-  const o: RequestInit = { ...opts };
-  const headers: Record<string, string> = { ...((opts?.headers as Record<string, string>) ?? {}) };
-  if (TOKEN) headers["X-Review-Token"] = TOKEN;
-  if (opts && opts.json !== undefined) {
-    o.method = opts.method ?? "POST";
-    headers["Content-Type"] = "application/json";
-    o.body = JSON.stringify(opts.json);
-    delete (o as ApiOptions).json;
-  }
-  o.headers = headers;
-  const res = await fetch(url(path), o);
-  if (!res.ok) {
-    let msg = String(res.status);
-    try {
-      const d = (await res.json()) as { detail?: string; error?: string };
-      msg = d.detail ?? d.error ?? msg;
-    } catch {
-      /* 本文が JSON でないことはある */
+  return withCurrentWebBuild(async () => {
+    const o: RequestInit = { ...opts };
+    const headers: Record<string, string> = { ...((opts?.headers as Record<string, string>) ?? {}) };
+    if (TOKEN) headers["X-Review-Token"] = TOKEN;
+    if (opts && opts.json !== undefined) {
+      o.method = opts.method ?? "POST";
+      headers["Content-Type"] = "application/json";
+      o.body = JSON.stringify(opts.json);
+      delete (o as ApiOptions).json;
     }
-    throw new Error(msg);
-  }
-  if (res.status === 204) return null as T;
-  return (await res.json()) as T;
+    o.headers = headers;
+    const res = await fetch(url(path), o);
+    if (!res.ok) {
+      let msg = String(res.status);
+      try {
+        const d = (await res.json()) as { detail?: string; error?: string };
+        msg = d.detail ?? d.error ?? msg;
+      } catch {
+        /* 本文が JSON でないことはある */
+      }
+      throw new Error(msg);
+    }
+    if (res.status === 204) return null as T;
+    return (await res.json()) as T;
+  });
 }
 
 /** 例外から画面に出す文字列を取る */

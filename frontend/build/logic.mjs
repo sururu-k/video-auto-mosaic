@@ -619,6 +619,23 @@ function nextShuttleSpeed(cur, dir) {
   const doubled = Math.abs(cur) * 2;
   return dir * Math.min(doubled, SHUTTLE_MAX);
 }
+
+// src/shared/web-build.ts
+var BUILD_ID = /^[0-9a-f]{64}$/;
+function shownBuildId(value) {
+  return typeof value === "string" && BUILD_ID.test(value) ? value.slice(0, 12) : "取得不能";
+}
+function webBuildProblem(frontendId, serverId) {
+  if (typeof frontendId === "string" && typeof serverId === "string" && BUILD_ID.test(frontendId) && frontendId === serverId) {
+    return null;
+  }
+  return `画面とサーバのバージョンが一致しないか、確認できません（画面 ${shownBuildId(frontendId)} / サーバ ${shownBuildId(serverId)}）。誤った API へ操作を送らないため、この画面の操作を停止しました。処理中のジョブが無いことを確認してからサーバを再起動し、画面を再読み込みしてください。`;
+}
+async function withMatchingWebBuild(problem, operation) {
+  const message = await problem;
+  if (message) throw new Error(message);
+  return await operation();
+}
 export {
   CORE_TRANSPORT,
   DRAW_ABSENT,
@@ -710,6 +727,8 @@ export {
   tapToBox,
   togglePick,
   uncoveredPixelMask,
+  webBuildProblem,
+  withMatchingWebBuild,
   worstCoverage,
   zoomLen,
   zoomViewport
