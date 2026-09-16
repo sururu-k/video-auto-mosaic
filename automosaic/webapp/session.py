@@ -44,21 +44,6 @@ def _review_flag_names() -> set[str]:
     return {opt for a in p._actions for opt in a.option_strings}
 
 
-def _as_bool(v) -> bool | None:
-    """settings の値を真偽に直す。判定できなければ None（呼び出し側で弾く）。"""
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    if isinstance(v, str):
-        s = v.strip().lower()
-        if s in ("true", "1", "yes", "on"):
-            return True
-        if s in ("false", "0", "no", "off", ""):
-            return False
-    return None
-
-
 def session_overrides(settings: dict) -> dict:
     """ジョブの meta.settings から、レビューの絵（領域計算・描画）に効く
     項目だけを session_for_job() の overrides として取り出す。
@@ -106,11 +91,7 @@ def session_overrides(settings: dict) -> dict:
         v = settings.get(key)
         if v is None or v == "":
             continue
-        b = _as_bool(v)
-        if b is None:
-            bad.append(f"{key}={v!r}")
-        else:
-            out[key] = b
+        out[key] = runner.parse_setting_bool(key, v)
 
     if bad:
         raise ValueError(

@@ -308,6 +308,8 @@ def create_app(
         sessions.drop(job_id)
         try:
             r = runners.start(job, settings, reuse=reuse)
+        except ValueError as e:
+            raise _err(400, str(e))
         except RuntimeError as e:
             raise _err(409, str(e))
         return {"ok": True, "id": job_id, "argv": r.argv, "status": job.status}

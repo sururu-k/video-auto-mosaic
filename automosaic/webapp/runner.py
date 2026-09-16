@@ -25,7 +25,6 @@ from collections import deque
 
 from . import jobs as jobs_mod
 from . import proxy as proxy_mod
-from .session import _as_bool
 
 # cli.Progress の出力そのもの:
 #   "\rパス1 検出 123/4560 ( 26.9%)   14.2 fps  残り 0:12:34   "
@@ -58,6 +57,26 @@ SETTINGS_OPTS: tuple[tuple[str, str, type], ...] = (
 )
 # 値を取らない（真偽だけの）設定キー
 SETTINGS_FLAGS: tuple[str, ...] = ("tta", "estimate_gaps", "detect_only")
+
+
+def parse_setting_bool(key: str, value) -> bool:
+    """真偽設定を解釈する。判定できなければ止める。
+
+    焼き込みとレビューが別々に判定すると、片方だけがフラグを外して
+    見ている絵と焼く絵が食い違う。判定をここだけに置き、呼び出し側に
+    「わからなければ False」のような危険側の判断をさせない。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+    raise ValueError(f"判定できない真偽設定があります: {key}={value!r}")
 
 
 def child_env() -> dict:
@@ -125,10 +144,10 @@ def build_argv(job: jobs_mod.Job, settings: dict, reuse: bool = False) -> list[s
         opt(key, flag, cast)
     for key in SETTINGS_FLAGS:
         v = settings.get(key)
-        if v is not None and v != "":
-            b = _as_bool(v)
-            if b:
-                argv.append("--" + key.replace("_", "-"))
+        if v is None or v == "":
+            continue
+        if parse_setting_bool(key, v):
+            argv.append("--" + key.replace("_", "-"))
     return argv
 
 
