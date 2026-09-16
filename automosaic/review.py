@@ -23,6 +23,7 @@ LAN に出す前提があるので、アクセストークンを必須にした�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import math
@@ -33,8 +34,11 @@ import secrets
 import socket
 import sys
 import threading
+import time
 import webbrowser
+from contextlib import contextmanager
 from dataclasses import astuple, dataclass, field
+from functools import wraps
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -860,6 +864,217 @@ def cover_box(
     return (x0, y0, x1 - x0, y1 - y0)
 
 
+@contextmanager
+def correction_file_lock(path: str, timeout: float = 10.0):
+    """同じ修正ファイルへの全件置換をプロセス間で直列化する。"""
+    lock_path = path + ".lock"
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    f = open(lock_path, "a+b")
+    locked = False
+    try:
+        f.seek(0, os.SEEK_END)
+        if f.tell() == 0:
+            f.write(b"\0")
+            f.flush()
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                f.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise ValueError(
+                        "修正一覧を別のプロセスが更新中です。少し待ってやり直してください"
+                    )
+                time.sleep(0.01)
+        yield
+    finally:
+        if locked:
+            f.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        f.close()
+
+
+def correction_mutation_locked(method):
+    """ReviewSession の correction 読み書きをファイルロック内で行う。"""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with correction_file_lock(self.corrections_path):
+            self._sync_corrections_from_disk_unlocked()
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
+def _paired_remove_flow(pair_counts, remove_demand, add_capacity) -> int:
+    """元の組を辺とする最大流。1個の add を複数の remove に使わせない。"""
+    source = ("source",)
+    sink = ("sink",)
+    graph: dict[tuple, set[tuple]] = {}
+    capacity: dict[tuple[tuple, tuple], int] = {}
+
+    def add_edge(a: tuple, b: tuple, cap: int) -> None:
+        if cap <= 0:
+            return
+        graph.setdefault(a, set()).add(b)
+        graph.setdefault(b, set()).add(a)
+        capacity[(a, b)] = capacity.get((a, b), 0) + cap
+        capacity.setdefault((b, a), 0)
+
+    for remove_key, demand in remove_demand.items():
+        add_edge(source, ("remove", remove_key), demand)
+    for (remove_key, add_key), count in pair_counts.items():
+        add_edge(("remove", remove_key), ("add", add_key), count)
+    for add_key, count in add_capacity.items():
+        add_edge(("add", add_key), sink, count)
+
+    flow = 0
+    while True:
+        parent: dict[tuple, tuple | None] = {source: None}
+        queue = [source]
+        for node in queue:
+            for nxt in graph.get(node, ()):
+                if nxt not in parent and capacity.get((node, nxt), 0) > 0:
+                    parent[nxt] = node
+                    queue.append(nxt)
+            if sink in parent:
+                break
+        if sink not in parent:
+            return flow
+        amount = 1 << 60
+        node = sink
+        while parent[node] is not None:
+            prev = parent[node]
+            amount = min(amount, capacity[(prev, node)])
+            node = prev
+        node = sink
+        while parent[node] is not None:
+            prev = parent[node]
+            capacity[(prev, node)] -= amount
+            capacity[(node, prev)] += amount
+            node = prev
+        flow += amount
+
+
+def orphaned_remove_frames(old_items, new_items) -> list[int]:
+    """add を落として remove だけ残したフレームを列挙する。
+
+    「でかすぎる」は自動領域を打ち消す remove と、代わりに残す add を
+    必ず組で積む。差し替え前に add があったフレームで、差し替え後に
+    remove だけが残ると完全な素通しになる。
+
+    最初から add が無い remove 単体は「誤検知」の正当な形でもあるため、
+    ここでは新しい一覧だけを見て一律に拒否しない。サーバが判別できる
+    「直前まで add があったのに、remove だけへ変わった」遷移を止める。
+    """
+    had_add = {c.frame for c in old_items if c.kind == "add"}
+    has_add = {c.frame for c in new_items if c.kind == "add"}
+    has_remove = {c.frame for c in new_items if c.kind == "remove"}
+    broken = (had_add - has_add) & has_remove
+
+    # 同じフレームの無関係な add で、元の組の add が消えたことを隠せない
+    # ようにする。toobig は remove の直後に add を積むのが保存形式の契約。
+    # 重複した組も件数で見る（1個の add で2個の remove を満たさない）。
+    def key(c: Correction) -> tuple:
+        return (c.frame, tuple(c.box), c.cls, c.kind)
+
+    new_counts: dict[tuple, int] = {}
+    for c in new_items:
+        k = key(c)
+        new_counts[k] = new_counts.get(k, 0) + 1
+
+    new_adjacent_pairs: dict[int, dict[tuple[tuple, tuple], int]] = {}
+    for remove, add in zip(new_items, new_items[1:]):
+        if remove.kind != "remove" or add.kind != "add" or remove.frame != add.frame:
+            continue
+        pair = (key(remove), key(add))
+        pairs = new_adjacent_pairs.setdefault(remove.frame, {})
+        pairs[pair] = pairs.get(pair, 0) + 1
+
+    pairs_by_frame: dict[int, dict[tuple[tuple, tuple], int]] = {}
+    for remove, add in zip(old_items, old_items[1:]):
+        if remove.kind != "remove" or add.kind != "add" or remove.frame != add.frame:
+            continue
+        rk, ak = key(remove), key(add)
+        pairs = pairs_by_frame.setdefault(remove.frame, {})
+        pairs[(rk, ak)] = pairs.get((rk, ak), 0) + 1
+
+    for frame, pair_counts in pairs_by_frame.items():
+        paired_by_remove: dict[tuple, int] = {}
+        paired_by_add: dict[tuple, int] = {}
+        for (remove_key, add_key), count in pair_counts.items():
+            paired_by_remove[remove_key] = paired_by_remove.get(remove_key, 0) + count
+            paired_by_add[add_key] = paired_by_add.get(add_key, 0) + count
+        remove_demand = {
+            remove_key: min(count, new_counts.get(remove_key, 0))
+            for remove_key, count in paired_by_remove.items()
+        }
+        add_capacity = {
+            add_key: min(count, new_counts.get(add_key, 0))
+            for add_key, count in paired_by_add.items()
+        }
+        # 組の対応関係は保存形式どおり隣接したまま残す。ここを一覧中の
+        # 件数だけで見ると、R,A,U -> R,U,A と並べ替えたあと A を落とし、
+        # 無関係な U を R の相方にすり替える二段階操作が通る。
+        adjacent = new_adjacent_pairs.get(frame, {})
+        remaining_pairs = {
+            pair: min(count, adjacent.get(pair, 0))
+            for pair, count in pair_counts.items()
+        }
+        demand = sum(remove_demand.values())
+        if _paired_remove_flow(remaining_pairs, remove_demand, add_capacity) < demand:
+            broken.add(frame)
+
+    return sorted(broken)
+
+
+def corrections_sha256(items) -> str:
+    """修正一覧の内容ハッシュ。古い画面からの全件上書きを検出する。"""
+    raw = json.dumps(
+        [c.as_dict() for c in items],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def validate_corrections(items, n_frames: int) -> None:
+    """保存・再計算より前に、修正1件ごとの形を検査する。"""
+    for i, c in enumerate(items):
+        if c.kind not in ("add", "remove"):
+            raise ValueError(f"corrections[{i}].kind が不正です: {c.kind!r}")
+        if not isinstance(c.cls, str) or not c.cls:
+            raise ValueError(f"corrections[{i}].class が空か文字列ではありません")
+        if not 0 <= c.frame < n_frames:
+            raise ValueError(
+                f"corrections[{i}].frame が範囲外です: {c.frame}（0〜{n_frames - 1}）"
+            )
+        if len(c.box) != 4:
+            raise ValueError(f"corrections[{i}].box は4要素で指定してください")
+        if not all(math.isfinite(v) for v in c.box):
+            raise ValueError(f"corrections[{i}].box に有限でない値があります")
+        if c.box[2] <= 0 or c.box[3] <= 0:
+            raise ValueError(f"corrections[{i}].box の幅と高さは正数で指定してください")
+
+
 def _thin(frames: list[int], step: int) -> list[int]:
     """近すぎるフレームを間引く。同じ現象で連続して足踏みさせないため。"""
     out: list[int] = []
@@ -1415,6 +1630,7 @@ class ReviewSession:
             "coverage": self.coverage,
             "version": self.version,
             "n_corrections": len(self.corrections.items),
+            "corrections_sha256": self.corrections_sha256(),
         }
         if frame is None:
             d["regions"] = self.regions_payload()
@@ -1425,14 +1641,103 @@ class ReviewSession:
         return d
 
     # -- 修正の受け取り --------------------------------------------------
-    def set_corrections(self, items: list[dict]) -> None:
-        self.corrections = CorrectionSet(
-            video=os.path.basename(self.video),
-            width=self.width,
-            height=self.height,
-            items=[Correction.from_dict(c) for c in items],
-        )
-        self.corrections.save(self.corrections_path)
+    def corrections_sha256(self) -> str:
+        return corrections_sha256(self.corrections.items)
+
+    def _sync_corrections_from_disk_unlocked(self) -> bool:
+        if not os.path.exists(self.corrections_path):
+            return False
+        current = CorrectionSet.load(self.corrections_path)
+        if corrections_sha256(current.items) == self.corrections_sha256():
+            return False
+        self.corrections = current
+        # 別プロセスの一覧に対して、このプロセスの件数ベース undo を使えない。
+        self.history.clear()
+        self.recompute()
+        return True
+
+    def sync_corrections_from_disk(self) -> bool:
+        """別プロセスが保存した一覧を取り込み、古い GET を返さない。"""
+        with correction_file_lock(self.corrections_path):
+            return self._sync_corrections_from_disk_unlocked()
+
+    def set_corrections(
+        self,
+        items: list[dict],
+        *,
+        expected_sha256: str | None = None,
+    ) -> None:
+        new_items = [Correction.from_dict(c) for c in items]
+        validate_corrections(new_items, self.n_frames)
+
+        conflict = False
+        current = self.corrections
+        with correction_file_lock(self.corrections_path):
+            # SHA 比較と保存を同じプロセス間ロック内で行う。メモリだけを
+            # 比べると、review.py と webapp の2プロセスが同じファイルを
+            # 開いたときに古い全件置換が通る。
+            if os.path.exists(self.corrections_path):
+                current = CorrectionSet.load(self.corrections_path)
+            current_sha256 = corrections_sha256(current.items)
+            if expected_sha256 is not None and not hmac.compare_digest(
+                expected_sha256, current_sha256
+            ):
+                conflict = True
+            else:
+                if expected_sha256 is not None:
+                    # 全件置換画面が行うのは add の追加と既存 correction の
+                    # 削除だけ。remove は検査画面の false_positive/toobig が
+                    # 自動領域を確認して作る。ここで新規追加や内容変更を許すと、
+                    # 元の paired remove の class だけを変えて別物に見せかけ、
+                    # 無関係な add を相方にして組割れ検査を迂回できる。
+                    available: dict[tuple, int] = {}
+                    for c in current.items:
+                        if c.kind != "remove":
+                            continue
+                        k = (c.frame, tuple(c.box), c.cls, c.kind)
+                        available[k] = available.get(k, 0) + 1
+                    introduced = []
+                    for c in new_items:
+                        if c.kind != "remove":
+                            continue
+                        k = (c.frame, tuple(c.box), c.cls, c.kind)
+                        if available.get(k, 0) > 0:
+                            available[k] -= 1
+                        else:
+                            introduced.append(c.frame)
+                    if introduced:
+                        shown = ", ".join(str(f) for f in sorted(set(introduced))[:10])
+                        raise ValueError(
+                            "この一覧置換では remove の新規追加・内容変更はできません"
+                            f"（誤検知の判定から追加してください）: frame {shown}"
+                        )
+                broken = orphaned_remove_frames(current.items, new_items)
+                if broken:
+                    shown = ", ".join(str(f) for f in broken[:10])
+                    if len(broken) > 10:
+                        shown += f", 他 {len(broken) - 10} フレーム"
+                    raise ValueError(
+                        "remove+add の組が壊れています（add が消えて remove だけ残る"
+                        f"フレームがあります。適用すると素通しになります）: frame {shown}"
+                    )
+                replacement = CorrectionSet(
+                    video=os.path.basename(self.video),
+                    width=self.width,
+                    height=self.height,
+                    items=new_items,
+                )
+                replacement.save(self.corrections_path)
+
+        if conflict:
+            # 次の GET も古い一覧を返し続けないよう、競合を検出した側の
+            # メモリをディスク上の勝者へ寄せる。
+            self.corrections = current
+            self.history.clear()
+            self.recompute()
+            raise ValueError(
+                "修正一覧が別の画面で更新されています。再読み込みしてからやり直してください"
+            )
+        self.corrections = replacement
         # 履歴を捨てる。undo は「末尾から件数ぶん落とす」実装なので、一覧を丸ごと
         # 差し替えたあとの履歴は別物を指す。件数が一致しても同一性の保証にならず、
         # 直前の判定ではなく無関係な修正が消える。消えるのは add（漏れを塞いだ矩形）
@@ -1440,6 +1745,7 @@ class ReviewSession:
         self.history.clear()
         self.recompute()
 
+    @correction_mutation_locked
     def mark(
         self,
         frame: int,
@@ -1520,6 +1826,7 @@ class ReviewSession:
         self.save_progress()
         return added
 
+    @correction_mutation_locked
     def mark_interval(
         self,
         frame: int,
@@ -1688,6 +1995,7 @@ class ReviewSession:
             self._save_corrections()
         return added, n_fp
 
+    @correction_mutation_locked
     def undo(self) -> dict | None:
         """直前の判定を取り消す。誤タップを1手で戻せないと画面が信用されない。
 
@@ -1957,6 +2265,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
         elif u.path == "/api/state":
             light = (q.get("light") or ["0"])[0] not in ("0", "", "false")
             with s.lock:
+                s.sync_corrections_from_disk()
                 self._send_json(s.state_payload(light), extra=self._cookie_header())
         elif u.path == "/api/regions":
             # タイムライン画面が表示中の1コマぶんだけ取りに来る経路（#24）。
@@ -1968,10 +2277,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self._error(400, "n が数値ではありません")
                 return
             with s.lock:
+                s.sync_corrections_from_disk()
                 self._send_json(s.frame_regions_payload(n), extra=self._cookie_header())
         elif u.path == "/api/queue":
             rebuild = (q.get("rebuild") or ["0"])[0] not in ("0", "", "false")
             with s.lock:
+                if s.sync_corrections_from_disk():
+                    rebuild = True
                 if "step" in q:
                     try:
                         s.queue_step = max(1, int(q["step"][0]))
@@ -1993,13 +2305,20 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self._send_json(s.queue_payload(), extra=self._cookie_header())
         elif u.path == "/api/corrections":
             with s.lock:
+                s.sync_corrections_from_disk()
+                payload = {
+                    "video": s.corrections.video,
+                    "width": s.corrections.width,
+                    "height": s.corrections.height,
+                    "corrections": [c.as_dict() for c in s.corrections.items],
+                    "corrections_sha256": s.corrections_sha256(),
+                }
+                if (q.get("state") or ["0"])[0] not in ("0", "", "false"):
+                    # 競合後の画面が correction 一覧だけでなく、同じロック時点の
+                    # 帯・矩形・版もまとめて勝者へ戻せるようにする。
+                    payload["state"] = s.state_payload(False)
                 self._send_json(
-                    {
-                        "video": s.corrections.video,
-                        "width": s.corrections.width,
-                        "height": s.corrections.height,
-                        "corrections": [c.as_dict() for c in s.corrections.items],
-                    },
+                    payload,
                     extra=self._cookie_header(),
                 )
         else:
@@ -2038,6 +2357,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if not isinstance(items, list):
                 self._error(400, "corrections（配列）が本文にありません")
                 return
+            base_sha256 = data.get("base_sha256")
+            if not isinstance(base_sha256, str) or len(base_sha256) != 64:
+                self._error(
+                    400,
+                    "base_sha256 がありません。修正一覧を再読み込みしてから送信してください",
+                )
+                return
             # frame は任意（#24）。画面が「いま表示しているコマ」を教えてくれた
             # ときだけ、そのコマぶんの regions に絞って返す。省略時は従来どおり
             # 全フレームぶん（後方互換）
@@ -2049,7 +2375,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     frame_arg = None
             try:
                 with s.lock:
-                    s.set_corrections(items)
+                    s.set_corrections(items, expected_sha256=base_sha256)
                     # set_corrections は履歴を捨てるが、捨てたことを保存しないと
                     # セッションを開き直した瞬間に .progress.json から古い履歴が
                     # 生き返り、次の undo が無関係な修正を末尾から削る（W-1）

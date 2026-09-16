@@ -92,6 +92,17 @@ function App() {
   // 全量読み込みは動画全体を検証済みとして扱い、手修正のあとは
   // 直したコマ1つだけを残して他は「未検証」に戻す
   const verifiedFrames = useRef<Set<number>>(new Set());
+  // 全件置換は古い画面との lost update がそのまま漏れになりうる。
+  // GET した一覧の内容ハッシュを POST に添え、サーバ側で比較させる。
+  const correctionsSha256 = useRef("");
+  // React の再描画前に連続操作されても、直前の楽観更新を土台にする。
+  const correctionsRef = useRef<Correction[]>([]);
+  // 保存要求を直列化する。並行 POST は同じ base_sha256 を送り、片方が
+  // 必ず競合するため、応答で SHA を更新してから次を送る。
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const saveGeneration = useRef(0);
+  const latestSaveId = useRef(0);
+  const saveBlocked = useRef(false);
 
   const regions = regionsMap[String(cur)] ?? [];
 
@@ -108,7 +119,9 @@ function App() {
         verifiedFrames.current = new Set(Array.from({ length: st.n_frames }, (_, i) => i));
         setSize([st.default_size[0], st.default_size[1]]);
         setCls(st.default_class);
-        setCorrections(c.corrections ?? []);
+        correctionsRef.current = c.corrections ?? [];
+        setCorrections(correctionsRef.current);
+        correctionsSha256.current = c.corrections_sha256;
       } catch (e) {
         setSave({ kind: "error", text: "起動に失敗: " + errText(e) });
       }
@@ -318,44 +331,99 @@ function App() {
   // ----------------------------------------------------------------
   // 修正
   // ----------------------------------------------------------------
-  async function pushCorrections(items: Correction[]) {
+  async function persistCorrections(items: Correction[], saveId: number, at: number) {
+    if (!correctionsSha256.current) {
+      throw new Error("修正一覧の版が分かりません。画面を再読み込みしてください");
+    }
+    const res = await fetch(u("/api/corrections"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // frame を渡すと、応答の regions は表示中のこのコマぶんだけになる
+      // （#24）。矩形を1個置くたびに動画全体の領域マップが往復していたのが
+      // 元の壊れ方で、1時間の動画で10MBを超えていた
+      body: JSON.stringify({
+        corrections: items,
+        frame: at,
+        base_sha256: correctionsSha256.current,
+      }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const d = (await res.json()) as UpdatePayload;
+    correctionsSha256.current = d.corrections_sha256;
+    // 手修正は実観測扱いなので、帯の色も推定のみ区間も変わる。
+    // regions は表示中のコマぶんだけ届く。手修正は stitch_tracks /
+    // bridge_uncovered を通じて離れたコマへも波及しうるので、それ以外の
+    // コマは「未検証」に戻し、実際にそこへ移動したときに取り直させる
+    // （空白にはしない。取り直すまでは1手前の絵が残るだけ）
+    verifiedFrames.current = new Set([at]);
+    setRegionsMap((prev) => ({ ...prev, ...d.regions }));
+    setState((prev) =>
+      prev
+        ? {
+            ...prev,
+            coverage: d.coverage,
+            version: d.version,
+            estimated_only_ranges: d.estimated_only_ranges,
+            uncovered_ranges: d.uncovered_ranges,
+          }
+        : prev,
+    );
+    if (saveId === latestSaveId.current) {
+      setSave({ kind: "saved", text: `保存済み (${d.n_corrections} 件)` });
+    }
+    if (!playingRef.current) loadStill(curRef.current); // モザイクが乗った絵に差し替える
+  }
+
+  async function reloadCorrectionsAfterConflict() {
+    // correction と同じロック時点の full state を1応答で受け取る。別々に
+    // 取り直すと、その間に別画面が保存して一覧と帯が再び食い違いうる。
+    const res = await fetch(u("/api/corrections", { state: 1 }));
+    if (!res.ok) throw new Error(await res.text());
+    const current = (await res.json()) as CorrectionsPayload;
+    const refreshed = current.state;
+    if (!refreshed) throw new Error("サーバから再同期用の状態が返りませんでした");
+    correctionsRef.current = current.corrections ?? [];
+    setCorrections(correctionsRef.current);
+    correctionsSha256.current = current.corrections_sha256;
+    setState(refreshed);
+    setRegionsMap(refreshed.regions);
+    verifiedFrames.current = new Set(
+      Array.from({ length: refreshed.n_frames }, (_, i) => i),
+    );
+    if (!playingRef.current) loadStill(curRef.current);
+  }
+
+  function pushCorrections(items: Correction[]) {
+    if (saveBlocked.current) {
+      setSave({ kind: "error", text: "保存を再同期できません。画面を再読み込みしてください" });
+      return;
+    }
+    correctionsRef.current = items;
     setCorrections(items);
     setSave({ kind: "dirty", text: "保存中" });
-    try {
-      const at = curRef.current;
-      const res = await fetch(u("/api/corrections"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        // frame を渡すと、応答の regions は表示中のこのコマぶんだけになる
-        // （#24）。矩形を1個置くたびに動画全体の領域マップが往復していたのが
-        // 元の壊れ方で、1時間の動画で10MBを超えていた
-        body: JSON.stringify({ corrections: items, frame: at }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      const d = (await res.json()) as UpdatePayload;
-      // 手修正は実観測扱いなので、帯の色も推定のみ区間も変わる。
-      // regions は表示中のコマぶんだけ届く。手修正は stitch_tracks /
-      // bridge_uncovered を通じて離れたコマへも波及しうるので、それ以外の
-      // コマは「未検証」に戻し、実際にそこへ移動したときに取り直させる
-      // （空白にはしない。取り直すまでは1手前の絵が残るだけ）
-      verifiedFrames.current = new Set([at]);
-      setRegionsMap((prev) => ({ ...prev, ...d.regions }));
-      setState((prev) =>
-        prev
-          ? {
-              ...prev,
-              coverage: d.coverage,
-              version: d.version,
-              estimated_only_ranges: d.estimated_only_ranges,
-              uncovered_ranges: d.uncovered_ranges,
-            }
-          : prev,
-      );
-      setSave({ kind: "saved", text: `保存済み (${d.n_corrections} 件)` });
-      if (!playingRef.current) loadStill(curRef.current); // モザイクが乗った絵に差し替える
-    } catch (e) {
-      setSave({ kind: "error", text: "保存失敗: " + errText(e) });
-    }
+    const saveId = ++latestSaveId.current;
+    const generation = saveGeneration.current;
+    const at = curRef.current;
+    saveQueue.current = saveQueue.current.then(async () => {
+      if (generation !== saveGeneration.current) return;
+      try {
+        await persistCorrections(items, saveId, at);
+      } catch (e) {
+        // この要求より後ろに積まれた楽観更新も古い一覧を土台にしている。
+        // 世代を進めて全部破棄し、サーバの勝者へ戻す。
+        saveGeneration.current++;
+        saveBlocked.current = true;
+        let message = errText(e);
+        try {
+          await reloadCorrectionsAfterConflict();
+          saveBlocked.current = false;
+          message += "（サーバの最新一覧へ戻しました。もう一度操作してください）";
+        } catch (reloadError) {
+          message += " / 再同期失敗: " + errText(reloadError);
+        }
+        setSave({ kind: "error", text: "保存失敗: " + message });
+      }
+    });
   }
 
   function placePending(p: FramePoint) {
@@ -381,7 +449,7 @@ function App() {
     }
     setPending(null);
     setHint(`frame ${at}-${last} に ${cls} を追加しました`);
-    void pushCorrections([...corrections, ...added]);
+    pushCorrections([...correctionsRef.current, ...added]);
   }
 
   function deleteUnderCursor() {
@@ -391,19 +459,20 @@ function App() {
     // 実際に落とす件数は correctionsAfterDrop が決める。「でかすぎる」が積んだ
     // remove+add の組を割ると、そのフレームが素通しになる
     const at = curRef.current;
-    for (let i = corrections.length - 1; i >= 0; i--) {
-      const c = corrections[i]!;
+    const current = correctionsRef.current;
+    for (let i = current.length - 1; i >= 0; i--) {
+      const c = current[i]!;
       if (c.frame !== at) continue;
       const [x, y, w, h] = c.box;
       if (m[0] >= x && m[0] <= x + w && m[1] >= y && m[1] <= y + h) {
-        const next = correctionsAfterDrop(corrections, [i]);
-        const n = corrections.length - next.length;
+        const next = correctionsAfterDrop(current, [i]);
+        const n = current.length - next.length;
         setHint(
           n > 1
             ? `frame ${at} の手修正を ${n} 件消しました（組で積まれたものは組で取り消します）`
             : `frame ${at} の手修正を1件消しました`,
         );
-        void pushCorrections(next);
+        pushCorrections(next);
         return;
       }
     }
@@ -411,11 +480,12 @@ function App() {
   }
 
   function undoLast() {
-    if (!corrections.length) return;
-    const next = correctionsAfterDrop(corrections, [corrections.length - 1]);
-    const n = corrections.length - next.length;
+    const current = correctionsRef.current;
+    if (!current.length) return;
+    const next = correctionsAfterDrop(current, [current.length - 1]);
+    const n = current.length - next.length;
     if (n > 1) setHint(`手修正を ${n} 件取り消しました（組で積まれたものは組で取り消します）`);
-    void pushCorrections(next);
+    pushCorrections(next);
   }
 
   function nextEstimatedRange() {

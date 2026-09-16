@@ -202,6 +202,9 @@ export interface CorrectionsPayload {
   width: number;
   height: number;
   corrections: Correction[];
+  corrections_sha256: string;
+  /** state=1 の競合回復用。同じサーバロック時点の派生状態 */
+  state?: StateFull;
 }
 
 /**
@@ -217,6 +220,7 @@ export interface UpdatePayload extends RangesPayload {
   regions: Record<string, Region[]>;
   version: number;
   n_corrections: number;
+  corrections_sha256: string;
 }
 
 /** GET /api/regions。表示中の1コマぶんだけ矩形を返す軽量版（#24） */

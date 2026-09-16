@@ -42,12 +42,14 @@ from automosaic.review import (  # noqa: E402
     ReviewSession,
     build_queue,
     cookie_token,
+    correction_file_lock,
     cover_box,
     dominant_class,
     export_dataset,
     lan_addresses,
     median_box_size,
     mosaic_bgr,
+    orphaned_remove_frames,
     parse_range,
     qr_matrix,
     runs_of,
@@ -310,6 +312,267 @@ def test_set_corrections_updates_coverage():
         boxes = [r for r in s.regions_payload()["25"] if r[4] == "x"]
         assert boxes and boxes[0][:4] == [300, 300, 64, 64]
         print("  手修正の反映 OK（推定のみ -> 実観測）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_orphaned_remove_frames_detects_only_broken_transition():
+    """add が消えて remove だけ残る遷移だけを危険と判定する。"""
+    old = [
+        Correction(frame=25, box=(0, 0, 10, 10), cls=CLS, kind="remove"),
+        Correction(frame=25, box=(2, 2, 6, 6), cls=CLS, kind="add"),
+    ]
+    remove_only = [
+        Correction(frame=25, box=(0, 0, 10, 10), cls=CLS, kind="remove")
+    ]
+    assert orphaned_remove_frames(old, remove_only) == [25]
+    assert orphaned_remove_frames(old, []) == [], "組ごとの削除まで拒否している"
+    assert orphaned_remove_frames([], remove_only) == [], "正当な誤検知まで拒否している"
+    assert orphaned_remove_frames(old, old) == [], "組が残っているのに拒否している"
+
+    unrelated_add = [
+        remove_only[0],
+        Correction(frame=25, box=(100, 100, 5, 5), cls=CLS, kind="add"),
+    ]
+    assert orphaned_remove_frames(old, unrelated_add) == [25], (
+        "同じフレームの無関係な add で元の組割れを隠せた"
+    )
+
+    other_add = unrelated_add[1]
+    reordered = [old[0], other_add, old[1]]
+    assert orphaned_remove_frames([*old, other_add], reordered) == [25], (
+        "組の間へ無関係な add を差し込んで保存すると、次の更新で組をすり替えられる"
+    )
+
+    duplicated = old + old
+    one_add_short = [old[0], old[0], old[1]]
+    assert orphaned_remove_frames(duplicated, one_add_short) == [25], (
+        "1個の add が重複した2個の remove を満たした"
+    )
+
+    remove2 = Correction(frame=25, box=(20, 20, 10, 10), cls=CLS, kind="remove")
+    shared_add = old[1]
+    shared = [old[0], shared_add, remove2, shared_add]
+    assert orphaned_remove_frames(shared, [old[0], remove2, shared_add]) == [25], (
+        "同じ add 1個を異なる2個の remove が使い回した"
+    )
+
+    add2 = Correction(frame=25, box=(30, 30, 6, 6), cls=CLS, kind="add")
+    choices = [old[0], shared_add, old[0], add2]
+    assert orphaned_remove_frames(choices, [old[0], add2]) == [], (
+        "同じ remove の組を1組だけ残す正当な削除まで拒否した"
+    )
+    print("  remove+add が壊れた遷移だけを検出 OK")
+
+
+def test_set_corrections_rejects_broken_pair_without_partial_update():
+    """組の add だけを落とした一覧を拒否し、元の状態を保つ。"""
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        s.mark(25, "toobig", tap=(0.5, 0.5), size=(20, 20), span=0, cls=CLS)
+        before = [c.as_dict() for c in s.corrections.items]
+        before_coverage = s.coverage
+        before_regions = s.frame_regions(25)
+        broken = [c for c in before if c["kind"] == "remove"]
+        try:
+            s.set_corrections(broken)
+        except ValueError as e:
+            assert "25" in str(e) and "素通し" in str(e), str(e)
+        else:
+            raise AssertionError("remove+add の組を割った一覧が通った")
+
+        assert [c.as_dict() for c in s.corrections.items] == before
+        assert s.coverage == before_coverage
+        assert s.frame_regions(25) == before_regions
+        saved = CorrectionSet.load(s.corrections_path)
+        assert [c.as_dict() for c in saved.items] == before
+        print("  組を割った一覧を拒否し、メモリと保存済み状態を維持 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_set_corrections_rejects_modified_paired_remove():
+    """paired remove を別物に見せかけて組割れ検査を迂回できないこと。"""
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        s.mark(25, "toobig", tap=(0.5, 0.5), size=(20, 20), span=0, cls=CLS)
+        before = [c.as_dict() for c in s.corrections.items]
+        before_sha = s.corrections_sha256()
+        changed_remove = {**before[0], "class": "ANUS_EXPOSED"}
+        unrelated_add = {**before[1], "box": [0, 0, 5, 5]}
+        try:
+            s.set_corrections(
+                [changed_remove, unrelated_add],
+                expected_sha256=before_sha,
+            )
+        except ValueError as e:
+            assert "remove の新規追加・内容変更" in str(e), str(e)
+        else:
+            raise AssertionError("remove の class 変更で元の組を別物にできた")
+
+        assert [c.as_dict() for c in s.corrections.items] == before
+        assert [c.as_dict() for c in CorrectionSet.load(s.corrections_path).items] == before
+        print("  paired remove の内容変更による組割れ迂回を拒否 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_set_corrections_keeps_legitimate_remove_and_pair_drop():
+    """誤検知の remove 単体と、remove+add を組ごと落とす操作は通す。"""
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        remove_only = {
+            "frame": 5,
+            "box": [0, 0, 10, 10],
+            "class": CLS,
+            "kind": "remove",
+        }
+        s.set_corrections([remove_only])
+        assert [c.kind for c in s.corrections.items] == ["remove"]
+
+        s = make_session(tmp)
+        s.mark(25, "toobig", tap=(0.5, 0.5), size=(20, 20), span=0, cls=CLS)
+        s.set_corrections([])
+        assert not s.corrections.items
+        assert s.coverage[25] == COV_ESTIMATED
+        print("  正当な remove 単体と組ごとの取り消しを許可 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_set_corrections_rejects_stale_list_after_pair_drop():
+    """安全な更新の直後でも、古い画面の全件上書きを通さない。"""
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        s.mark(25, "toobig", tap=(0.5, 0.5), size=(20, 20), span=0, cls=CLS)
+        old_items = [c.as_dict() for c in s.corrections.items]
+        old_sha = s.corrections_sha256()
+
+        s.set_corrections([], expected_sha256=old_sha)
+        empty_sha = s.corrections_sha256()
+        assert empty_sha != old_sha
+
+        stale_remove_only = [c for c in old_items if c["kind"] == "remove"]
+        try:
+            s.set_corrections(stale_remove_only, expected_sha256=old_sha)
+        except ValueError as e:
+            assert "別の画面" in str(e), str(e)
+        else:
+            raise AssertionError("古い一覧で remove だけを復活できた")
+
+        assert not s.corrections.items
+        assert s.corrections_sha256() == empty_sha
+        assert s.frame_regions(25), "古い一覧を拒否したのに素通しになった"
+        assert not CorrectionSet.load(s.corrections_path).items
+        print("  組ごとの削除後も古い remove 単体の復活を拒否 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_set_corrections_cas_reads_disk_across_sessions():
+    """別プロセス相当の2セッションでも、古い全件置換を通さない。"""
+    tmp = tempfile.mkdtemp()
+    try:
+        seed = make_session(tmp)
+        remove_only = {
+            "frame": 5,
+            "box": [190, 190, 80, 80],
+            "class": CLS,
+            "kind": "remove",
+        }
+        safe_add = {
+            "frame": 5,
+            "box": [190, 190, 80, 80],
+            "class": CLS,
+            "kind": "add",
+        }
+        seed.set_corrections([remove_only])
+        old_sha = seed.corrections_sha256()
+
+        path = seed.corrections_path
+        first = make_session(tmp, corrections=CorrectionSet.load(path))
+        stale = make_session(tmp, corrections=CorrectionSet.load(path))
+        first.set_corrections([safe_add], expected_sha256=old_sha)
+        safe_sha = first.corrections_sha256()
+
+        try:
+            stale.set_corrections([remove_only], expected_sha256=old_sha)
+        except ValueError as e:
+            assert "別の画面" in str(e), str(e)
+        else:
+            raise AssertionError("別セッションの古い remove 単体で安全な add を上書きできた")
+
+        assert stale.corrections_sha256() == safe_sha, "競合側のメモリが古いまま"
+        assert [c.kind for c in stale.corrections.items] == ["add"]
+        saved = CorrectionSet.load(path)
+        assert [c.kind for c in saved.items] == ["add"]
+        print("  別セッション間でもディスク上の SHA で古い全件置換を拒否 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_correction_file_lock_serializes_handles():
+    """同じプロセスの別ハンドルでも、修正ファイルのロックは同時取得させない。"""
+    tmp = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmp, "corrections.json")
+        first_acquired = threading.Event()
+        release_first = threading.Event()
+        second_acquired = threading.Event()
+
+        def first():
+            with correction_file_lock(path):
+                first_acquired.set()
+                assert release_first.wait(5)
+
+        def second():
+            assert first_acquired.wait(5)
+            with correction_file_lock(path):
+                second_acquired.set()
+
+        a = threading.Thread(target=first)
+        b = threading.Thread(target=second)
+        a.start()
+        b.start()
+        assert first_acquired.wait(5)
+        assert not second_acquired.wait(0.1), "同じ修正ファイルのロックを同時取得した"
+        release_first.set()
+        a.join(5)
+        b.join(5)
+        assert not a.is_alive() and not b.is_alive()
+        assert second_acquired.is_set()
+        print("  修正ファイルのプロセス間ロックを直列化 OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_set_corrections_validates_before_mutation():
+    """不正な add を番兵にして検査を抜けても、状態を一切書き換えない。"""
+    tmp = tempfile.mkdtemp()
+    try:
+        s = make_session(tmp)
+        before = [c.as_dict() for c in s.corrections.items]
+        before_sha = s.corrections_sha256()
+        invalid = [
+            {"frame": 5, "box": [0, 0, 10], "class": CLS, "kind": "add"},
+            {"frame": 5, "box": [0, 0, 10, 10], "class": CLS, "kind": "other"},
+            {"frame": 5, "box": [0, 0, float("nan"), 10], "class": CLS, "kind": "add"},
+        ]
+        for item in invalid:
+            try:
+                s.set_corrections([item], expected_sha256=before_sha)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"不正な修正が通った: {item}")
+            assert [c.as_dict() for c in s.corrections.items] == before
+            assert s.corrections_sha256() == before_sha
+            assert not os.path.exists(s.corrections_path), "拒否した修正が保存された"
+        print("  不正な修正を保存・再計算より前に拒否 OK")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2040,18 +2303,32 @@ def test_http_corrections_scoped_to_frame():
         httpd, base = _serve(s, tok)
 
         code, body, _ = _get(f"{base}/api/corrections?t={tok}")
-        cur = json.loads(body)["corrections"]
+        current = json.loads(body)
+        cur = current["corrections"]
         extra = {"frame": 3, "box": [10, 10, 20, 20], "class": CLS, "kind": "add"}
 
         code, d = _post(
-            f"{base}/api/corrections?t={tok}", {"corrections": cur + [extra], "frame": 3}
+            f"{base}/api/corrections?t={tok}",
+            {
+                "corrections": cur + [extra],
+                "frame": 3,
+                "base_sha256": current["corrections_sha256"],
+            },
         )
         assert code == 200, d
         assert list(d["regions"].keys()) == ["3"], d["regions"].keys()
 
-        code, d2 = _post(f"{base}/api/corrections?t={tok}", {"corrections": cur + [extra]})
+        code, d2 = _post(
+            f"{base}/api/corrections?t={tok}",
+            {"corrections": cur + [extra], "base_sha256": d["corrections_sha256"]},
+        )
         assert code == 200, d2
         assert len(d2["regions"]) > 1, "frame 未指定なのに全フレームぶんに戻っていない"
+
+        code, body, _ = _get(f"{base}/api/corrections?state=1&t={tok}")
+        synced = json.loads(body)
+        assert code == 200 and synced["state"]["n_corrections"] == 1, synced
+        assert synced["state"]["regions"]["3"] == d2["regions"]["3"], synced["state"]
         print("  POST /api/corrections の frame 指定で regions を絞れる OK（未指定は従来どおり）")
     finally:
         if httpd:
@@ -2091,6 +2368,56 @@ def test_http_regions_endpoint_returns_single_frame():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_http_read_paths_sync_corrections_from_disk():
+    """別プロセスが保存した correction を state / regions / queue が取り込むこと。"""
+    tmp = tempfile.mkdtemp()
+    httpd = None
+    try:
+        s = make_session(tmp)
+        tok = "testtoken1234"
+        httpd, base = _serve(s, tok)
+        code, body, _ = _get(f"{base}/api/state?light=0&t={tok}")
+        assert code == 200 and json.loads(body)["n_corrections"] == 0
+
+        def save_external(frames):
+            CorrectionSet(
+                video=os.path.basename(s.video),
+                width=s.width,
+                height=s.height,
+                items=[
+                    Correction(
+                        frame=f,
+                        box=(10 + f, 10 + f, 20, 20),
+                        cls=CLS,
+                        kind="add",
+                    )
+                    for f in frames
+                ],
+            ).save(s.corrections_path)
+
+        save_external([3])
+        code, body, _ = _get(f"{base}/api/state?light=0&t={tok}")
+        state = json.loads(body)
+        assert code == 200 and state["n_corrections"] == 1, state
+        assert any(r[4] == "x" for r in state["regions"]["3"]), state["regions"]["3"]
+
+        save_external([3, 4])
+        code, body, _ = _get(f"{base}/api/regions?n=4&t={tok}")
+        regions = json.loads(body)
+        assert code == 200 and any(r[4] == "x" for r in regions["regions"]), regions
+
+        save_external([3, 4, 5])
+        code, body, _ = _get(f"{base}/api/queue?rebuild=1&t={tok}")
+        assert code == 200, body
+        assert len(s.corrections.items) == 3, s.corrections.items
+        print("  state / regions / queue が別プロセスの修正へ同期 OK")
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_corrections_payload_must_be_a_list():
     """corrections キーの無い本文で全消ししないこと（webapp と同じ修正）。
 
@@ -2116,8 +2443,17 @@ def test_corrections_payload_must_be_a_list():
             assert code == 400, f"{bad} を通した: {code} {d}"
         assert len(s.corrections.items) == 1, "本文が壊れているのに消えた"
 
-        # 空配列を明示で送ったときだけ全消しになる
         code, d = _post(f"{base}/api/corrections?t={tok}", {"corrections": []})
+        assert code == 400 and "base_sha256" in d.get("error", ""), d
+        assert len(s.corrections.items) == 1, "古い画面で全消しできた"
+
+        # 空配列を明示で送ったときだけ全消しになる
+        code, body, _ = _get(f"{base}/api/corrections?t={tok}")
+        current = json.loads(body)
+        code, d = _post(
+            f"{base}/api/corrections?t={tok}",
+            {"corrections": [], "base_sha256": current["corrections_sha256"]},
+        )
         assert code == 200 and d["n_corrections"] == 0, d
         print("  corrections キーの無い本文を拒否 OK（明示の空配列だけ通る）")
     finally:
@@ -2164,7 +2500,11 @@ def test_corrections_replace_does_not_resurrect_history_on_reopen():
             for f in range(40, 51)
         ]
         code, d = _post(
-            f"{base}/api/corrections?t={tok}", {"corrections": cur["corrections"] + extra}
+            f"{base}/api/corrections?t={tok}",
+            {
+                "corrections": cur["corrections"] + extra,
+                "base_sha256": cur["corrections_sha256"],
+            },
         )
         assert code == 200 and d["n_corrections"] == 22, d
 

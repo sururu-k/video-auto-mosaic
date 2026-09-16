@@ -11,10 +11,13 @@
 // 「押した覚えのないものが消える」が起きると気づけないため。
 
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LOGIC = path.resolve(HERE, "..", "frontend", "build", "logic.mjs");
+const TIMELINE = path.resolve(HERE, "..", "automosaic", "web", "timeline.js");
+const TIMELINE_SOURCE = path.resolve(HERE, "..", "frontend", "src", "timeline", "timeline.tsx");
 
 const L = await import("file://" + LOGIC.replace(/\\/g, "/"));
 
@@ -872,6 +875,128 @@ section("キーマップ（issue #84）: トラックの拡大縮小");
   ok(L.resolveKey(combined, { key: "i" }) === "intervalStart", "拡大縮小を足しても I は区間の始点のまま");
   ok(L.resolveKey(combined, { key: "=" }) === "trackZoomIn", "束ねた一覧でも + でズームできる");
   ok(L.resolveKey(combined, { key: "0" }) === "trackZoomFit", "束ねた一覧でも 0 で全体表示に戻る");
+}
+
+// --------------------------------------------------------------------
+section("remove+add の不変条件（issue #6）");
+// --------------------------------------------------------------------
+{
+  const items = [
+    { frame: 10, kind: "remove" },
+    { frame: 10, kind: "add" },
+    { frame: 20, kind: "remove" },
+  ];
+  let got = L.correctionsAfterDrop(items, [1]);
+  ok(got.length === 1 && got[0] === items[2],
+     "組の add を落とすと相方の remove も落ち、別フレームは巻き込まない");
+
+  got = L.correctionsAfterDrop(items, [0]);
+  ok(got.length === 1 && got[0] === items[2],
+     "組の remove を落とすと相方の add も落ちる");
+
+  got = L.correctionsAfterDrop(items, [99, -1]);
+  ok(got.length === items.length, "範囲外の番号では修正を消さない");
+
+  const separated = [
+    { frame: 30, kind: "remove" },
+    { frame: 40, kind: "add" },
+    { frame: 30, kind: "add" },
+  ];
+  got = L.correctionsAfterDrop(separated, [2]);
+  ok(!got.some((c) => c.frame === 30),
+     "隣接していない add を落としても、同じフレームに remove だけ残さない");
+  ok(got.length === 1 && got[0] === separated[1],
+     "安全側の全削除でも別フレームは巻き込まない");
+}
+
+{
+  // 2フレーム x add/remove の4種類を長さ0〜6で全列挙し、各列の全 drop
+  // 組み合わせを当てる。選択したフレームで、元に add があったのに
+  // 結果が remove のみ、という完全素通しの形が1件も残らないことを見る。
+  const symbols = [
+    { frame: 0, kind: "remove" },
+    { frame: 0, kind: "add" },
+    { frame: 1, kind: "remove" },
+    { frame: 1, kind: "add" },
+  ];
+  let checked = 0;
+  let bad = null;
+  outer:
+  for (let n = 0; n <= 6; n++) {
+    const sequences = 4 ** n;
+    for (let encoded = 0; encoded < sequences; encoded++) {
+      let value = encoded;
+      const items = [];
+      for (let i = 0; i < n; i++) {
+        items.push(symbols[value & 3]);
+        value = Math.floor(value / 4);
+      }
+      for (let mask = 0; mask < 2 ** n; mask++) {
+        const drop = [];
+        for (let i = 0; i < n; i++) if (mask & (1 << i)) drop.push(i);
+        const got = L.correctionsAfterDrop(items, drop);
+        const touched = new Set(drop.map((i) => items[i]?.frame).filter((f) => f !== undefined));
+        for (const frame of touched) {
+          const hadAdd = items.some((c) => c.frame === frame && c.kind === "add");
+          const hasAdd = got.some((c) => c.frame === frame && c.kind === "add");
+          const hasRemove = got.some((c) => c.frame === frame && c.kind === "remove");
+          if (hadAdd && hasRemove && !hasAdd) {
+            bad = { items, drop, got, frame };
+            break outer;
+          }
+        }
+        checked++;
+      }
+    }
+  }
+  ok(bad === null,
+     `全 ${checked} 通りで、drop 後に add が消えて remove だけ残るフレームが無い` +
+     (bad ? `: ${JSON.stringify(bad)}` : ""));
+}
+
+// --------------------------------------------------------------------
+section("数値入力の空欄と 0（issue #6）");
+// --------------------------------------------------------------------
+{
+  ok(L.numOr("", 7) === 7, "空欄は既定値へ倒す");
+  ok(L.numOr("   ", 7) === 7, "空白だけも既定値へ倒す");
+  ok(L.numOr("abc", 7) === 7, "数でない文字は既定値へ倒す");
+  ok(L.numOr("Infinity", 7) === 7, "有限でない値は既定値へ倒す");
+  ok(L.numOr("0", 7) === 0, "明示した 0 は既定値に化けない");
+  ok(L.numOr("12", 7) === 12, "整数をそのまま読む");
+  ok(L.numOr("1.5", 7) === 1.5, "小数をそのまま読む");
+}
+
+// --------------------------------------------------------------------
+section("修正一覧の版を送受信する生成済み画面（issue #6）");
+// --------------------------------------------------------------------
+{
+  const timeline = readFileSync(TIMELINE, "utf8");
+  const source = readFileSync(TIMELINE_SOURCE, "utf8");
+  ok(timeline.includes("base_sha256"), "保存時に取得済みの版をサーバへ送る");
+  ok(timeline.includes("corrections_sha256"), "読込・保存結果から最新の版を受け取る");
+  ok(timeline.includes("サーバから再同期用の状態が返りませんでした"),
+     "競合回復の full state 処理が生成済み画面にも入っている");
+  ok(timeline.includes("修正一覧の版が分かりません"), "版が無い古い状態では保存を止める");
+  ok(source.includes("saveQueue.current = saveQueue.current.then"),
+     "連続した保存要求を前の応答後まで待たせる");
+  ok(source.includes("const current = correctionsRef.current"),
+     "再描画前の連続操作も直前の楽観更新へ積む");
+  ok(source.includes("saveGeneration.current++"),
+     "競合後は同じ古い一覧から作った待機中の保存を破棄する");
+  const reloadStart = source.indexOf("async function reloadCorrectionsAfterConflict()");
+  const reloadEnd = source.indexOf("\n  function pushCorrections", reloadStart);
+  const reload = source.slice(reloadStart, reloadEnd);
+  ok(reloadStart >= 0 && reloadEnd > reloadStart,
+     "競合回復の処理本体を検査できる");
+  ok(reload.includes('u("/api/corrections", { state: 1 })'),
+     "競合後は correction と同じ時点の full state を要求する");
+  ok(reload.includes("setRegionsMap(refreshed.regions)"),
+     "競合後は楽観更新した矩形をサーバの勝者へ戻す");
+  ok(reload.includes("length: refreshed.n_frames"),
+     "競合後は全フレームの検証済み状態も full state に合わせる");
+  ok(reload.includes("if (!playingRef.current) loadStill(curRef.current)"),
+     "競合後は表示中のモザイク画像も取り直す");
 }
 
 console.log(fails ? `\n${count} 件中 ${fails} 件失敗` : `\n${count} 件すべて通過`);
