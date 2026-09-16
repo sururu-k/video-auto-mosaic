@@ -15,6 +15,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 
@@ -38,6 +39,8 @@ from .runner import RunnerRegistry
 from .session import SessionCache, session_overrides, sync_meta
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+WEB_BUILD_MANIFEST = os.path.join(STATIC_DIR, "build.json")
+_WEB_BUILD_ID_RE = re.compile(r"[0-9a-f]{64}")
 
 # 配信範囲の判定は review.py と同じものを使う。文字列の先頭一致で判定すると
 # 兄弟ディレクトリが通るので、実装を2箇所に持たない
@@ -57,11 +60,39 @@ def _err(status: int, msg: str) -> HTTPException:
     return HTTPException(status_code=status, detail=msg)
 
 
+def _load_web_build_id() -> str:
+    """ビルド済み画面の版を manifest から読む。
+
+    create_app() が一度だけ呼び、起動済みサーバのメモリへ固定する。要求のたびに
+    読み直すと、サーバを立てたまま git pull したときに manifest だけ新しくなり、
+    古い API が新しい画面と同じ版を名乗ってしまう（issue #80）。
+    """
+    try:
+        with open(WEB_BUILD_MANIFEST, encoding="utf-8") as f:
+            build_id = json.load(f)["web_build_id"]
+    except (OSError, KeyError, TypeError, ValueError) as e:
+        raise RuntimeError(
+            "Web 画面の build manifest を読めません。"
+            "frontend で node build.mjs を実行してからサーバを起動してください: "
+            f"{e}"
+        ) from e
+    if not isinstance(build_id, str) or _WEB_BUILD_ID_RE.fullmatch(build_id) is None:
+        raise RuntimeError(
+            "Web 画面の build manifest に64桁の web_build_id がありません: "
+            f"{build_id!r}"
+        )
+    return build_id
+
+
 def create_app(
     library_dir: str | None = None,
     token: str = "",
     require_token: bool = True,
 ) -> FastAPI:
+    # issue #80: static/ は git pull 後にディスク上の新しい画面を配るが、
+    # API のハンドラは起動時のまま残る。ここで版を一度だけ固定しておき、
+    # 新しい画面が古い API を同じ版だと誤認しないようにする。
+    web_build_id = _load_web_build_id()
     lib = Library(library_dir)
     runners = RunnerRegistry()
     sessions = SessionCache()
@@ -83,6 +114,7 @@ def create_app(
     app.state.sessions = sessions
     app.state.token = token
     app.state.require_token = bool(require_token and token)
+    app.state.web_build_id = web_build_id
 
     # ------------------------------------------------------------------
     # トークン
@@ -194,6 +226,14 @@ def create_app(
             raise _err(404, "not found")
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
         return FileResponse(path, media_type=ctype)
+
+    @app.get("/api/version")
+    def api_version():
+        """起動済み API の版。画面側の埋め込み版と違えば操作を止める。"""
+        return JSONResponse(
+            {"web_build_id": app.state.web_build_id},
+            headers={"Cache-Control": "no-store"},
+        )
 
     # ------------------------------------------------------------------
     # 1. ジョブの受け皿

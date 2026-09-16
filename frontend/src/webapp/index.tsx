@@ -10,7 +10,16 @@ import { render } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 
 import type { JobDetail, JobSummary, JobsPayload } from "../shared/api.js";
-import { TOKEN, api, errText, fmtBytes, fmtSec, link, url } from "../shared/webapp-net.js";
+import {
+  TOKEN,
+  api,
+  errText,
+  fmtBytes,
+  fmtSec,
+  link,
+  url,
+  withCurrentWebBuild,
+} from "../shared/webapp-net.js";
 import { StatusBadge } from "./StatusBadge.js";
 
 interface UploadState {
@@ -68,31 +77,37 @@ function App() {
   const fileRef = useRef<HTMLInputElement>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  function upload(file: File) {
-    setUp({ active: true, pct: 0, msg: `${file.name}（${fmtBytes(file.size)}）を送っています` });
-    const xhr = new XMLHttpRequest();
-    xhr.open("PUT", url("/api/upload", { name: file.name }));
-    if (TOKEN) xhr.setRequestHeader("X-Review-Token", TOKEN);
-    xhr.upload.onprogress = (ev) => {
-      if (!ev.lengthComputable) return;
-      const pct = (100 * ev.loaded) / ev.total;
-      setUp({
-        active: true,
-        pct,
-        msg: `${file.name}  ${fmtBytes(ev.loaded)} / ${fmtBytes(ev.total)}（${pct.toFixed(1)}%）`,
+  async function upload(file: File) {
+    try {
+      await withCurrentWebBuild(() => {
+        setUp({ active: true, pct: 0, msg: `${file.name}（${fmtBytes(file.size)}）を送っています` });
+        const xhr = new XMLHttpRequest();
+        xhr.open("PUT", url("/api/upload", { name: file.name }));
+        if (TOKEN) xhr.setRequestHeader("X-Review-Token", TOKEN);
+        xhr.upload.onprogress = (ev) => {
+          if (!ev.lengthComputable) return;
+          const pct = (100 * ev.loaded) / ev.total;
+          setUp({
+            active: true,
+            pct,
+            msg: `${file.name}  ${fmtBytes(ev.loaded)} / ${fmtBytes(ev.total)}（${pct.toFixed(1)}%）`,
+          });
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            const d = JSON.parse(xhr.responseText) as JobDetail;
+            setUp((s) => ({ ...s, msg: "受け取りました。設定へ移ります" }));
+            location.href = link("/job/" + d.id);
+          } else {
+            setUp((s) => ({ ...s, msg: "失敗しました: " + xhr.status + " " + xhr.responseText }));
+          }
+        };
+        xhr.onerror = () => setUp((s) => ({ ...s, msg: "通信に失敗しました" }));
+        xhr.send(file);
       });
-    };
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        const d = JSON.parse(xhr.responseText) as JobDetail;
-        setUp((s) => ({ ...s, msg: "受け取りました。設定へ移ります" }));
-        location.href = link("/job/" + d.id);
-      } else {
-        setUp((s) => ({ ...s, msg: "失敗しました: " + xhr.status + " " + xhr.responseText }));
-      }
-    };
-    xhr.onerror = () => setUp((s) => ({ ...s, msg: "通信に失敗しました" }));
-    xhr.send(file);
+    } catch (e) {
+      setUp({ active: false, pct: 0, msg: errText(e) });
+    }
   }
 
   useEffect(() => {

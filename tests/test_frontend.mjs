@@ -11,12 +11,47 @@
 // 「押した覚えのないものが消える」が起きると気づけないため。
 
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LOGIC = path.resolve(HERE, "..", "frontend", "build", "logic.mjs");
 
 const L = await import("file://" + LOGIC.replace(/\\/g, "/"));
+
+function filesUnder(dir) {
+  const out = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...filesUnder(full));
+    else if (entry.isFile()) out.push(full);
+  }
+  return out;
+}
+
+/** build.mjs と独立に入力 hash を計算し、固定文字列への置換も見逃さない。 */
+function expectedWebBuildId(frontendDir) {
+  const inputs = [
+    path.join(frontendDir, "build.mjs"),
+    path.join(frontendDir, "package.json"),
+    path.join(frontendDir, "package-lock.json"),
+    ...filesUnder(path.join(frontendDir, "src")),
+  ];
+  const rel = (file) => path.relative(frontendDir, file).replaceAll("\\", "/");
+  inputs.sort((a, b) => (rel(a) < rel(b) ? -1 : rel(a) > rel(b) ? 1 : 0));
+  const hash = createHash("sha256");
+  for (const file of inputs) {
+    hash.update(rel(file), "utf8");
+    hash.update("\0", "utf8");
+    hash.update(
+      readFileSync(file, "utf8").replaceAll("\r\n", "\n").replaceAll("\r", "\n"),
+      "utf8",
+    );
+    hash.update("\0", "utf8");
+  }
+  return hash.digest("hex");
+}
 
 let fails = 0;
 let count = 0;
@@ -872,6 +907,103 @@ section("キーマップ（issue #84）: トラックの拡大縮小");
   ok(L.resolveKey(combined, { key: "i" }) === "intervalStart", "拡大縮小を足しても I は区間の始点のまま");
   ok(L.resolveKey(combined, { key: "=" }) === "trackZoomIn", "束ねた一覧でも + でズームできる");
   ok(L.resolveKey(combined, { key: "0" }) === "trackZoomFit", "束ねた一覧でも 0 で全体表示に戻る");
+}
+
+// --------------------------------------------------------------------
+section("画面と起動済みサーバのビルド版照合（issue #80）");
+// --------------------------------------------------------------------
+{
+  const current = "a".repeat(64);
+  const old = "b".repeat(64);
+  ok(L.webBuildProblem(current, current) === null, "同じ版なら警告を出さない");
+
+  const mismatch = L.webBuildProblem(current, old);
+  ok(mismatch?.includes("サーバを再起動"), "版が違えば再起動を明示する");
+  ok(mismatch?.includes(current.slice(0, 12)), "画面側の版を表示する");
+  ok(mismatch?.includes(old.slice(0, 12)), "サーバ側の版を表示する");
+  ok(mismatch?.includes("操作を停止"), "不一致では操作を続けないことを明示する");
+
+  const missing = L.webBuildProblem(current, null);
+  ok(missing?.includes("取得不能"), "旧サーバの404など版を取れない場合も黙って通さない");
+  ok(L.webBuildProblem("same", "same") !== null, "壊れた短いIDは同じ文字列でも一致扱いしない");
+
+  let blockedCalls = 0;
+  let blockedMessage = "";
+  try {
+    await L.withMatchingWebBuild(Promise.resolve(missing), () => {
+      blockedCalls++;
+    });
+  } catch (e) {
+    blockedMessage = e instanceof Error ? e.message : String(e);
+  }
+  ok(blockedCalls === 0, "旧サーバで版を取れなければ変更処理を1回も呼ばない");
+  ok(blockedMessage.includes("操作を停止"), "遮断理由を呼び出し側へ返す");
+
+  let matchedCalls = 0;
+  const matchedResult = await L.withMatchingWebBuild(Promise.resolve(null), () => {
+    matchedCalls++;
+    return 42;
+  });
+  ok(matchedCalls === 1, "版が一致すれば処理を1回だけ呼ぶ");
+  ok(matchedResult === 42, "版が一致した処理の結果を変えない");
+
+  const frontendDir = path.resolve(HERE, "..", "frontend");
+  const manifestPath = path.resolve(
+    HERE, "..", "automosaic", "webapp", "static", "build.json",
+  );
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  ok(/^[0-9a-f]{64}$/.test(manifest.web_build_id), "manifest は64桁の SHA-256 IDを持つ");
+  ok(
+    manifest.web_build_id === expectedWebBuildId(frontendDir),
+    "manifest の版は手書きでなく、実際の全ビルド入力から一意に決まる",
+  );
+
+  const netSource = readFileSync(
+    path.join(frontendDir, "src", "shared", "webapp-net.ts"),
+    "utf8",
+  );
+  ok(
+    netSource.includes("document.documentElement.inert = true;"),
+    "版を確認し始める前から画面入力を止める",
+  );
+  const gateAt = netSource.indexOf("withCurrentWebBuild(async () => {");
+  const apiSendAt = netSource.indexOf("const res = await fetch(url(path), o);");
+  ok(
+    gateAt >= 0 && apiSendAt > gateAt,
+    "inert を迂回されても API 送信前に版照合を待つ",
+  );
+
+  const indexSource = readFileSync(path.join(frontendDir, "src", "webapp", "index.tsx"), "utf8");
+  const uploadGateAt = indexSource.indexOf("await withCurrentWebBuild(() => {");
+  const uploadSendAt = indexSource.indexOf("xhr.send(file);");
+  ok(
+    uploadGateAt >= 0 && uploadSendAt > uploadGateAt,
+    "進捗表示つき XHR も upload 送信前に版照合を待つ",
+  );
+
+  const buildSource = readFileSync(path.join(frontendDir, "build.mjs"), "utf8");
+  ok(
+    buildSource.includes("current = await computeWebBuild();") &&
+      buildSource.includes("watchFiles: current.inputs"),
+    "watch の再ビルドでも入力を読み直し、全画面へ新しい版を埋め込む",
+  );
+  ok(
+    buildSource.includes("await writeBuildManifest(current.id);"),
+    "watch の成功時にもサーバ用 manifest を同じ版へ進める",
+  );
+
+  const bundles = ["index.js", "job.js", "review.js", "draw.js"];
+  for (const name of bundles) {
+    const file = path.resolve(HERE, "..", "automosaic", "webapp", "static", name);
+    const code = readFileSync(file, "utf8");
+    ok(code.includes(manifest.web_build_id), `${name}: manifest と同じ版を埋め込んでいる`);
+    ok(code.includes("/api/version"), `${name}: 起動直後にサーバ版を確認する`);
+    ok(code.includes("サーバを再起動"), `${name}: 不一致を画面に明示する`);
+    ok(
+      code.includes("document.documentElement.inert=!0"),
+      `${name}: 版の確認中と不一致時は入力を止める`,
+    );
+  }
 }
 
 console.log(fails ? `\n${count} 件中 ${fails} 件失敗` : `\n${count} 件すべて通過`);

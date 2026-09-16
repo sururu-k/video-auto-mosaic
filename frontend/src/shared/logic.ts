@@ -11,3 +11,4 @@ export * from "./canvas-draw.js";
 export * from "./job-logic.js";
 export * from "./keymap.js";
 export * from "./shuttle.js";
+export * from "./web-build.js";
