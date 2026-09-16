@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -40,6 +41,28 @@ STATUS_INTERRUPTED = "interrupted"  # サーバか OS 側で落ちた
 # 受け付ける拡張子。ffmpeg が読めるものに限る必要はないが、
 # 素材以外を置き場に流し込まれる筋は塞いでおく。
 ALLOWED_EXT = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm", ".ts", ".wmv", ".flv"}
+
+# Windows は meta.json を別スレッドが読んでいる短い間、置き換えを
+# PermissionError にする。読み終わるまで待てば同じ置き換えを安全に再試行
+# できるので、その他の I/O エラーと区別して短時間だけ待つ。
+META_REPLACE_ATTEMPTS = 20
+META_REPLACE_RETRY_SEC = 0.01
+
+
+def _replace_meta_file(src: str, dst: str) -> None:
+    """一時的な Windows の共有違反だけを再試行する。
+
+    最終回の PermissionError と、それ以外の OSError はそのまま呼び出し側へ
+    返す。meta が保存されなかったのに成功扱いにはしない。
+    """
+    for attempt in range(META_REPLACE_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt + 1 >= META_REPLACE_ATTEMPTS:
+                raise
+            time.sleep(META_REPLACE_RETRY_SEC)
 
 
 def new_job_id(library: str) -> str:
@@ -132,10 +155,28 @@ class Job:
     def save(self) -> None:
         """meta.json を書く。書き換え中に落ちても壊れないよう置き換えで書く。"""
         self.meta["updated_at"] = time.time()
-        tmp = self.path("meta.json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.meta, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, self.path("meta.json"))
+        # 固定名 meta.json.tmp は並行する保存同士が同じファイルを奪い合う。
+        # 同じディレクトリ内の一意な一時ファイルなら置き換えの原子性を保ちつつ、
+        # 別の保存が先に os.replace() してこちらの一時ファイルを消すこともない。
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.dir,
+                prefix="meta.json.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                tmp = f.name
+                json.dump(self.meta, f, ensure_ascii=False, indent=1)
+            _replace_meta_file(tmp, self.path("meta.json"))
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
 
     def update(self, **kw) -> "Job":
         self.meta.update(kw)
