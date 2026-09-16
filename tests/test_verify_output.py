@@ -35,6 +35,22 @@ def test_warning_matches_basename_not_full_path():
     print("  相対パスでも basename で判定される OK")
 
 
+def test_warning_fires_for_320n_nudenet_variant():
+    """同じ NudeNet 系列の 320n を別モデル扱いして循環を隠さない。"""
+    msg = vo.structural_warning("source", "weights/320n.onnx")
+    assert msg is not None, "320n.onnx が同じ NudeNet 系列なのに警告されていない"
+    assert "320n.onnx" in msg
+    print("  source + 320n.onnx で警告が出る OK")
+
+
+def test_warning_fires_for_480m_nudenet_variant():
+    """同じ NudeNet 系列の 480m を別モデル扱いして循環を隠さない。"""
+    msg = vo.structural_warning("source", "weights/480m.onnx")
+    assert msg is not None, "480m.onnx が同じ NudeNet 系列なのに警告されていない"
+    assert "480m.onnx" in msg
+    print("  source + 480m.onnx で警告が出る OK")
+
+
 def test_no_warning_for_output_mode():
     """output モードは別の理由で使い物にならないとdocstringに明記済み。二重警告しない。"""
     msg = vo.structural_warning("output", "weights/640m.onnx")
