@@ -147,8 +147,9 @@ M7変異（4キーを落とす）        -> すべて通過（検出できず）
 const L = await import("file://" + LOGIC.replace(/\/g, "/"));
 ```
 
-**`.ts` を書き換えただけでは、テストには何も届かない。**
-変異を当てて `node tests/test_frontend.mjs` を走らせると**必ず「すべて通過」になる。**
+**`.ts` を書き換えただけでは、ビルド済みロジックのテストには何も届かない。**
+`tests/test_frontend.mjs` は先に `node frontend/build.mjs --check` を実行し、現在はこのずれを
+失敗として止める。依存が無い場合も検査を飛ばさず失敗する。
 
 実際に一度だまされた（PR #85）。2種類の変異がどちらも素通りし、
 `cd frontend && node build.mjs` を挟んだら 3件と1件が落ちた。
@@ -158,12 +159,13 @@ const L = await import("file://" + LOGIC.replace(/\/g, "/"));
 
 ```
 1. .ts を書き換える
-2. cd frontend && node build.mjs
-3. node tests/test_frontend.mjs
-4. git checkout -- <file> して 2. をもう一度（復元もビルドが要る）
+2. node frontend/build.mjs --check（ビルド前のずれが検出されることを見る）
+3. node frontend/build.mjs
+4. node tests/test_frontend.mjs
+5. 元の .ts に戻して `node frontend/build.mjs`（復元もビルドが要る）
 ```
 
-**4 を忘れると、次のテストが変異したバンドルで走る。**
+**5 を忘れると、次のテストが変異したバンドルで走る。**
 
 **変異テストは「落ちること」を見る。走っていないテストは、変異を当てても落ちないので
 『変異が検出されない』と『テストが走っていない』を区別できない。**

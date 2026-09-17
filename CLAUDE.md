@@ -48,9 +48,25 @@ docs/            設計と実測の記録。番号順に読むと経緯が分か
 .venv\Scripts\python.exe tests\test_webapp.py
 node tests\test_frontend.mjs
 
-# フロントエンド
-cd frontend && node build.mjs && npx tsc --noEmit
+# フロントエンド（canonical repository の最新 master を取り込んでから作る）
+git fetch origin
+git rebase origin/master
+npm --prefix frontend ci
+node frontend/build.mjs
+npm --prefix frontend run check-build
+npm --prefix frontend run typecheck
 ```
+
+`origin` は canonical repository を指す remote 名。fork を `origin` にしている場合は、
+canonical repository を指す remote（通常は `upstream`）に読み替える。
+フロントを変更する PR は、**その remote の最新 master を取り込んでから**ビルド結果をコミットする。
+共有モジュールを変えると複数のバンドルが変わるため、`node build.mjs` が更新した成果物を
+選り分けずすべて確認する。`node tests\test_frontend.mjs` は最初に同じ同期検査を行い、
+`frontend/node_modules` が無ければ成功扱いにせず `npm ci` を案内して停止する。
+同期検査は remote 名ではなく URL が `sururu-k/video-auto-mosaic` を指すことを確認し、
+その remote の master が HEAD の祖先であることも確認する。
+canonical repository をミラー経由で取得する場合は
+`AUTOMOSAIC_FRONTEND_BASE_REF=<remote>/master` を明示する。
 
 `PYTHONIOENCODING=utf-8` を設定しないと日本語の出力が化ける。
 
